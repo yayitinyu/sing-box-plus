@@ -18,14 +18,16 @@
 ## 快速开始
 
 ```bash
-wget -O sbp.sh https://raw.githubusercontent.com/yayitinyu/sing-box-plus/main/sing-box-plus.sh && bash sbp.sh
+# 方法一：wget 下载后运行（推荐）
+wget -O sbp.sh https://raw.githubusercontent.com/yayitinyu/sing-box-plus/main/sing-box-plus.sh
+bash sbp.sh
+
+# 方法二：curl 下载后运行
+curl -fsSL -o sbp.sh https://raw.githubusercontent.com/yayitinyu/sing-box-plus/main/sing-box-plus.sh
+bash sbp.sh
 ```
 
-或：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/yayitinyu/sing-box-plus/main/sing-box-plus.sh | bash
-```
+> ⚠️ **注意**：本脚本为交互式菜单，不支持 `curl | bash` 管道方式运行。
 
 ## 菜单选项
 
