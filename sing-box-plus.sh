@@ -6,7 +6,7 @@
 
 set -Eeuo pipefail
 
-stty erase ^H # 让退格键在终端里正常工作
+[[ -t 0 ]] && stty erase ^H 2>/dev/null || true # 让退格键在终端里正常工作（仅交互模式）
 # ===== [BEGIN] SBP 引导模块 v2.2.0+（包管理器优先 + 二进制回退） =====
 # 模式与哨兵
 : "${SBP_SOFT:=0}"                               # 1=宽松模式（失败尽量继续），默认 0=严格
@@ -919,6 +919,7 @@ banner(){
   echo -e "  ${C_GREEN}3)${C_RESET} 重启服务"
   echo -e "  ${C_GREEN}4)${C_RESET} 一键更换所有端口"
   echo -e "  ${C_GREEN}5)${C_RESET} 一键开启 BBR"
+  echo -e "  ${C_YELLOW}6)${C_RESET} 更新 sing-box 版本"
   echo -e "  ${C_RED}8)${C_RESET} 卸载"
   echo -e "  ${C_RED}0)${C_RESET} 退出"
   hr
@@ -928,6 +929,41 @@ banner(){
 restart_service(){
   systemctl restart "${SYSTEMD_SERVICE}" || die "重启失败"
   systemctl --no-pager status "${SYSTEMD_SERVICE}" | sed -n '1,6p' || true
+}
+
+# 更新 sing-box 到最新版本
+update_singbox(){
+  ensure_installed_or_hint || return 0
+  local current_ver new_ver
+  current_ver=$("$BIN_PATH" version 2>/dev/null | head -n1 || echo "未知")
+  info "当前版本: $current_ver"
+  info "正在检查最新版本..."
+  
+  # 备份旧版本
+  if [[ -f "$BIN_PATH" ]]; then
+    cp "$BIN_PATH" "${BIN_PATH}.bak" 2>/dev/null || true
+  fi
+  
+  # 删除旧版本以触发重新安装
+  rm -f "$BIN_PATH"
+  
+  if install_singbox; then
+    new_ver=$("$BIN_PATH" version 2>/dev/null | head -n1 || echo "未知")
+    info "更新成功! 新版本: $new_ver"
+    rm -f "${BIN_PATH}.bak" 2>/dev/null || true
+    
+    # 重启服务
+    if systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
+      info "正在重启服务..."
+      systemctl restart "${SYSTEMD_SERVICE}" || warn "重启服务失败"
+    fi
+  else
+    warn "更新失败，正在恢复旧版本..."
+    if [[ -f "${BIN_PATH}.bak" ]]; then
+      mv "${BIN_PATH}.bak" "$BIN_PATH"
+      info "已恢复到旧版本"
+    fi
+  fi
 }
 
 rotate_ports(){
@@ -1009,6 +1045,7 @@ menu(){
     3) if ensure_installed_or_hint; then restart_service; fi; read -rp "回车返回..." _ || true; menu ;;
    4) if ensure_installed_or_hint; then rotate_ports; fi; menu ;;
     5) enable_bbr; read -rp "回车返回..." _ || true; menu ;;
+    6) update_singbox; read -rp "回车返回..." _ || true; menu ;;
     8) uninstall_all ;; # 直接退出
     0) exit 0 ;;
     *) menu ;;

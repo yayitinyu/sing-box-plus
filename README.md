@@ -18,7 +18,6 @@
 ## 快速开始
 
 ```bash
-# 下载并运行
 wget -O sbp.sh https://raw.githubusercontent.com/yayitinyu/sing-box-plus/main/sing-box-plus.sh && bash sbp.sh
 ```
 
