@@ -336,7 +336,7 @@ ensure_deps() {
   elif command -v zypper >/dev/null 2>&1; then
     zypper --non-interactive install "${miss[@]}"
   else
-    err "无法自动安装依赖：${miss[*]}，请手动安装后重试"
+    die "无法自动安装依赖：${miss[*]}，请手动安装后重试"
     return 1
   fi
 }
@@ -666,12 +666,12 @@ install_singbox() {
     url="$(curl -fsSL "https://api.github.com/repos/${repo}/releases" \
            | jq -r --arg re "$re" '[ .[] | .assets[] | select(.name | test($re)) | .browser_download_url ][0]')"
   fi
-  [[ -n "$url" ]] || { err "下载 sing-box 失败：未匹配到发行包（arch=${arch} tag=${tag})"; return 1; }
+  [[ -n "$url" ]] || { die "下载 sing-box 失败：未匹配到发行包（arch=${arch} tag=${tag})"; return 1; }
 
 
   tmp="$(mktemp -d)"; pkg="${tmp}/pkg"
   if ! curl -fL "$url" -o "$pkg"; then
-    rm -rf "$tmp"; err "下载 sing-box 失败"; return 1
+    rm -rf "$tmp"; die "下载 sing-box 失败"; return 1
   fi
 
   # 解压
@@ -682,13 +682,13 @@ install_singbox() {
   elif echo "$url" | grep -qE '\.zip$'; then
     unzip -q "$pkg" -d "$tmp"
   else
-    rm -rf "$tmp"; err "未知包格式：$url"; return 1
+    rm -rf "$tmp"; die "未知包格式：$url"; return 1
   fi
 
   # 找到二进制并安装
   local bin
   bin="$(find "$tmp" -type f -name 'sing-box' | head -n1)"
-  [[ -n "$bin" ]] || { rm -rf "$tmp"; err "解压失败：未找到 sing-box 可执行文件"; return 1; }
+  [[ -n "$bin" ]] || { rm -rf "$tmp"; die "解压失败：未找到 sing-box 可执行文件"; return 1; }
 
   install -m 0755 "$bin" "$BIN_PATH"
   rm -rf "$tmp"
@@ -908,7 +908,7 @@ banner(){
   clear >/dev/null 2>&1 || true
   hr
   echo -e " ${C_CYAN}🚀 ${SCRIPT_NAME} ${SCRIPT_VERSION} 🚀${C_RESET}"
-  echo -e "${C_CYAN} 脚本更新地址: https://github.com/Alvin9999/Sing-Box-Plus${C_RESET}"
+  echo -e "${C_CYAN} 脚本更新地址: https://github.com/yayitinyu/sing-box-plus${C_RESET}"
 
   hr
   echo -e "系统加速状态：$(bbr_state)"
