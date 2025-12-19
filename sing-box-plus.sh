@@ -1023,8 +1023,15 @@ ensure_installed_or_hint(){
 
 # ===== 菜单 =====
 menu(){
+  # 检测是否为交互模式
+  if [[ ! -t 0 ]]; then
+    echo -e "${C_RED}[错误] 请以交互模式运行脚本${C_RESET}"
+    echo -e "${C_YELLOW}用法: wget -O sbp.sh https://raw.githubusercontent.com/yayitinyu/sing-box-plus/main/sing-box-plus.sh && bash sbp.sh${C_RESET}"
+    exit 1
+  fi
+  
   banner
-  read -rp "选择: " op || true
+  read -rp "选择: " op || { echo; exit 0; }
   case "${op:-}" in
   1)
   sbp_bootstrap                                     # 依赖/二进制回退
@@ -1047,10 +1054,11 @@ menu(){
     5) enable_bbr; read -rp "回车返回..." _ || true; menu ;;
     6) update_singbox; read -rp "回车返回..." _ || true; menu ;;
     8) uninstall_all ;; # 直接退出
-    0) exit 0 ;;
-    *) menu ;;
+    0|q|Q) exit 0 ;;
+    *) echo -e "${C_YELLOW}无效选项，请重新选择${C_RESET}"; sleep 1; menu ;;
   esac
 }
 
 # ===== 入口 =====
 menu
+
