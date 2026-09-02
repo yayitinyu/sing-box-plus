@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v3.1.2
+#  Version: v3.2.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -330,7 +330,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.1.2"
+SCRIPT_VERSION="v3.2.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -694,6 +694,103 @@ load_route_json(){
   else
     empty_route_json
   fi
+}
+
+normalize_route_file(){
+  jq -ces '
+    def nonempty_string:
+      if type == "string" then length > 0 and (test("[[:cntrl:]]") | not) else false end;
+    def valid_tag:
+      if type == "string" then test("^[A-Za-z0-9._@!-]+$") else false end;
+    def string_list:
+      if type == "array" then all(.[]; nonempty_string) else false end;
+    ["domain", "domain_suffix", "domain_keyword", "domain_regex", "rule_set"] as $match_keys
+    | ["direct", "direct-ipv4", "direct-ipv6", "warp"] as $builtins
+    | if length != 1 or (.[0] | type) != "object" then
+        error("分流文件必须包含一个 JSON 对象")
+      else .[0] end
+    | if ((keys - ["format", "version", "rules", "rule_set", "outbounds", "default_outbound"]) | length) > 0 then
+        error("只支持本脚本导出的分流文件或 routes.json")
+      elif (has("format") or has("version")) and (.format != "sing-box-plus-routes" or .version != 1) then
+        error("不支持的分流文件格式或版本")
+      elif (.rules | type) != "array" then error("rules 必须是数组")
+      else . end
+    | .rule_set = (if has("rule_set") then .rule_set else [] end)
+    | .outbounds = (if has("outbounds") then .outbounds else [] end)
+    | .default_outbound = (if has("default_outbound") then .default_outbound else "direct" end)
+    | if (.rule_set | type) != "array" or (.outbounds | type) != "array" then
+        error("rule_set 和 outbounds 必须是数组")
+      elif (.default_outbound | valid_tag | not) then error("默认出口 tag 无效")
+      else . end
+    | .rules |= map(
+        if type != "object" then error("每条分流规则必须是对象") else . end
+        | if ((keys - ($match_keys + ["name", "action", "outbound"])) | length) > 0 then
+            error("规则含有不支持的字段，无法完整导入")
+          elif has("name") and (.name | type) != "string" then error("规则名称必须是字符串")
+          else . end
+        | . as $rule
+        | if all($match_keys[]; . as $key | ($rule | has($key) | not) or ($rule[$key] | string_list)) then .
+          else error("匹配项必须是非空字符串组成的数组") end
+        | if ([$match_keys[] as $key | ($rule[$key] // []) | length] | add) == 0 then
+            error("分流规则至少需要一个匹配项")
+          elif .action == "reject" then
+            if has("outbound") then error("block 规则不能同时指定出口") else . end
+          elif has("action") and .action != "route" then error("只支持 route 或 reject 动作")
+          elif (.outbound | valid_tag | not) then error("路由规则缺少有效出口")
+          else . end)
+    | .outbounds |= map(
+        if type != "object" then error("每个远程出口必须是对象") else . end
+        | .tag as $tag
+        | if (.tag | valid_tag | not) or (.type | nonempty_string | not) then
+            error("远程出口缺少有效的 tag 或 type")
+          elif ($builtins | index($tag)) != null then error("远程出口 tag 与内置出口冲突")
+          else . end)
+    | .rule_set |= map(
+        if type != "object" then error("每个规则集必须是对象") else . end
+        | if (.tag | valid_tag | not) then error("规则集 tag 无效")
+          elif .type == "remote" then
+            if (.url | nonempty_string) then . else error("远程规则集缺少 URL") end
+          elif .type == "local" then
+            if (.path | nonempty_string) then . else error("本地规则集缺少路径") end
+          elif .type == "inline" then
+            if (.rules | type) == "array" then . else error("内联规则集缺少 rules 数组") end
+          else error("不支持的规则集类型") end)
+    | if ([.outbounds[].tag] | length != (unique | length)) then error("远程出口 tag 重复")
+      elif ([.rule_set[].tag] | length != (unique | length)) then error("规则集 tag 重复")
+      else del(.format, .version) end
+  ' "$1"
+}
+
+validate_route_references(){
+  jq -e '
+    (["direct", "direct-ipv4", "direct-ipv6", "warp"] + [.outbounds[].tag]) as $outbounds
+    | [.rule_set[].tag] as $rule_sets
+    | if all(.rules[] | select(.action != "reject"); .outbound as $tag | ($outbounds | index($tag)) != null)
+        and (.default_outbound as $tag | ($outbounds | index($tag)) != null) then .
+      else error("分流配置引用了不存在的出口") end
+    | if all(.rules[].rule_set[]?; . as $tag | ($rule_sets | index($tag)) != null) then .
+      else error("分流配置引用了不存在的规则集") end
+    | if all(.rule_set[] | select(has("download_detour")); .download_detour as $tag | ($outbounds | index($tag)) != null) then .
+      else error("规则集下载引用了不存在的出口") end
+  ' "$1" >/dev/null
+}
+
+merge_route_files(){
+  jq -cen --slurpfile current "$1" --slurpfile incoming "$2" '
+    def merge_tags($old; $new; $kind):
+      reduce $new[] as $item ($old;
+        ([.[] | select(.tag == $item.tag)] | first) as $existing
+        | if $existing == null then . + [$item]
+          elif $existing == $item then .
+          else error($kind + "存在同名配置冲突：" + $item.tag) end);
+    $current[0] as $old | $incoming[0] as $new
+    | $old + {
+        rules: (reduce $new.rules[] as $rule ($old.rules;
+          if index($rule) == null then . + [$rule] else . end)),
+        rule_set: merge_tags($old.rule_set; $new.rule_set; "规则集"),
+        outbounds: merge_tags($old.outbounds; $new.outbounds; "远程出口")
+      }
+  '
 }
 
 parse_route_match_json(){
@@ -2274,11 +2371,11 @@ write_config(){
       + (if (($rule.domain_keyword // []) | length) > 0 then {domain_keyword:$rule.domain_keyword} else {} end)
       + (if (($rule.domain_regex // []) | length) > 0 then {domain_regex:$rule.domain_regex} else {} end)
       + (if (($rule.rule_set // []) | length) > 0 then {rule_set:$rule.rule_set} else {} end)
-      + {action:"route", outbound:$rule.outbound});
+      + (if $rule.action == "reject" then {action:"reject"} else {action:"route", outbound:$rule.outbound} end));
 
   def custom_route_rules:
     (($CUSTOM_ROUTES.rules // [])
-      | map(select((.outbound // "") != ""))
+      | map(select(.action == "reject" or (.outbound // "") != ""))
       | map(custom_route_rule(.))
       | map(select((keys - ["action","outbound"]) | length > 0)));
 
@@ -2482,9 +2579,14 @@ JSON
 
 # ===== 自定义路由菜单 =====
 apply_custom_routing(){
-  local route_bak="${1:-}" conf_bak
-  conf_bak="$(mktemp)"
-  [[ -f "$CONF_JSON" ]] && cp "$CONF_JSON" "$conf_bak" || true
+  local route_bak="${1:-}" conf_bak rollback_failed=0
+  conf_bak="$(mktemp)" || return 1
+  if [[ -f "$CONF_JSON" ]] && ! cp "$CONF_JSON" "$conf_bak"; then
+    [[ -n "$route_bak" && -f "$route_bak" ]] && cp "$route_bak" "$ROUTE_JSON"
+    rm -f "$conf_bak"
+    warn "备份运行配置失败，已取消应用。"
+    return 1
+  fi
 
   if ! write_config; then
     [[ -n "$route_bak" && -f "$route_bak" ]] && cp "$route_bak" "$ROUTE_JSON"
@@ -2502,13 +2604,31 @@ apply_custom_routing(){
     return 1
   fi
 
-  rm -f "$conf_bak"
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
-    systemctl restart "${SYSTEMD_SERVICE}" || { warn "配置已写入，但服务重启失败"; return 1; }
+    if ! { systemctl restart "${SYSTEMD_SERVICE}" && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; }; then
+      if [[ -n "$route_bak" && -f "$route_bak" ]]; then
+        cp "$route_bak" "$ROUTE_JSON" || rollback_failed=1
+      fi
+      if [[ -s "$conf_bak" ]]; then
+        cp "$conf_bak" "$CONF_JSON" || rollback_failed=1
+      fi
+      if (( rollback_failed != 0 )); then
+        warn "服务重启失败，恢复配置时出错；运行配置备份：$conf_bak"
+        return 1
+      fi
+      rm -f "$conf_bak"
+      if systemctl restart "${SYSTEMD_SERVICE}" && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
+        warn "服务重启失败，已回滚分流配置并恢复服务。"
+      else
+        warn "已回滚分流配置，但服务仍无法启动，请检查服务日志。"
+      fi
+      return 1
+    fi
     info "自定义路由已应用并重启服务。"
   else
     info "自定义路由已写入配置；服务未运行，未自动重启。"
   fi
+  rm -f "$conf_bak"
 }
 
 print_custom_routes(){
@@ -2531,7 +2651,7 @@ print_custom_routes(){
     (if ((.rules // []) | length) == 0 then
       "  （无）"
     else
-      (.rules // [] | to_entries[] | "  \(.key + 1)) \((.value.name // "未命名")) -> \(.value.outbound) | \(.value | match_text)")
+      (.rules // [] | to_entries[] | "  \(.key + 1)) \((.value.name // "未命名")) -> \(if .value.action == "reject" then "block（阻断）" else .value.outbound end) | \(.value | match_text)")
     end),
     "",
     "导入的远程出口:",
@@ -2547,21 +2667,23 @@ select_route_outbound(){
   local ip4 ip6 choice idx tag
   local -a imported
   SBP_SELECTED_OUTBOUND=""
+  SBP_SELECTED_ACTION="route"
   ip4="$(default_ipv4_address || true)"
   ip6="$(default_ipv6_address || true)"
   mapfile -t imported < <(jq -r '.outbounds[]?.tag' "$ROUTE_JSON" | tr -d '\r')
 
-  echo "选择这条规则使用的出口（支持 V4 / V6 / 双栈 / 远程节点）："
+  echo "选择规则目标："
   echo "  1) 本机 WARP 出口（warp：Cloudflare WARP 双栈）"
   echo "  2) 本机双栈出口（direct：IPv4 + IPv6 双栈直连，当前 IPv4=${ip4:-未检测到} IPv6=${ip6:-未检测到}）"
   echo "  3) 本机 IPv4 出口（direct-ipv4：仅 IPv4 直连，当前 ${ip4:-未检测到}）"
   echo "  4) 本机 IPv6 出口（direct-ipv6：仅 IPv6 直连，当前 ${ip6:-未检测到}）"
-  idx=5
+  echo "  5) block（阻断连接）"
+  idx=6
   for tag in "${imported[@]}"; do
     echo "  ${idx}) 导入出口：${tag}"
     idx=$((idx+1))
   done
-  read -rp "选择出口: " choice || return 1
+  read -rp "选择目标: " choice || return 1
   choice="${choice//$'\r'/}"
   case "$choice" in
     1)
@@ -2582,16 +2704,19 @@ select_route_outbound(){
       warn "仅 IPv6 出口无法访问没有 AAAA 记录的站点；客户端直接以 IPv4 地址（而非域名）发起的连接也不受此设置约束。"
       SBP_SELECTED_OUTBOUND="direct-ipv6"
       ;;
+    5)
+      SBP_SELECTED_ACTION="reject"
+      ;;
     *)
       if [[ "$choice" =~ ^[0-9]+$ ]]; then
-        idx=$((choice-5))
+        idx=$((10#$choice-6))
         if (( idx >= 0 && idx < ${#imported[@]} )); then
           SBP_SELECTED_OUTBOUND="${imported[$idx]}"
         fi
       fi
       ;;
   esac
-  [[ -n "$SBP_SELECTED_OUTBOUND" ]] || { warn "无效出口选择"; return 1; }
+  [[ "$SBP_SELECTED_ACTION" == "reject" || -n "$SBP_SELECTED_OUTBOUND" ]] || { warn "无效目标选择"; return 1; }
 }
 
 add_custom_route_rule(){
@@ -2601,7 +2726,7 @@ add_custom_route_rule(){
   echo "输入匹配项，逗号或空格分隔。"
   echo "示例：geosite:netflix, suffix:openai.com, domain:example.com, keyword:google"
   echo "简写：netflix 会按 geosite 处理；example.com 会按域名后缀处理。"
-  local matches name match_json route_bak tmp
+  local matches name match_json route_bak tmp status=0
   read -rp "匹配项: " matches || return 1
   matches="${matches//$'\r'/}"
   match_json="$(parse_route_match_json "$matches")"
@@ -2621,21 +2746,30 @@ add_custom_route_rule(){
   route_bak="$(mktemp)"
   cp "$ROUTE_JSON" "$route_bak"
   tmp="$(mktemp)"
-  if jq -c --argjson match "$match_json" --arg outbound "$SBP_SELECTED_OUTBOUND" --arg name "$name" '
+  if jq -c --argjson match "$match_json" --arg outbound "$SBP_SELECTED_OUTBOUND" --arg action "$SBP_SELECTED_ACTION" --arg name "$name" '
     .rules = (.rules // [])
     | .rule_set = (.rule_set // [])
     | .outbounds = (.outbounds // [])
-    | .rules += [($match | del(.rule_set_defs) + {outbound:$outbound} + (if $name != "" then {name:$name} else {} end))]
+    | .rules += [($match | del(.rule_set_defs)
+        + (if $action == "reject" then {action:"reject"} else {outbound:$outbound} end)
+        + (if $name != "" then {name:$name} else {} end))]
     | .rule_set = ((.rule_set + ($match.rule_set_defs // [])) | unique_by(.tag))
   ' "$ROUTE_JSON" > "$tmp"; then
-    mv "$tmp" "$ROUTE_JSON"
-    apply_custom_routing "$route_bak"
+    if mv "$tmp" "$ROUTE_JSON"; then
+      apply_custom_routing "$route_bak" || status=$?
+    else
+      rm -f "$tmp"
+      warn "保存路由规则失败。"
+      status=1
+    fi
   else
     rm -f "$tmp"
     cp "$route_bak" "$ROUTE_JSON"
     warn "写入路由规则失败。"
+    status=1
   fi
   rm -f "$route_bak"
+  return "$status"
 }
 
 import_custom_route_outbound(){
@@ -2870,6 +3004,120 @@ clear_custom_route_rules(){
   rm -f "$route_bak"
 }
 
+export_custom_route_rules()(
+  local destination="${1:-}" default_path tmp export_dir yn
+  [[ -s "$ROUTE_JSON" ]] || { warn "没有可导出的分流配置。"; return 1; }
+  default_path="$SB_DIR/routes-export-$(date +%Y%m%d-%H%M%S).json"
+  if [[ -z "$destination" ]]; then
+    read -rp "导出文件路径 [$default_path]: " destination || return 1
+    destination="${destination//$'\r'/}"
+    destination="${destination:-$default_path}"
+  fi
+  if [[ -L "$destination" || -d "$destination" ]] || { [[ -e "$destination" ]] && [[ ! -f "$destination" ]]; }; then
+    warn "导出目标必须是普通文件路径。"
+    return 1
+  fi
+  if [[ "$destination" -ef "$ROUTE_JSON" || "$destination" -ef "$CONF_JSON" ]]; then
+    warn "请使用独立的导出文件，不能覆盖当前分流或运行配置。"
+    return 1
+  fi
+  export_dir=$(dirname -- "$destination")
+  [[ -d "$export_dir" ]] || { warn "导出目录不存在：$export_dir"; return 1; }
+  tmp=$(mktemp "$export_dir/.routes-export.XXXXXX") || { warn "无法创建导出文件。"; return 1; }
+  trap 'rm -f -- "$tmp"' EXIT
+  if ! normalize_route_file "$ROUTE_JSON" | jq '{format:"sing-box-plus-routes", version:1} + .' > "$tmp" \
+      || ! validate_route_references "$tmp"; then
+    warn "当前分流配置无效，导出已取消。"
+    return 1
+  fi
+  if [[ -f "$destination" ]]; then
+    read -rp "导出文件已存在，确认覆盖？[y/N] " yn || return 1
+    [[ "${yn//$'\r'/}" =~ ^[Yy]$ ]] || return 0
+  fi
+  if ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$destination"; then
+    warn "保存导出文件失败。"
+    return 1
+  fi
+  info "分流配置已导出：$destination"
+  if jq -e '.outbounds | length > 0' "$ROUTE_JSON" >/dev/null; then
+    warn "导出文件包含远程出口配置及其凭据，请妥善保管。"
+  fi
+)
+
+import_custom_route_rules()(
+  local source_file="${1:-}" source_dir mode work_dir route_bak yn
+  if [[ -z "$source_file" ]]; then
+    read -rp "分流规则文件路径: " source_file || return 1
+    source_file="${source_file//$'\r'/}"
+  fi
+  [[ -f "$source_file" && -r "$source_file" ]] || { warn "分流文件不存在或不可读。"; return 1; }
+  # Resolve relative paths before passing the filename to jq, including names beginning with a dash.
+  source_dir=$(cd -- "$(dirname -- "$source_file")" && pwd) || return 1
+  source_file="$source_dir/$(basename -- "$source_file")"
+  ensure_dirs || return 1
+  work_dir=$(mktemp -d "$SB_DIR/.routes-import.XXXXXX") || return 1
+  trap 'rm -f -- "$work_dir/incoming.json" "$work_dir/current.json" "$work_dir/candidate.json"; rmdir -- "$work_dir"' EXIT
+  if ! normalize_route_file "$source_file" > "$work_dir/incoming.json"; then
+    warn "分流文件校验失败，未修改现有配置。"
+    return 1
+  fi
+  if [[ -s "$ROUTE_JSON" ]]; then
+    normalize_route_file "$ROUTE_JSON" > "$work_dir/current.json" || { warn "当前分流配置无效，导入已取消。"; return 1; }
+  else
+    empty_route_json > "$work_dir/current.json" || return 1
+  fi
+  echo "  1) 合并（保留现有规则顺序和默认出口）"
+  echo "  2) 替换（包含远程出口及默认出口）"
+  echo "  0) 取消"
+  read -rp "导入方式 [1]: " mode || return 1
+  mode="${mode//$'\r'/}"
+  case "${mode:-1}" in
+    1)
+      mode=1
+      if ! merge_route_files "$work_dir/current.json" "$work_dir/incoming.json" > "$work_dir/candidate.json"; then
+        warn "合并失败；同名出口或规则集的配置必须一致，未修改现有配置。"
+        return 1
+      fi
+      ;;
+    2) cp "$work_dir/incoming.json" "$work_dir/candidate.json" || return 1 ;;
+    0|q|Q) return 0 ;;
+    *) warn "无效导入方式。"; return 1 ;;
+  esac
+  validate_route_references "$work_dir/candidate.json" || { warn "导入配置的引用不完整，未修改现有配置。"; return 1; }
+  load_env
+  if [[ "$ENABLE_WARP" != "true" ]] && jq -e '
+    .default_outbound == "warp" or any(.rules[]; .outbound == "warp")
+    or any(.rule_set[]; .download_detour == "warp")
+    or any(.outbounds[]; .detour == "warp")
+  ' "$work_dir/candidate.json" >/dev/null; then
+    warn "导入配置使用 WARP，请先开启 WARP。"
+    return 1
+  fi
+  if jq -en --slurpfile current "$work_dir/current.json" --slurpfile candidate "$work_dir/candidate.json" \
+      '$current[0] == $candidate[0]' >/dev/null; then
+    info "分流配置未发生变化，无需重复导入。"
+    return 0
+  fi
+  jq -r '"导入后：\(.rules | length) 条规则，\(.outbounds | length) 个远程出口，默认出口 \(.default_outbound)"' "$work_dir/candidate.json"
+  if [[ "$mode" == "2" ]]; then
+    read -rp "确认替换现有规则、规则集、远程出口和默认出口？[y/N] " yn || return 1
+    [[ "${yn//$'\r'/}" =~ ^[Yy]$ ]] || return 0
+  fi
+  (umask 077; mkdir -p "$SB_DIR/backups") || return 1
+  route_bak=$(mktemp "$SB_DIR/backups/routes-import-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return 1
+  if [[ -f "$ROUTE_JSON" ]]; then
+    cp "$ROUTE_JSON" "$route_bak" || { warn "备份分流配置失败，已取消导入。"; return 1; }
+  else
+    cp "$work_dir/current.json" "$route_bak" || return 1
+  fi
+  if ! chmod 600 "$work_dir/candidate.json" || ! mv -f -- "$work_dir/candidate.json" "$ROUTE_JSON"; then
+    warn "保存分流配置失败。"
+    return 1
+  fi
+  info "原分流配置已备份：$route_bak"
+  apply_custom_routing "$route_bak"
+)
+
 custom_route_menu(){
   ensure_installed_or_hint || { read -rp "回车返回..." _ || true; return 0; }
   ensure_route_file
@@ -2880,22 +3128,26 @@ custom_route_menu(){
     hr
     print_custom_routes
     hr
-    echo -e "  ${C_GREEN}1)${C_RESET} 添加网址 / geosite 路由规则"
+    echo -e "  ${C_GREEN}1)${C_RESET} 添加分流规则（含 block）"
     echo -e "  ${C_GREEN}2)${C_RESET} 导入其他 VPS 出口节点"
     echo -e "  ${C_GREEN}3)${C_RESET} 设置非 Warp 节点默认出口 (V4 / V6 / 双栈 / 导入节点)"
     echo -e "  ${C_YELLOW}4)${C_RESET} 删除路由规则"
     echo -e "  ${C_YELLOW}5)${C_RESET} 删除导入出口"
     echo -e "  ${C_RED}6)${C_RESET} 清空自定义路由规则"
+    echo -e "  ${C_GREEN}7)${C_RESET} 导入分流规则"
+    echo -e "  ${C_GREEN}8)${C_RESET} 导出分流规则"
     echo -e "  ${C_RED}0)${C_RESET} 返回主菜单"
     hr
     read -rp "选择: " op || return 0
     case "${op:-}" in
-      1) add_custom_route_rule; read -rp "回车继续..." _ || true ;;
-      2) import_custom_route_outbound; read -rp "回车继续..." _ || true ;;
-      3) set_custom_default_outbound; read -rp "回车继续..." _ || true ;;
-      4) remove_custom_route_rule; read -rp "回车继续..." _ || true ;;
-      5) remove_custom_route_outbound; read -rp "回车继续..." _ || true ;;
-      6) clear_custom_route_rules; read -rp "回车继续..." _ || true ;;
+      1) add_custom_route_rule || true; read -rp "回车继续..." _ || true ;;
+      2) import_custom_route_outbound || true; read -rp "回车继续..." _ || true ;;
+      3) set_custom_default_outbound || true; read -rp "回车继续..." _ || true ;;
+      4) remove_custom_route_rule || true; read -rp "回车继续..." _ || true ;;
+      5) remove_custom_route_outbound || true; read -rp "回车继续..." _ || true ;;
+      6) clear_custom_route_rules || true; read -rp "回车继续..." _ || true ;;
+      7) import_custom_route_rules || true; read -rp "回车继续..." _ || true ;;
+      8) export_custom_route_rules || true; read -rp "回车继续..." _ || true ;;
       0|q|Q) return 0 ;;
       *) warn "无效选项"; sleep 1 ;;
     esac

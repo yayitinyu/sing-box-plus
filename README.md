@@ -17,7 +17,7 @@
 | **运行状态看板** | 实时查看主进程 PID、内存占用、20 节点端口监听监控、DNS 切换与证书到期倒计时 |
 | **WARP 出口** | Cloudflare WARP 线路，解锁 Netflix / Disney+ 等流媒体更友好 |
 | **DNS 故障切换** | Cloudflare DoH → Google DoH → UDP 1.0.0.1，连续失败确认与恢复冷却避免探测抖动重启 |
-| **自定义路由** | 按域名 / geosite 规则指定 WARP、本机 IPv4/IPv6、或导入的远程 VPS 出口 |
+| **自定义路由** | 按域名 / geosite 指定出口或 block 阻断，支持分流规则 JSON 导入、导出 |
 | **TLS 证书** | 自签证书 / 手动上传公开有效证书 / ACME 自动申请续期，三种模式一键切换 |
 | **连接稳定** | TCP keepalive · 可调 UDP timeout · WARP 保活 · 全参数环境变量覆盖 |
 | **彻底卸载** | 一键注销服务、关闭防火墙放行、清理二进制与残留数据，干净无痕 |
@@ -101,7 +101,7 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 
 ```text
 =============================================================
- 🚀 Sing-Box-Plus 管理脚本 v3.1.2 🚀
+ 🚀 Sing-Box-Plus 管理脚本 v3.2.0 🚀
  脚本更新地址: https://github.com/yayitinyu/sing-box-plus
 =============================================================
   服务状态: 运行中 (Active)  |  核心版本: sing-box v1.12.7
@@ -199,7 +199,8 @@ openssl x509 -in /opt/sing-box/cert/fullchain.pem -noout -subject
 菜单 `7) 自定义路由与分流规则` 支持按目标网站指定出口分流，以及切换非 Warp 协议节点的默认出口 IP：
 
 - **非 Warp 节点默认出口**：支持将 10 个直连协议节点（VLESS-Reality、Hysteria2、TUIC 等）的默认出口 IP 自由切换为已导入的其他 VPS 节点、本机双栈（`direct`）、本机 IPv4（`direct-ipv4`）、本机 IPv6（`direct-ipv6`）或 WARP。
-- **自定义分流规则**：支持为特定域名或 geosite 指定专属出口。
+- **自定义分流规则**：支持为特定域名或 geosite 指定专属出口，或选择 `block` 阻断连接。
+- **导入与导出**：分流子菜单 `7)` 导入、`8)` 导出，包含规则顺序、关联规则集、远程出口配置和默认出口。
 
 > 本机 IPv4 / IPv6 出口通过绑定本机源地址实现。仅 IPv6 出口无法访问没有 AAAA 记录的站点；客户端直接以 IP 地址（而非域名）发起的连接不受解析策略约束。导入的远程节点走哪个 IP 栈出口由对端节点决定，本机无法配置。
 
@@ -209,6 +210,7 @@ openssl x509 -in /opt/sing-box/cert/fullchain.pem -noout -subject
 | 本机双栈直连 | 默认双栈出口，支持 IPv4 + IPv6 |
 | 本机 IPv4 | `suffix:openai.com` 固定走 IPv4 出口 |
 | 本机 IPv6 | 需要原生 IPv6 的场景 |
+| block 阻断 | 添加规则时选择 `5) block`，例如阻断 `suffix:ads.example.com` 或 `geosite:category-ads-all` |
 | 远程 VPS 节点 | 粘贴分享链接（VLESS / Trojan / Hy2 / VMess / SS / TUIC / AnyTLS / Socks5 / HTTP 等）或 sing-box outbound JSON 导入，可作为分流出口或设为非 Warp 节点默认出口 |
 
 匹配项支持逗号或空格分隔，支持以下格式：
@@ -218,8 +220,37 @@ geosite:netflix, suffix:openai.com, domain:example.com, keyword:google, regex:.*
 ```
 
 简写规则：
+
 - `netflix` → 按 `geosite:netflix` 处理
 - `example.com` → 按 `suffix:example.com` 处理
+
+规则按列表顺序匹配，先匹配的规则优先；`block` 对直连和 WARP 入站均生效，底层使用 sing-box 的 [`reject` 动作](https://sing-box.sagernet.org/configuration/route/rule_action/#reject)。
+
+导入时输入本地 JSON 文件路径，然后选择：
+
+- **合并（默认）**：追加新规则，保留现有优先级和默认出口；完全相同的规则不会重复添加。同名远程出口或规则集必须配置一致，否则取消导入。
+- **替换**：确认后替换全部分流规则、规则集、远程出口和默认出口。可使用空规则文件清空这些设置。
+
+导入支持本脚本导出的文件，也兼容原有 `routes.json`。导入会校验文件结构和依赖引用，再使用本机 sing-box 检查生成的配置；校验或服务重启失败时回滚。修改前的规则备份保存在 `/opt/sing-box/backups/routes-import-*`。使用 WARP 的配置需要先开启 WARP，本地规则集需要在目标服务器存在对应文件。
+
+导出默认保存为 `/opt/sing-box/routes-export-时间戳.json`，权限为 `600`。**文件包含远程出口的认证信息，请妥善保管。** 以下为只包含一条 block 规则的示例：
+
+```json
+{
+  "format": "sing-box-plus-routes",
+  "version": 1,
+  "rules": [
+    {
+      "name": "屏蔽广告",
+      "domain_suffix": ["ads.example.com"],
+      "action": "reject"
+    }
+  ],
+  "rule_set": [],
+  "outbounds": [],
+  "default_outbound": "direct"
+}
+```
 
 ---
 
