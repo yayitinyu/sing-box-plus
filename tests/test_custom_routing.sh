@@ -13,7 +13,13 @@ cleanup(){
 }
 trap cleanup EXIT
 
+# Run the same suite with jq 1.6 and newer versions without changing the system jq.
+if [[ -n "${SBP_TEST_JQ:-}" ]]; then
+  [[ -x "$SBP_TEST_JQ" ]] || { echo "SBP_TEST_JQ must name an executable" >&2; exit 1; }
+  jq(){ "$SBP_TEST_JQ" "$@"; }
+fi
 command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
+printf 'Testing with %s\n' "$(jq --version)"
 export SBP_SKIP_DEPS=1 SBP_SKIP_ROOT=1
 export SBP_ROOT="$test_root/runtime" SBP_BIN_DIR="$test_root/bin"
 export SBP_DEPS_SENTINEL="$test_root/runtime/.deps_ok"
@@ -270,6 +276,33 @@ EOF
   [[ "$(wc -l < "$test_root/restarts" | tr -d '[:space:]')" == 2 ]] || fail "failed organization must restart once and restore once"
 }
 
+test_organize_preview(){
+  reset_state
+  jq -n '{
+    rules: (
+      [{domain:["first.example"],outbound:"direct"}]
+      + [range(3) | {domain:["jp-\(.).example"],outbound:"jp"}]
+      + [range(3) | {domain:["hk-\(.).example"],outbound:"hk"}]
+      + [{domain:["blocked.example"],action:"reject"}]
+      + [range(4) | {domain_suffix:["ntt-\(.).example"],outbound:"hk-ntt"}]
+    ),
+    rule_set: [],
+    outbounds: ["jp","hk","hk-ntt"] | map({type:"socks",tag:.,server:"192.0.2.20",server_port:1080}),
+    default_outbound: "direct"
+  }' > "$ROUTE_JSON"
+  local before_route before_conf
+  before_route=$(file_hash "$ROUTE_JSON")
+  before_conf=$(file_hash "$CONF_JSON")
+  if ! organize_custom_route_rules <<< $'3\nn\n' > "$test_root/organize-preview.log" 2>&1; then
+    cat "$test_root/organize-preview.log" >&2
+    fail "organization preview must compile on the selected jq version"
+  fi
+  grep -Fq '整理目标：hk-ntt；总规则数：12 → 9' "$test_root/organize-preview.log" || fail "preview must show the selected outlet and exact rule counts"
+  assert_unchanged "$before_route" "$ROUTE_JSON" "canceling the preview must preserve all route rules"
+  assert_unchanged "$before_conf" "$CONF_JSON" "canceling the preview must preserve runtime config"
+  [[ ! -s "$test_root/restarts" ]] || fail "preview must not restart the service"
+}
+
 test_invalid_imports(){
   reset_state
   local before_route before_conf invalid
@@ -375,9 +408,10 @@ test_menu(){
 case "${1:-all}" in
   block) test_block ;;
   organize) test_organize ;;
+  preview) test_organize_preview ;;
   rollback) test_rollback ;;
   all)
-    for test_name in test_block test_round_trip test_merge test_organize test_invalid_imports test_cancel_and_export_protection test_rollback test_import_check_failure test_menu; do
+    for test_name in test_block test_round_trip test_merge test_organize test_organize_preview test_invalid_imports test_cancel_and_export_protection test_rollback test_import_check_failure test_menu; do
       "$test_name"
       printf 'PASS: %s\n' "$test_name"
     done

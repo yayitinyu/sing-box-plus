@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v3.2.1
+#  Version: v3.2.2
 # ============================================================
 
 set -Eeuo pipefail
@@ -330,7 +330,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.2.1"
+SCRIPT_VERSION="v3.2.2"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -3160,8 +3160,9 @@ organize_custom_route_rules()(
     info "该目标没有相邻规则可合并，配置保持不变。"
     return 0
   fi
-  jq -nr --arg label "$label" --slurpfile current "$work_dir/current.json" --slurpfile candidate "$work_dir/candidate.json" \
-    '"整理目标：\($label)；总规则数：\($current[0].rules | length) → \($candidate[0].rules | length)"' || return 1
+  # jq 1.6 rejects reserved keywords such as "label" even as variable names.
+  jq -nr --arg target_label "$label" --slurpfile current "$work_dir/current.json" --slurpfile candidate "$work_dir/candidate.json" \
+    '"整理目标：\($target_label)；总规则数：\($current[0].rules | length) → \($candidate[0].rules | length)"' || return 1
   if [[ "$mode" == "all" ]]; then
     warn "合并结果放在该目标第一条规则的位置；跨过的其他出口或 block 规则若有重叠匹配，优先级会改变。"
   fi
