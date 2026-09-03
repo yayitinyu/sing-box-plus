@@ -238,6 +238,10 @@ EOF
   import_custom_route_rules "$test_root/organized-export.json" <<< $'2\ny\n' > "$test_root/organized-import.log" 2>&1
   assert_same_json "$test_root/organized-expected.json" "$ROUTE_JSON" "logical organization must survive export and replacement import"
   check_with_core
+  remove_custom_route_rule <<< '2' > "$test_root/remove-after-organize.log" 2>&1
+  assert_json '(.rules | length) == 2 and any(.rule_set[]; .tag == "ads")' "$ROUTE_JSON" "removing another rule must retain dependencies nested inside organized rules"
+  validate_route_references "$ROUTE_JSON" || fail "routes must remain valid after deleting alongside organized rules"
+  check_with_core
 
   reset_state
   printf '%s\n' '{"rules":[{"domain":["first.example"],"outbound":"direct"},{"domain":["middle.example"],"outbound":"remote-vps"},{"domain":["last.example"],"outbound":"direct"}],"outbounds":[{"type":"socks","tag":"remote-vps","server":"192.0.2.20","server_port":1080}]}' > "$ROUTE_JSON"
@@ -369,7 +373,19 @@ test_cancel_and_export_protection(){
 
 test_rollback(){
   reset_state
-  local before_route before_conf
+  local before_route before_conf before_restarts
+  cp "$ROUTE_JSON" "$test_root/route-backup.json"
+  before_conf=$(file_hash "$CONF_JSON")
+  before_restarts=$(file_hash "$test_root/restarts")
+  printf '%s\n' '{"rules":[{"rule_set":["missing"],"outbound":"direct"}]}' > "$ROUTE_JSON"
+  if apply_custom_routing "$test_root/route-backup.json" > "$test_root/reference-rollback.log" 2>&1; then
+    fail "missing rule-set references must fail before generating runtime config"
+  fi
+  assert_same_json "$test_root/route-backup.json" "$ROUTE_JSON" "reference validation failure must restore saved routing rules"
+  assert_unchanged "$before_conf" "$CONF_JSON" "reference validation failure must preserve runtime config"
+  assert_unchanged "$before_restarts" "$test_root/restarts" "reference validation failure must not restart the service"
+
+  reset_state
   before_route=$(file_hash "$ROUTE_JSON")
   before_conf=$(file_hash "$CONF_JSON")
   cp "$ROUTE_JSON" "$test_root/route-backup.json"

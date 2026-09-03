@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v3.2.2
+#  Version: v3.2.3
 # ============================================================
 
 set -Eeuo pipefail
@@ -330,7 +330,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.2.2"
+SCRIPT_VERSION="v3.2.3"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -2646,6 +2646,14 @@ JSON
 # ===== 自定义路由菜单 =====
 apply_custom_routing(){
   local route_bak="${1:-}" conf_bak rollback_failed=0
+  if ! normalize_route_file "$ROUTE_JSON" | validate_route_references -; then
+    if [[ -n "$route_bak" && -f "$route_bak" ]] && ! cp "$route_bak" "$ROUTE_JSON"; then
+      warn "分流引用校验失败，且无法恢复原分流配置。"
+      return 1
+    fi
+    warn "分流引用校验失败，已回滚自定义路由。"
+    return 1
+  fi
   conf_bak="$(mktemp)" || return 1
   if [[ -f "$CONF_JSON" ]] && ! cp "$CONF_JSON" "$conf_bak"; then
     [[ -n "$route_bak" && -f "$route_bak" ]] && cp "$route_bak" "$ROUTE_JSON"
@@ -3017,7 +3025,7 @@ remove_custom_route_rule(){
   tmp="$(mktemp)"
   if jq -c --argjson idx "$idx" '
     .rules = ((.rules // []) | del(.[$idx]))
-    | ([.rules[]?.rule_set[]?] | unique) as $used
+    | ([.rules[] | recurse(if .type == "logical" then .rules[] else empty end) | .rule_set[]?] | unique) as $used
     | .rule_set = ((.rule_set // []) | map(. as $rs | select($used | index($rs.tag))))
   ' "$ROUTE_JSON" > "$tmp"; then
     mv "$tmp" "$ROUTE_JSON"
