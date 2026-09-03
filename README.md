@@ -17,7 +17,7 @@
 | **运行状态看板** | 实时查看主进程 PID、内存占用、20 节点端口监听监控、DNS 切换与证书到期倒计时 |
 | **WARP 出口** | Cloudflare WARP 线路，解锁 Netflix / Disney+ 等流媒体更友好 |
 | **DNS 故障切换** | Cloudflare DoH → Google DoH → UDP 1.0.0.1，连续失败确认与恢复冷却避免探测抖动重启 |
-| **自定义路由** | 按域名 / geosite 指定出口或 block 阻断，支持分流规则 JSON 导入、导出 |
+| **自定义路由** | 按域名 / geosite 指定出口或 block 阻断，支持同出口规则整理及 JSON 导入、导出 |
 | **TLS 证书** | 自签证书 / 手动上传公开有效证书 / ACME 自动申请续期，三种模式一键切换 |
 | **连接稳定** | TCP keepalive · 可调 UDP timeout · WARP 保活 · 全参数环境变量覆盖 |
 | **彻底卸载** | 一键注销服务、关闭防火墙放行、清理二进制与残留数据，干净无痕 |
@@ -201,6 +201,7 @@ openssl x509 -in /opt/sing-box/cert/fullchain.pem -noout -subject
 - **非 Warp 节点默认出口**：支持将 10 个直连协议节点（VLESS-Reality、Hysteria2、TUIC 等）的默认出口 IP 自由切换为已导入的其他 VPS 节点、本机双栈（`direct`）、本机 IPv4（`direct-ipv4`）、本机 IPv6（`direct-ipv6`）或 WARP。
 - **自定义分流规则**：支持为特定域名或 geosite 指定专属出口，或选择 `block` 阻断连接。
 - **导入与导出**：分流子菜单 `7)` 导入、`8)` 导出，包含规则顺序、关联规则集、远程出口配置和默认出口。
+- **整理规则**：分流子菜单 `9)` 选择需要整理的出口（也支持 `block`），预览规则数量变化并确认合并。
 
 > 本机 IPv4 / IPv6 出口通过绑定本机源地址实现。仅 IPv6 出口无法访问没有 AAAA 记录的站点；客户端直接以 IP 地址（而非域名）发起的连接不受解析策略约束。导入的远程节点走哪个 IP 栈出口由对端节点决定，本机无法配置。
 
@@ -225,6 +226,10 @@ geosite:netflix, suffix:openai.com, domain:example.com, keyword:google, regex:.*
 - `example.com` → 按 `suffix:example.com` 处理
 
 规则按列表顺序匹配，先匹配的规则优先；`block` 对直连和 WARP 入站均生效，底层使用 sing-box 的 [`reject` 动作](https://sing-box.sagernet.org/configuration/route/rule_action/#reject)。
+
+整理默认只合并**相邻且目标相同**的规则，不跨过其他规则，保留原有匹配优先级。也可选择将该目标的**全部规则**合并到第一次出现的位置；该方式会提前后面的匹配分支，可能改变与其他出口或 block 规则的优先级，操作前会明确警告并要求确认。
+
+合并结果使用 [`logical / or` 规则](https://sing-box.sagernet.org/configuration/route/rule/#logical-fields)，保留各分支原有的匹配条件和名称，不直接混合域名与规则集条件。未选中的规则、远程出口、规则集定义和默认出口保持不变；合并后的规则可正常显示、删除、导入及导出（需要 v3.2.1 或更新的管理脚本）。应用前自动备份到 `/opt/sing-box/backups/routes-organize-*`，配置检查或服务重启失败时回滚；取消或没有可合并项时不重写配置、不重启服务。
 
 导入时输入本地 JSON 文件路径，然后选择：
 

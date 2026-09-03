@@ -189,6 +189,87 @@ test_merge(){
   done
 }
 
+test_organize(){
+  reset_state
+  cat > "$ROUTE_JSON" <<'EOF'
+{
+  "rules": [
+    {"name":"精确匹配", "domain":["one.example"], "outbound":"direct"},
+    {"name":"Suffix", "domain_suffix":["two.example"], "outbound":"direct"},
+    {"name":"Remote between", "domain_keyword":["remote"], "outbound":"remote-vps"},
+    {"name":"Rule set", "rule_set":["ads"], "outbound":"direct"},
+    {"name":"Regex", "domain_regex":["^four\\.example$"], "outbound":"direct"},
+    {"name":"Block suffix", "domain_suffix":["blocked.example"], "action":"reject"},
+    {"name":"Block keyword", "domain_keyword":["tracker"], "action":"reject"}
+  ],
+  "rule_set": [{"type":"inline", "tag":"ads", "rules":[{"domain_suffix":["ads.example"]}]}],
+  "outbounds": [{"type":"socks", "tag":"remote-vps", "server":"192.0.2.20", "server_port":1080}],
+  "default_outbound":"direct"
+}
+EOF
+  cp "$ROUTE_JSON" "$test_root/organize-original.json"
+  organize_custom_route_rules <<< $'1\n\ny\n' > "$test_root/organize-adjacent.log" 2>&1
+  assert_json '.rules | length == 5 and .[0].type == "logical" and .[0].mode == "or" and (.[0].rules | length) == 2 and .[1].outbound == "remote-vps" and .[2].type == "logical" and (.[2].rules | length) == 2' "$ROUTE_JSON" "adjacent organization must preserve intervening priority and create separate OR groups"
+  assert_json '.route.rules | length == 5 and .[0].type == "logical" and .[0].action == "route" and .[0].outbound == "direct" and all(.[0].rules[]; has("action") | not) and .[1].outbound == "remote-vps"' "$CONF_JSON" "organized rules must render as valid logical route rules"
+  grep -q '精确匹配: domain:one.example' <(print_custom_routes) || fail "organized rule display must retain branch names and matchers"
+  local organize_backup
+  organize_backup=$(find "$SB_DIR/backups" -type f -name 'routes-organize-*' -print -quit)
+  [[ -n "$organize_backup" ]] || fail "organization must keep a recovery backup"
+  assert_same_json "$test_root/organize-original.json" "$organize_backup" "organization backup must contain the original unmerged rules"
+  organize_custom_route_rules <<< $'1\n2\ny\n' > "$test_root/organize-all.log" 2>&1
+  assert_json '.rules | length == 4 and .[0].type == "logical" and (.[0].rules | length) == 4 and .[1].outbound == "remote-vps"' "$ROUTE_JSON" "full organization must consolidate the selected outlet at its first position"
+  jq -en --slurpfile original "$test_root/organize-original.json" --slurpfile organized "$ROUTE_JSON" '
+    [$original[0].rules[] | select(.outbound == "direct") | del(.action, .outbound)] == $organized[0].rules[0].rules
+    and ($original[0] | del(.rules)) == ($organized[0] | del(.rules))
+  ' >/dev/null || fail "organization must preserve every original predicate, name, dependency, and default outlet"
+  grep -q '优先级会改变' "$test_root/organize-all.log" || fail "full organization must warn about priority changes"
+  organize_custom_route_rules <<< $'1\ny\n' > "$test_root/organize-block.log" 2>&1
+  assert_json '.rules | length == 3 and .[-1].type == "logical" and .[-1].action == "reject" and (.[-1] | has("outbound") | not) and (.[-1].rules | length) == 2' "$ROUTE_JSON" "block rules must be organized without inventing an outbound"
+  assert_json '.route.rules[-1].type == "logical" and .route.rules[-1].action == "reject" and (.route.rules[-1] | has("outbound") | not)' "$CONF_JSON" "organized block rules must render as logical reject rules"
+  export_custom_route_rules "$test_root/organized-export.json" > "$test_root/organized-export.log" 2>&1
+  cp "$ROUTE_JSON" "$test_root/organized-expected.json"
+  empty_route_json > "$ROUTE_JSON"
+  import_custom_route_rules "$test_root/organized-export.json" <<< $'2\ny\n' > "$test_root/organized-import.log" 2>&1
+  assert_same_json "$test_root/organized-expected.json" "$ROUTE_JSON" "logical organization must survive export and replacement import"
+  check_with_core
+
+  reset_state
+  printf '%s\n' '{"rules":[{"domain":["first.example"],"outbound":"direct"},{"domain":["middle.example"],"outbound":"remote-vps"},{"domain":["last.example"],"outbound":"direct"}],"outbounds":[{"type":"socks","tag":"remote-vps","server":"192.0.2.20","server_port":1080}]}' > "$ROUTE_JSON"
+  local before_route before_conf before_restarts
+  before_route=$(file_hash "$ROUTE_JSON")
+  before_conf=$(file_hash "$CONF_JSON")
+  before_restarts=$(file_hash "$test_root/restarts")
+  organize_custom_route_rules <<< $'1\n1\n' > "$test_root/organize-no-adjacent.log" 2>&1
+  assert_unchanged "$before_route" "$ROUTE_JSON" "adjacent mode must not move separated rules"
+  assert_unchanged "$before_conf" "$CONF_JSON" "a no-op organization must not rewrite runtime config"
+  assert_unchanged "$before_restarts" "$test_root/restarts" "a no-op organization must not restart services"
+  organize_custom_route_rules <<< $'1\n2\nn\n' > "$test_root/organize-cancel.log" 2>&1
+  assert_unchanged "$before_route" "$ROUTE_JSON" "canceling organization must preserve the original routes"
+  assert_unchanged "$before_conf" "$CONF_JSON" "canceling organization must preserve runtime config"
+  assert_unchanged "$before_restarts" "$test_root/restarts" "canceling organization must not restart services"
+
+  reset_state
+  printf '%s\n' '{"rules":[{"domain":["first.example"],"outbound":"direct"},{"domain_suffix":["second.example"],"outbound":"direct"}]}' > "$ROUTE_JSON"
+  before_route=$(file_hash "$ROUTE_JSON")
+  before_conf=$(file_hash "$CONF_JSON")
+  : > "$test_root/restarts"
+  touch "$SB_DIR/fail-check"
+  if organize_custom_route_rules <<< $'1\ny\n' > "$test_root/organize-check-failure.log" 2>&1; then
+    fail "failed core validation must fail organization"
+  fi
+  assert_unchanged "$before_route" "$ROUTE_JSON" "failed validation must restore the original routes"
+  assert_unchanged "$before_conf" "$CONF_JSON" "failed validation must preserve runtime config"
+  [[ ! -s "$test_root/restarts" ]] || fail "failed validation must not restart the service"
+  rm -f -- "$SB_DIR/fail-check"
+  touch "$test_root/fail-restart"
+  if organize_custom_route_rules <<< $'1\ny\n' > "$test_root/organize-rollback.log" 2>&1; then
+    fail "failed service restart must fail organization"
+  fi
+  assert_unchanged "$before_route" "$ROUTE_JSON" "failed organization must restore the original routes"
+  assert_unchanged "$before_conf" "$CONF_JSON" "failed organization must restore the runtime config"
+  [[ "$(wc -l < "$test_root/restarts" | tr -d '[:space:]')" == 2 ]] || fail "failed organization must restart once and restore once"
+}
+
 test_invalid_imports(){
   reset_state
   local before_route before_conf invalid
@@ -207,6 +288,10 @@ test_invalid_imports(){
     '{"rules":[{"action":"reject","domain":["example.com"],"source_ip_cidr":["192.0.2.0/24"]}]}'
     '{"rules":[{"action":"reject","domain":["example.com"],"outbound":"direct"}]}'
     '{"rules":[{"action":"unknown","domain":["example.com"],"outbound":"direct"}]}'
+    '{"rules":[{"type":"logical","mode":"and","rules":[{"domain":["one.example"]},{"domain":["two.example"]}],"outbound":"direct"}]}'
+    '{"rules":[{"type":"logical","mode":"or","rules":[],"outbound":"direct"}]}'
+    '{"rules":[{"type":"logical","mode":"or","rules":[{"domain":["one.example"],"outbound":"direct"},{"domain":["two.example"]}],"outbound":"direct"}]}'
+    '{"rules":[{"type":"logical","mode":"or","rules":[{"rule_set":["missing"]},{"domain":["two.example"]}],"outbound":"direct"}]}'
     '{"rules":[{"domain":["example.com"],"outbound":"missing"}]}'
     '{"rules":[{"action":"reject","rule_set":["missing"]}]}'
     '{"rules":[],"default_outbound":"missing"}'
@@ -284,13 +369,15 @@ test_menu(){
   reset_state
   custom_route_menu <<< $'7\n/nonexistent/rules.json\n\n8\n'"$test_root/menu-export.json"$'\n\n0\n' > "$test_root/menu.log" 2>&1
   [[ -s "$test_root/menu-export.json" ]] || fail "routing menu must remain usable after a failed import"
+  grep -q '9).*整理分流规则' "$test_root/menu.log" || fail "routing menu must expose the organization action"
 }
 
 case "${1:-all}" in
   block) test_block ;;
+  organize) test_organize ;;
   rollback) test_rollback ;;
   all)
-    for test_name in test_block test_round_trip test_merge test_invalid_imports test_cancel_and_export_protection test_rollback test_import_check_failure test_menu; do
+    for test_name in test_block test_round_trip test_merge test_organize test_invalid_imports test_cancel_and_export_protection test_rollback test_import_check_failure test_menu; do
       "$test_name"
       printf 'PASS: %s\n' "$test_name"
     done

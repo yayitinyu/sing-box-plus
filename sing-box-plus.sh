@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v3.2.0
+#  Version: v3.2.1
 # ============================================================
 
 set -Eeuo pipefail
@@ -330,7 +330,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.2.0"
+SCRIPT_VERSION="v3.2.1"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -704,8 +704,34 @@ normalize_route_file(){
       if type == "string" then test("^[A-Za-z0-9._@!-]+$") else false end;
     def string_list:
       if type == "array" then all(.[]; nonempty_string) else false end;
-    ["domain", "domain_suffix", "domain_keyword", "domain_regex", "rule_set"] as $match_keys
-    | ["direct", "direct-ipv4", "direct-ipv6", "warp"] as $builtins
+    def normalize_match_rule:
+      ["domain", "domain_suffix", "domain_keyword", "domain_regex", "rule_set"] as $match_keys
+      | if type != "object" then error("每个匹配分支必须是对象") else . end
+      | if has("name") and (.name | type) != "string" then error("规则名称必须是字符串")
+        else . end
+      | if .type == "logical" then
+          if ((keys - ["name", "type", "mode", "rules"]) | length) > 0 then
+            error("逻辑分支含有不支持的字段")
+          elif .mode != "or" then error("整理规则只支持 or 逻辑")
+          elif (.rules | type) != "array" or (.rules | length) < 2 then error("逻辑规则至少需要两个匹配分支")
+          else . end
+          | .rules |= map(normalize_match_rule)
+        else
+          if ((keys - ($match_keys + ["name"])) | length) > 0 then error("匹配分支含有不支持的字段") else . end
+          | . as $rule
+          | if all($match_keys[]; . as $key | ($rule | has($key) | not) or ($rule[$key] | string_list)) then .
+            else error("匹配项必须是非空字符串组成的数组") end
+          | if ([$match_keys[] as $key | ($rule[$key] // []) | length] | add) == 0 then
+              error("分流规则至少需要一个匹配项")
+            else . end
+        end;
+    def normalize_target:
+      if .action == "reject" then
+        if has("outbound") then error("block 规则不能同时指定出口") else . end
+      elif has("action") and .action != "route" then error("只支持 route 或 reject 动作")
+      elif (.outbound | valid_tag | not) then error("路由规则缺少有效出口")
+      else . end;
+    ["direct", "direct-ipv4", "direct-ipv6", "warp"] as $builtins
     | if length != 1 or (.[0] | type) != "object" then
         error("分流文件必须包含一个 JSON 对象")
       else .[0] end
@@ -724,20 +750,9 @@ normalize_route_file(){
       else . end
     | .rules |= map(
         if type != "object" then error("每条分流规则必须是对象") else . end
-        | if ((keys - ($match_keys + ["name", "action", "outbound"])) | length) > 0 then
-            error("规则含有不支持的字段，无法完整导入")
-          elif has("name") and (.name | type) != "string" then error("规则名称必须是字符串")
-          else . end
         | . as $rule
-        | if all($match_keys[]; . as $key | ($rule | has($key) | not) or ($rule[$key] | string_list)) then .
-          else error("匹配项必须是非空字符串组成的数组") end
-        | if ([$match_keys[] as $key | ($rule[$key] // []) | length] | add) == 0 then
-            error("分流规则至少需要一个匹配项")
-          elif .action == "reject" then
-            if has("outbound") then error("block 规则不能同时指定出口") else . end
-          elif has("action") and .action != "route" then error("只支持 route 或 reject 动作")
-          elif (.outbound | valid_tag | not) then error("路由规则缺少有效出口")
-          else . end)
+        | del(.action, .outbound) | normalize_match_rule
+        | $rule | normalize_target)
     | .outbounds |= map(
         if type != "object" then error("每个远程出口必须是对象") else . end
         | .tag as $tag
@@ -765,10 +780,11 @@ validate_route_references(){
   jq -e '
     (["direct", "direct-ipv4", "direct-ipv6", "warp"] + [.outbounds[].tag]) as $outbounds
     | [.rule_set[].tag] as $rule_sets
+    | [.rules[] | recurse(if .type == "logical" then .rules[] else empty end)] as $match_rules
     | if all(.rules[] | select(.action != "reject"); .outbound as $tag | ($outbounds | index($tag)) != null)
         and (.default_outbound as $tag | ($outbounds | index($tag)) != null) then .
       else error("分流配置引用了不存在的出口") end
-    | if all(.rules[].rule_set[]?; . as $tag | ($rule_sets | index($tag)) != null) then .
+    | if all($match_rules[]; all(.rule_set[]?; . as $tag | ($rule_sets | index($tag)) != null)) then .
       else error("分流配置引用了不存在的规则集") end
     | if all(.rule_set[] | select(has("download_detour")); .download_detour as $tag | ($outbounds | index($tag)) != null) then .
       else error("规则集下载引用了不存在的出口") end
@@ -791,6 +807,48 @@ merge_route_files(){
         outbounds: merge_tags($old.outbounds; $new.outbounds; "远程出口")
       }
   '
+}
+
+consolidate_route_rules(){
+  local source_file="$1" target="$2" mode="$3"
+  # Keep original predicates as OR branches; flattening domain and rule-set fields can change their meaning.
+  jq -c --arg target "$target" --arg mode "$mode" '
+    def target_key:
+      if .action == "reject" then "reject:" else "route:" + .outbound end;
+    def target_fields($key):
+      if $key == "reject:" then {action:"reject"}
+      else {outbound:($key | ltrimstr("route:"))} end;
+    def branches:
+      if .type == "logical" and .mode == "or" and ((.name // "") == "") then .rules[]
+      else del(.action, .outbound) end;
+    def combined($items; $key):
+      if ($items | length) == 1 then $items[0]
+      else
+        (reduce ($items[] | branches) as $branch ([];
+          if index($branch) == null then . + [$branch] else . end)) as $branches
+        | if ($branches | length) == 1 then $branches[0] + target_fields($key)
+          else {type:"logical", mode:"or", rules:$branches} + target_fields($key) end
+      end;
+    def flush($state; $key):
+      if ($state.pending | length) == 0 then $state
+      else $state | .output += [combined(.pending; $key)] | .pending = [] end;
+    . as $document
+    | if $mode == "adjacent" then
+        (reduce .rules[] as $rule ({output:[], pending:[]};
+          if ($rule | target_key) == $target then .pending += [$rule]
+          else flush(.; $target) | .output += [$rule] end)
+          | flush(.; $target)) as $state
+        | $document | .rules = $state.output
+      elif $mode == "all" then
+        [.rules[] | select((. | target_key) == $target)] as $selected
+        | combined($selected; $target) as $merged
+        | (reduce .rules[] as $rule ({output:[], inserted:false};
+            if ($rule | target_key) == $target then
+              if .inserted then . else .output += [$merged] | .inserted = true end
+            else .output += [$rule] end)) as $state
+        | $document | .rules = $state.output
+      else error("不支持的整理方式") end
+  ' "$source_file"
 }
 
 parse_route_match_json(){
@@ -2364,13 +2422,21 @@ write_config(){
     ((($CUSTOM_ROUTES.rules // []) | map(select((.outbound // "") == $tag)) | length) > 0)
     or (($CUSTOM_ROUTES.default_outbound // "direct") == $tag);
 
-  def custom_route_rule($rule):
+  def custom_route_match($rule):
     ({}
       + (if (($rule.domain // []) | length) > 0 then {domain:$rule.domain} else {} end)
       + (if (($rule.domain_suffix // []) | length) > 0 then {domain_suffix:$rule.domain_suffix} else {} end)
       + (if (($rule.domain_keyword // []) | length) > 0 then {domain_keyword:$rule.domain_keyword} else {} end)
       + (if (($rule.domain_regex // []) | length) > 0 then {domain_regex:$rule.domain_regex} else {} end)
-      + (if (($rule.rule_set // []) | length) > 0 then {rule_set:$rule.rule_set} else {} end)
+      + (if (($rule.rule_set // []) | length) > 0 then {rule_set:$rule.rule_set} else {} end));
+
+  def custom_route_match_tree($rule):
+    if $rule.type == "logical" then
+      {type:"logical", mode:"or", rules:(($rule.rules // []) | map(custom_route_match_tree(.)))}
+    else custom_route_match($rule) end;
+
+  def custom_route_rule($rule):
+    (custom_route_match_tree($rule)
       + (if $rule.action == "reject" then {action:"reject"} else {action:"route", outbound:$rule.outbound} end));
 
   def custom_route_rules:
@@ -2641,17 +2707,27 @@ print_custom_routes(){
   echo -e "${C_CYAN}非 Warp 节点默认出口:${C_RESET} ${def_outbound}"
   echo
   jq -r --arg cur_default "$def_outbound" '
-    def match_text:
+    def simple_match_text:
       [(.domain // [] | map("domain:" + .))[],
        (.domain_suffix // [] | map("suffix:" + .))[],
        (.domain_keyword // [] | map("keyword:" + .))[],
        (.domain_regex // [] | map("regex:" + .))[],
        (.rule_set // [] | map("rule-set:" + .))[]] | join(", ");
+    def match_text:
+      if .type == "logical" then
+        [.rules[] | ((.name // "") as $name
+          | (if $name == "" then "" else $name + ": " end) + (. | match_text))]
+        | "OR [" + join("；") + "]"
+      else simple_match_text end;
+    def display_name:
+      if (.name // "") != "" then .name
+      elif .type == "logical" then "合并规则（\(.rules | length) 个分支）"
+      else "未命名" end;
     "自定义路由规则:",
     (if ((.rules // []) | length) == 0 then
       "  （无）"
     else
-      (.rules // [] | to_entries[] | "  \(.key + 1)) \((.value.name // "未命名")) -> \(if .value.action == "reject" then "block（阻断）" else .value.outbound end) | \(.value | match_text)")
+      (.rules // [] | to_entries[] | "  \(.key + 1)) \(.value | display_name) -> \(if .value.action == "reject" then "block（阻断）" else .value.outbound end) | \(.value | match_text)")
     end),
     "",
     "导入的远程出口:",
@@ -3004,6 +3080,112 @@ clear_custom_route_rules(){
   rm -f "$route_bak"
 }
 
+organize_custom_route_rules()(
+  local work_dir choice target count segments mode=adjacent idx line label route_bak yn candidate_rows
+  local -a candidates
+  [[ -s "$ROUTE_JSON" ]] || { info "没有可整理的分流规则。"; return 0; }
+  ensure_dirs || return 1
+  work_dir=$(mktemp -d "$SB_DIR/.routes-organize.XXXXXX") || return 1
+  trap 'rm -f -- "$work_dir/original.json" "$work_dir/current.json" "$work_dir/candidate.json"; rmdir -- "$work_dir"' EXIT
+  cp "$ROUTE_JSON" "$work_dir/original.json" || { warn "读取分流配置失败。"; return 1; }
+  if ! normalize_route_file "$work_dir/original.json" > "$work_dir/current.json" \
+      || ! validate_route_references "$work_dir/current.json"; then
+    warn "当前分流配置无效，未修改任何规则。"
+    return 1
+  fi
+  candidate_rows=$(jq -r '
+    [.rules[] | if .action == "reject" then "reject:" else "route:" + .outbound end] as $targets
+    | (reduce $targets[] as $target ([]; if index($target) == null then . + [$target] else . end))[] as $target
+    | ([$targets[] | select(. == $target)] | length) as $count
+    | select($count > 1) | [$target, $count] | @tsv
+  ' "$work_dir/current.json" | tr -d '\r') || { warn "读取整理目标失败。"; return 1; }
+  candidates=()
+  if [[ -n "$candidate_rows" ]]; then mapfile -t candidates <<< "$candidate_rows"; fi
+  if (( ${#candidates[@]} == 0 )); then
+    info "没有相同出口或 block 的重复规则需要合并。"
+    return 0
+  fi
+  echo "选择要整理的目标："
+  for idx in "${!candidates[@]}"; do
+    line="${candidates[$idx]}"
+    target="${line%%$'\t'*}"
+    count="${line#*$'\t'}"
+    label="${target#route:}"
+    [[ "$target" == "reject:" ]] && label="block（阻断）"
+    printf '  %s) %s（%s 条规则）\n' "$((idx+1))" "$label" "$count"
+  done
+  echo "  0) 取消"
+  read -rp "选择目标 [0]: " choice || return 1
+  choice="${choice//$'\r'/}"
+  case "${choice:-0}" in 0|q|Q) return 0 ;; esac
+  if [[ ! "$choice" =~ ^[0-9]{1,6}$ ]]; then warn "无效目标选择。"; return 1; fi
+  idx=$((10#$choice-1))
+  if (( idx < 0 || idx >= ${#candidates[@]} )); then warn "无效目标选择。"; return 1; fi
+  line="${candidates[$idx]}"
+  target="${line%%$'\t'*}"
+  label="${target#route:}"
+  [[ "$target" == "reject:" ]] && label="block（阻断）"
+  segments=$(jq -r --arg target "$target" '
+    reduce .rules[] as $rule ({count:0, previous:false};
+      ($rule | if .action == "reject" then "reject:" else "route:" + .outbound end) as $key
+      | if $key == $target then
+          .count += (if .previous then 0 else 1 end) | .previous = true
+        else .previous = false end)
+    | .count
+  ' "$work_dir/current.json" | tr -d '\r') || return 1
+  if (( segments > 1 )); then
+    echo "  1) 仅合并相邻规则（保持优先级）"
+    echo "  2) 合并该目标的全部规则（可能改变优先级）"
+    echo "  0) 取消"
+    read -rp "整理方式 [1]: " choice || return 1
+    choice="${choice//$'\r'/}"
+    case "${choice:-1}" in
+      1) mode=adjacent ;;
+      2) mode=all ;;
+      0|q|Q) return 0 ;;
+      *) warn "无效整理方式。"; return 1 ;;
+    esac
+  fi
+  if ! consolidate_route_rules "$work_dir/current.json" "$target" "$mode" > "$work_dir/candidate.json"; then
+    warn "整理失败，未修改现有规则。"
+    return 1
+  fi
+  if ! normalize_route_file "$work_dir/candidate.json" >/dev/null \
+      || ! validate_route_references "$work_dir/candidate.json"; then
+    warn "整理结果校验失败，未修改现有规则。"
+    return 1
+  fi
+  if jq -en --slurpfile current "$work_dir/current.json" --slurpfile candidate "$work_dir/candidate.json" \
+      '$current[0] == $candidate[0]' >/dev/null; then
+    info "该目标没有相邻规则可合并，配置保持不变。"
+    return 0
+  fi
+  jq -nr --arg label "$label" --slurpfile current "$work_dir/current.json" --slurpfile candidate "$work_dir/candidate.json" \
+    '"整理目标：\($label)；总规则数：\($current[0].rules | length) → \($candidate[0].rules | length)"' || return 1
+  if [[ "$mode" == "all" ]]; then
+    warn "合并结果放在该目标第一条规则的位置；跨过的其他出口或 block 规则若有重叠匹配，优先级会改变。"
+  fi
+  read -rp "确认整理并应用（服务运行时会重启）？[y/N] " yn || return 1
+  [[ "${yn//$'\r'/}" =~ ^[Yy]$ ]] || return 0
+  if ! jq -en --slurpfile original "$work_dir/original.json" --slurpfile current "$ROUTE_JSON" \
+      '$original[0] == $current[0]' >/dev/null; then
+    warn "分流配置已被其他操作修改，请重新整理。"
+    return 1
+  fi
+  (umask 077; mkdir -p "$SB_DIR/backups") || return 1
+  route_bak=$(mktemp "$SB_DIR/backups/routes-organize-$(date +%Y%m%d-%H%M%S)-XXXXXX") || return 1
+  if ! cp "$ROUTE_JSON" "$route_bak"; then
+    warn "备份分流配置失败，已取消整理。"
+    return 1
+  fi
+  if ! chmod 600 "$work_dir/candidate.json" || ! mv -f -- "$work_dir/candidate.json" "$ROUTE_JSON"; then
+    warn "保存整理结果失败。"
+    return 1
+  fi
+  info "原分流配置已备份：$route_bak"
+  apply_custom_routing "$route_bak"
+)
+
 export_custom_route_rules()(
   local destination="${1:-}" default_path tmp export_dir yn
   [[ -s "$ROUTE_JSON" ]] || { warn "没有可导出的分流配置。"; return 1; }
@@ -3136,6 +3318,7 @@ custom_route_menu(){
     echo -e "  ${C_RED}6)${C_RESET} 清空自定义路由规则"
     echo -e "  ${C_GREEN}7)${C_RESET} 导入分流规则"
     echo -e "  ${C_GREEN}8)${C_RESET} 导出分流规则"
+    echo -e "  ${C_GREEN}9)${C_RESET} 整理分流规则（合并相同出口）"
     echo -e "  ${C_RED}0)${C_RESET} 返回主菜单"
     hr
     read -rp "选择: " op || return 0
@@ -3148,6 +3331,7 @@ custom_route_menu(){
       6) clear_custom_route_rules || true; read -rp "回车继续..." _ || true ;;
       7) import_custom_route_rules || true; read -rp "回车继续..." _ || true ;;
       8) export_custom_route_rules || true; read -rp "回车继续..." _ || true ;;
+      9) organize_custom_route_rules || true; read -rp "回车继续..." _ || true ;;
       0|q|Q) return 0 ;;
       *) warn "无效选项"; sleep 1 ;;
     esac
