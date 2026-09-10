@@ -331,7 +331,7 @@ DNS_FAILURE_THRESHOLD=3 DNS_RECOVERY_THRESHOLD=5 DNS_SWITCH_COOLDOWN=600 bash sb
 - **NekoBox** / **sing-box 客户端**
 - **Shadowrocket** / **Quantumult X**
 
-> 💡 AnyTLS 使用 `h2` / `http/1.1` ALPN，分享链接附带 `fp=chrome`。部分客户端可能不支持直接导入 AnyTLS 链接，可按输出的服务器、端口、SNI、ALPN 和密码手动添加。
+> 💡 AnyTLS 使用 `h2` / `http/1.1` ALPN，分享链接附带 `fp=ios`。部分客户端可能不支持直接导入 AnyTLS 链接，可按输出的服务器、端口、SNI、ALPN 和密码手动添加。
 
 ---
 

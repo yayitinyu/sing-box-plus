@@ -950,7 +950,7 @@ share_link_to_outbound(){
       ws_host="$(query_get "$query" host)"
       jq -n -c \
         --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" \
-        --arg flow "$flow" --arg security "$security" --arg sni "$sni" --arg fp "${fp:-chrome}" \
+        --arg flow "$flow" --arg security "$security" --arg sni "$sni" --arg fp "${fp:-ios}" \
         --arg pbk "$pbk" --arg sid "$sid" --arg transport "$transport_type" \
         --arg grpc "$grpc_service" --arg path "$ws_path" --arg host "$ws_host" '
         {type:"vless", tag:$tag, server:$server, server_port:$port, uuid:$uuid, domain_resolver:"dns-doh-primary"}
@@ -980,7 +980,7 @@ share_link_to_outbound(){
       ws_host="$(query_get "$query" host)"
       jq -n -c \
         --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg password "$password" \
-        --arg security "$security" --arg sni "$sni" --arg fp "${fp:-chrome}" \
+        --arg security "$security" --arg sni "$sni" --arg fp "${fp:-ios}" \
         --arg pbk "$pbk" --arg sid "$sid" --arg transport "$transport_type" \
         --arg grpc "$grpc_service" --arg path "$ws_path" --arg host "$ws_host" '
         {type:"trojan", tag:$tag, server:$server, server_port:$port, password:$password, domain_resolver:"dns-doh-primary"}
@@ -2583,9 +2583,9 @@ print_links_grouped(){
     tls_tip="Hysteria2 / TUIC / AnyTLS 使用自签证书并已允许跳过证书验证"
   fi
   # 直连10
-  links_direct+=("vless://${UUID}@${ip}:${PORT_VLESSR}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality")
-  links_direct+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality")
-  links_direct+=("trojan://${UUID}@${ip}:${PORT_TROJANR}?security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality")
+  links_direct+=("vless://${UUID}@${ip}:${PORT_VLESSR}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality")
+  links_direct+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality")
+  links_direct+=("trojan://${UUID}@${ip}:${PORT_TROJANR}?security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality")
   links_direct+=("hy2://$(urlenc "${HY2_PWD}")@${tls_host}:${PORT_HY2}?${tls_security_query}#hysteria2")
   local VMESS_JSON; VMESS_JSON=$(cat <<JSON
 {"v":"2","ps":"vmess-ws","add":"${ip}","port":"${PORT_VMESS_WS}","id":"${UUID}","aid":"0","net":"ws","type":"none","host":"","path":"${VMESS_WS_PATH}","tls":""}
@@ -2596,12 +2596,12 @@ JSON
   links_direct+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022}#ss2022")
   links_direct+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS}#ss")
   links_direct+=("tuic://${UUID}:$(urlenc "${UUID}")@${tls_host}:${PORT_TUIC}?congestion_control=bbr&alpn=h3&${tls_security_query}#tuic-v5")
-  links_direct+=("anytls://$(urlenc "${ANYTLS_PWD}")@${tls_host}:${PORT_ANYTLS}?${tls_security_query}&alpn=h2,http/1.1&fp=chrome#anytls")
+  links_direct+=("anytls://$(urlenc "${ANYTLS_PWD}")@${tls_host}:${PORT_ANYTLS}?${tls_security_query}&alpn=h2,http/1.1&fp=ios#anytls")
 
   # WARP 10
-  links_warp+=("vless://${UUID}@${ip}:${PORT_VLESSR_W}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality-warp")
-  links_warp+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR_W}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality-warp")
-  links_warp+=("trojan://${UUID}@${ip}:${PORT_TROJANR_W}?security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality-warp")
+  links_warp+=("vless://${UUID}@${ip}:${PORT_VLESSR_W}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality-warp")
+  links_warp+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR_W}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality-warp")
+  links_warp+=("trojan://${UUID}@${ip}:${PORT_TROJANR_W}?security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality-warp")
   links_warp+=("hy2://$(urlenc "${HY2_PWD}")@${tls_host}:${PORT_HY2_W}?${tls_security_query}#hysteria2-warp")
   local VMESS_JSON_W; VMESS_JSON_W=$(cat <<JSON
 {"v":"2","ps":"vmess-ws-warp","add":"${ip}","port":"${PORT_VMESS_WS_W}","id":"${UUID}","aid":"0","net":"ws","type":"none","host":"","path":"${VMESS_WS_PATH}","tls":""}
@@ -2612,7 +2612,7 @@ JSON
   links_warp+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022_W}#ss2022-warp")
   links_warp+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS_W}#ss-warp")
   links_warp+=("tuic://${UUID}:$(urlenc "${UUID}")@${tls_host}:${PORT_TUIC_W}?congestion_control=bbr&alpn=h3&${tls_security_query}#tuic-v5-warp")
-  links_warp+=("anytls://$(urlenc "${ANYTLS_PWD}")@${tls_host}:${PORT_ANYTLS_W}?${tls_security_query}&alpn=h2,http/1.1&fp=chrome#anytls-warp")
+  links_warp+=("anytls://$(urlenc "${ANYTLS_PWD}")@${tls_host}:${PORT_ANYTLS_W}?${tls_security_query}&alpn=h2,http/1.1&fp=ios#anytls-warp")
 
   mkdir -p "$(dirname "$SHARE_LINKS_FILE")"
   links_tmp="$(mktemp "${SHARE_LINKS_FILE}.tmp.XXXXXX")" || {
