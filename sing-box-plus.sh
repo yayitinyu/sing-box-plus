@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
-#  Sing-Box-Plus 管理脚本（20 节点：直连 10 + WARP 10）
-#  Version: v3.2.3
+#  Sing-Box-Plus 管理脚本（直连 10 + WARP 就绪时额外 10）
+#  Version: v3.2.4
 # ============================================================
 
 set -Eeuo pipefail
@@ -330,7 +330,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.2.3"
+SCRIPT_VERSION="v3.2.4"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -645,17 +645,23 @@ EOF
 }
 load_creds(){ safe_source_env "$SB_DIR/creds.env" || return 1; }
 
-save_warp(){ cat > "$SB_DIR/warp.env" <<EOF
-WARP_PRIVATE_KEY=$WARP_PRIVATE_KEY
-WARP_PEER_PUBLIC_KEY=$WARP_PEER_PUBLIC_KEY
-WARP_ENDPOINT_HOST=$WARP_ENDPOINT_HOST
-WARP_ENDPOINT_PORT=$WARP_ENDPOINT_PORT
-WARP_ADDRESS_V4=$WARP_ADDRESS_V4
-WARP_ADDRESS_V6=$WARP_ADDRESS_V6
-WARP_RESERVED_1=$WARP_RESERVED_1
-WARP_RESERVED_2=$WARP_RESERVED_2
-WARP_RESERVED_3=$WARP_RESERVED_3
-EOF
+save_warp(){
+  local tmp
+  mkdir -p "$SB_DIR" || return 1
+  tmp="$(mktemp "$SB_DIR/warp.env.tmp.XXXXXX")" || return 1
+  {
+    printf 'WARP_PRIVATE_KEY=%q\n' "${WARP_PRIVATE_KEY:-}"
+    printf 'WARP_PEER_PUBLIC_KEY=%q\n' "${WARP_PEER_PUBLIC_KEY:-}"
+    printf 'WARP_ENDPOINT_HOST=%q\n' "${WARP_ENDPOINT_HOST:-}"
+    printf 'WARP_ENDPOINT_PORT=%q\n' "${WARP_ENDPOINT_PORT:-}"
+    printf 'WARP_ADDRESS_V4=%q\n' "${WARP_ADDRESS_V4:-}"
+    printf 'WARP_ADDRESS_V6=%q\n' "${WARP_ADDRESS_V6:-}"
+    printf 'WARP_RESERVED_1=%q\n' "${WARP_RESERVED_1:-0}"
+    printf 'WARP_RESERVED_2=%q\n' "${WARP_RESERVED_2:-0}"
+    printf 'WARP_RESERVED_3=%q\n' "${WARP_RESERVED_3:-0}"
+  } > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$SB_DIR/warp.env" || { rm -f -- "$tmp"; return 1; }
 }
 load_warp(){ safe_source_env "$SB_DIR/warp.env" || return 1; }
 
@@ -1603,8 +1609,111 @@ pad_b64(){
 
 
 # ===== WARP（wgcf）配置生成/修复 =====
+valid_warp_key(){
+  local key
+  key="$(pad_b64 "${1:-}")"
+  [[ "$key" =~ ^[A-Za-z0-9+/]{43}=$ ]]
+}
+
+warp_profile_ready(){
+  local value
+  [[ "${ENABLE_WARP:-false}" == "true" ]] || return 1
+  valid_warp_key "${WARP_PRIVATE_KEY:-}" || return 1
+  valid_warp_key "${WARP_PEER_PUBLIC_KEY:-}" || return 1
+  [[ -n "${WARP_ENDPOINT_HOST:-}" && "${WARP_ENDPOINT_HOST:-}" != *[[:space:]]* ]] || return 1
+  [[ "${WARP_ENDPOINT_PORT:-}" =~ ^[0-9]+$ ]] || return 1
+  (( WARP_ENDPOINT_PORT >= 1 && WARP_ENDPOINT_PORT <= 65535 )) || return 1
+  [[ -n "${WARP_ADDRESS_V4:-}" || -n "${WARP_ADDRESS_V6:-}" ]] || return 1
+  for value in "${WARP_RESERVED_1:-0}" "${WARP_RESERVED_2:-0}" "${WARP_RESERVED_3:-0}"; do
+    [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 0 && value <= 255 )) || return 1
+  done
+}
+
+wgcf_account_ready(){
+  local account_file="$1" key
+  [[ -s "$account_file" ]] || return 1
+  for key in device_id access_token private_key; do
+    grep -Eq "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*['\"][^'\"]+['\"]" "$account_file" || return 1
+  done
+}
+
+save_private_file(){
+  local source_file="$1" target_file="$2" tmp
+  tmp="$(mktemp "${target_file}.tmp.XXXXXX")" || return 1
+  if ! cp -- "$source_file" "$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$target_file"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+record_wgcf_failure(){
+  local phase="$1" log_file="$2" saved_log="$WGCF_DIR/wgcf-last-error.log"
+  mkdir -p "$WGCF_DIR" || true
+  install -m 0600 "$log_file" "$saved_log" 2>/dev/null || true
+  if grep -Fqi '429 Too Many Requests' "$log_file"; then
+    warn "Cloudflare WARP 注册接口返回 HTTP 429；已停止自动重试，避免出口继续触发限流。"
+    warn "可稍后运行 sudo bash ${SBP_SCRIPT_PATH} --repair-warp，或从其他网络生成 wgcf-account.toml 后放入 $WGCF_DIR 再修复。"
+  else
+    warn "wgcf ${phase}失败，未继续读取或发布无效 WARP 配置。"
+  fi
+  [[ -s "$saved_log" ]] && warn "完整错误日志：$saved_log"
+}
+
+run_wgcf_logged(){
+  local phase="$1" log_file="$2"
+  shift 2
+  if "$WGCF_BIN" "$@" > "$log_file" 2>&1; then
+    return 0
+  fi
+  record_wgcf_failure "$phase" "$log_file"
+  return 1
+}
+
+parse_warp_profile(){
+  local prof="$1" ep ad rs addr
+  local -a addresses=() line_addresses=()
+  [[ -s "$prof" ]] || return 1
+
+  WARP_PRIVATE_KEY="$(pad_b64 "$(awk -F'= *' '/^PrivateKey/{gsub(/\r/,"");print $2; exit}' "$prof")")"
+  WARP_PEER_PUBLIC_KEY="$(pad_b64 "$(awk -F'= *' '/^PublicKey/{gsub(/\r/,"");print $2; exit}' "$prof")")"
+
+  ep="$(awk -F'= *' '/^Endpoint/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '\" ')"
+  split_hostport "$ep" || return 1
+  WARP_ENDPOINT_HOST="$SBP_PARSED_HOST"
+  WARP_ENDPOINT_PORT="$SBP_PARSED_PORT"
+
+  WARP_ADDRESS_V4=""
+  WARP_ADDRESS_V6=""
+  while IFS= read -r ad; do
+    IFS=',' read -r -a line_addresses <<< "$ad"
+    addresses+=("${line_addresses[@]}")
+  done < <(awk -F'= *' '/^Address/{gsub(/\r/,"");print $2}' "$prof" | tr -d '\"')
+  for addr in "${addresses[@]}"; do
+    addr="${addr//[[:space:]]/}"
+    if [[ "$addr" == *:* ]]; then
+      WARP_ADDRESS_V6="$addr"
+    elif [[ "$addr" == *.* ]]; then
+      WARP_ADDRESS_V4="$addr"
+    fi
+  done
+
+  WARP_RESERVED_1=0
+  WARP_RESERVED_2=0
+  WARP_RESERVED_3=0
+  rs="$(awk -F'= *' '/^Reserved/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '[]\" ')"
+  if [[ -n "$rs" ]]; then
+    IFS=',' read -r WARP_RESERVED_1 WARP_RESERVED_2 WARP_RESERVED_3 _ <<< "$rs"
+    : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
+  fi
+
+  warp_profile_ready
+}
+
 ensure_warp_profile(){
   [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
+
+  local wd="$WGCF_DIR" tmp_dir log_file account_file account_source profile_file
+  local new_account=false register_ok=false timestamp backup_file
 
   # 先尝试读取旧 env，并做一次规范化补齐
   if load_warp 2>/dev/null; then
@@ -1612,45 +1721,79 @@ ensure_warp_profile(){
     WARP_PEER_PUBLIC_KEY="$(pad_b64 "${WARP_PEER_PUBLIC_KEY:-}")"
     # 允许之前没写 reserved，给默认 0
     : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
-    save_warp
     # 如果关键字段都在，就直接用旧的（已经补齐），无需重建
-    if [[ -n "$WARP_PRIVATE_KEY" && -n "$WARP_PEER_PUBLIC_KEY" && -n "${WARP_ENDPOINT_HOST:-}" && -n "${WARP_ENDPOINT_PORT:-}" ]]; then
+    if warp_profile_ready; then
+      save_warp
       return 0
     fi
   fi
 
-  # 走到这里说明旧 env 不完整；开始用 wgcf 重建
-  install_wgcf || { warn "wgcf 安装失败，禁用 WARP 节点"; ENABLE_WARP=false; save_env; return 0; }
+  mkdir -p "$wd" || return 1
+  chmod 0700 "$wd" 2>/dev/null || true
 
-  local wd="$SB_DIR/wgcf"; mkdir -p "$wd"
-  if [[ ! -f "$wd/wgcf-account.toml" ]]; then
-    "$WGCF_BIN" register --accept-tos --config "$wd/wgcf-account.toml" >/dev/null
+  # wgcf profile 本身已包含 sing-box 所需的全部 WireGuard 参数。
+  # 优先复用人工导入或上次已生成的有效 profile，避免再次访问注册 API。
+  profile_file="$wd/wgcf-profile.conf"
+  if parse_warp_profile "$profile_file" 2>/dev/null; then
+    chmod 0600 "$profile_file" 2>/dev/null || true
+    save_warp || return 1
+    rm -f -- "$wd/wgcf-last-error.log"
+    info "已复用现有 WARP profile，无需重新注册"
+    return 0
   fi
-  "$WGCF_BIN" generate --config "$wd/wgcf-account.toml" --profile "$wd/wgcf-profile.conf" >/dev/null
 
-  local prof="$wd/wgcf-profile.conf"
-  # 提取并规范化
-  WARP_PRIVATE_KEY="$(pad_b64 "$(awk -F'= *' '/^PrivateKey/{gsub(/\r/,"");print $2; exit}' "$prof")")"
-  WARP_PEER_PUBLIC_KEY="$(pad_b64 "$(awk -F'= *' '/^PublicKey/{gsub(/\r/,"");print $2; exit}' "$prof")")"
+  # 走到这里说明旧 env 不完整；开始用 wgcf 重建
+  install_wgcf || { warn "wgcf 安装失败，WARP 节点不会启用"; return 1; }
 
-  # Endpoint 可能是域名或 [IPv6]:port
-  local ep host port
-  ep="$(awk -F'= *' '/^Endpoint/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '" ')"
-  if [[ "$ep" =~ ^\[(.+)\]:(.+)$ ]]; then host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"; else host="${ep%:*}"; port="${ep##*:}"; fi
-  WARP_ENDPOINT_HOST="$host"
-  WARP_ENDPOINT_PORT="$port"
+  tmp_dir="$(mktemp -d "$wd/.prepare.XXXXXX")" || return 1
+  chmod 0700 "$tmp_dir" 2>/dev/null || true
+  log_file="$tmp_dir/wgcf.log"
+  account_file="$wd/wgcf-account.toml"
+  account_source="$account_file"
 
-  # 内网地址与 reserved
-  local ad rs
-  ad="$(awk -F'= *' '/^Address/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '" ')"
-  WARP_ADDRESS_V4="${ad%%,*}"
-  WARP_ADDRESS_V6="${ad##*,}"
-  rs="$(awk -F'= *' '/^Reserved/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '" ')"
-  WARP_RESERVED_1="${rs%%,*}"; rs="${rs#*,}"
-  WARP_RESERVED_2="${rs%%,*}"; WARP_RESERVED_3="${rs##*,}"
-  : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
+  if ! wgcf_account_ready "$account_file"; then
+    account_source="$tmp_dir/wgcf-account.toml"
+    if run_wgcf_logged "注册" "$log_file" register --accept-tos --config "$account_source"; then
+      register_ok=true
+    fi
+    if ! wgcf_account_ready "$account_source"; then
+      rm -rf -- "$tmp_dir"
+      return 1
+    fi
+    if [[ "$register_ok" != true ]]; then
+      warn "wgcf 注册命令返回失败，但账号文件完整；继续验证生成结果。"
+    fi
+    new_account=true
+  fi
 
-  save_warp
+  profile_file="$tmp_dir/wgcf-profile.conf"
+  if ! run_wgcf_logged "生成配置" "$log_file" generate --config "$account_source" --profile "$profile_file"; then
+    rm -rf -- "$tmp_dir"
+    return 1
+  fi
+  if ! parse_warp_profile "$profile_file"; then
+    printf '%s\n' 'wgcf generated an incomplete or invalid WireGuard profile' > "$log_file"
+    record_wgcf_failure "配置校验" "$log_file"
+    rm -rf -- "$tmp_dir"
+    return 1
+  fi
+
+  if [[ "$new_account" == true ]]; then
+    if [[ -e "$account_file" ]]; then
+      timestamp="$(date +%Y%m%d-%H%M%S)"
+      backup_file="${account_file}.invalid-${timestamp}"
+      cp -a -- "$account_file" "$backup_file" || { rm -rf -- "$tmp_dir"; return 1; }
+      chmod 0600 "$backup_file" 2>/dev/null || true
+    fi
+    save_private_file "$account_source" "$account_file" || { rm -rf -- "$tmp_dir"; return 1; }
+  else
+    chmod 0600 "$account_file" 2>/dev/null || true
+  fi
+  save_private_file "$profile_file" "$wd/wgcf-profile.conf" || { rm -rf -- "$tmp_dir"; return 1; }
+  save_warp || { rm -rf -- "$tmp_dir"; return 1; }
+  rm -f -- "$wd/wgcf-last-error.log"
+  rm -rf -- "$tmp_dir"
+  info "WARP 配置已生成并通过完整性检查"
 }
 
 # ===== 版本探测与比对 =====
@@ -2282,7 +2425,7 @@ write_systemd(){
 write_runtime_helpers
 cat > "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" <<EOF
 [Unit]
-Description=Sing-Box (Native 20 nodes)
+Description=Sing-Box-Plus
 After=network-online.target
 Requires=network-online.target
 
@@ -2314,7 +2457,10 @@ write_config(){
   apply_runtime_overrides
   normalize_runtime_settings
   ensure_creds; save_all_ports; prepare_tls_certificate || return 1
-  [[ "$ENABLE_WARP" == "true" ]] && ensure_warp_profile || true
+  if [[ "$ENABLE_WARP" == "true" ]] && ! ensure_warp_profile; then
+    ENABLE_WARP=false
+    warn "WARP 当前不可用，本次仅部署 10 个直连节点。"
+  fi
 
   local CRT="$TLS_CERT_PATH" KEY="$TLS_KEY_PATH"
   local ROUTING_JSON BIND4 BIND6 TMP_CONF
@@ -2489,7 +2635,7 @@ write_config(){
       cache_capacity:4096
     },
     endpoints: (if warp_ready then [warp_endpoint] else [] end),
-    inbounds:[
+    inbounds: ([
       (inbound_vless_flow($P1) + {tag:"vless-reality"}),
       (inbound_vless($P2) + {tag:"vless-grpcr", transport:{type:"grpc", service_name:$GRPC}}),
       (inbound_trojan($P3) + {tag:"trojan-reality"}),
@@ -2499,8 +2645,8 @@ write_config(){
       (inbound_ss2022($P7) + {tag:"ss2022"}),
       (inbound_ss($P8) + {tag:"ss"}),
       (inbound_tuic($P9) + {tag:"tuic-v5"}),
-      (inbound_anytls($P10) + {tag:"anytls"}),
-
+      (inbound_anytls($P10) + {tag:"anytls"})
+    ] + (if warp_ready then [
       (inbound_vless_flow($PW1) + {tag:"vless-reality-warp"}),
       (inbound_vless($PW2) + {tag:"vless-grpcr-warp", transport:{type:"grpc", service_name:$GRPC}}),
       (inbound_trojan($PW3) + {tag:"trojan-reality-warp"}),
@@ -2511,7 +2657,7 @@ write_config(){
       (inbound_ss($PW8) + {tag:"ss-warp"}),
       (inbound_tuic($PW9) + {tag:"tuic-v5-warp"}),
       (inbound_anytls($PW10) + {tag:"anytls-warp"})
-    ],
+    ] else [] end)),
     outbounds: ([direct_outbound]
       + (if custom_uses_outbound("direct-ipv4") then [direct_ipv4_outbound] else [] end)
       + (if custom_uses_outbound("direct-ipv6") then [direct_ipv6_outbound] else [] end)
@@ -2537,13 +2683,18 @@ write_config(){
 
 # ===== 防火墙 =====
 open_firewall(){
-  local rules=()
+  local rules=() warp_active=false
+  load_env || true
+  load_warp 2>/dev/null || true
+  warp_profile_ready && warp_active=true
   rules+=("${PORT_VLESSR}/tcp" "${PORT_VLESS_GRPCR}/tcp" "${PORT_TROJANR}/tcp" "${PORT_VMESS_WS}/tcp")
   rules+=("${PORT_HY2}/udp" "${PORT_HY2_OBFS}/udp" "${PORT_TUIC}/udp" "${PORT_ANYTLS}/tcp")
   rules+=("${PORT_SS2022}/tcp" "${PORT_SS2022}/udp" "${PORT_SS}/tcp" "${PORT_SS}/udp")
-  rules+=("${PORT_VLESSR_W}/tcp" "${PORT_VLESS_GRPCR_W}/tcp" "${PORT_TROJANR_W}/tcp" "${PORT_VMESS_WS_W}/tcp")
-  rules+=("${PORT_HY2_W}/udp" "${PORT_HY2_OBFS_W}/udp" "${PORT_TUIC_W}/udp" "${PORT_ANYTLS_W}/tcp")
-  rules+=("${PORT_SS2022_W}/tcp" "${PORT_SS2022_W}/udp" "${PORT_SS_W}/tcp" "${PORT_SS_W}/udp")
+  if [[ "$warp_active" == true ]]; then
+    rules+=("${PORT_VLESSR_W}/tcp" "${PORT_VLESS_GRPCR_W}/tcp" "${PORT_TROJANR_W}/tcp" "${PORT_VMESS_WS_W}/tcp")
+    rules+=("${PORT_HY2_W}/udp" "${PORT_HY2_OBFS_W}/udp" "${PORT_TUIC_W}/udp" "${PORT_ANYTLS_W}/tcp")
+    rules+=("${PORT_SS2022_W}/tcp" "${PORT_SS2022_W}/udp" "${PORT_SS_W}/tcp" "${PORT_SS_W}/udp")
+  fi
   if [[ "$TLS_CERT_MODE" == acme ]]; then
     [[ "$TLS_ACME_DISABLE_HTTP_CHALLENGE" == false ]] && rules+=("80/tcp")
     [[ "$TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE" == false ]] && rules+=("443/tcp")
@@ -2566,9 +2717,15 @@ open_firewall(){
 # ===== 分享链接（分组输出 + 提示） =====
 print_links_grouped(){
   load_env; load_creds; load_ports
+  load_warp 2>/dev/null || true
   local ip; ip=$(get_ip)
   local tls_host tls_security_query tls_tip links_tmp l
+  local warp_active=false link_count=10
   local links_direct=() links_warp=()
+  if warp_profile_ready; then
+    warp_active=true
+    link_count=20
+  fi
   if [[ "$TLS_CERT_MODE" != "self_signed" && -n "$TLS_DOMAIN" ]]; then
     tls_host="$TLS_DOMAIN"
     tls_security_query="insecure=0&sni=$(urlenc "$TLS_DOMAIN")"
@@ -2598,21 +2755,22 @@ JSON
   links_direct+=("tuic://${UUID}:$(urlenc "${UUID}")@${tls_host}:${PORT_TUIC}?congestion_control=bbr&alpn=h3&${tls_security_query}#tuic-v5")
   links_direct+=("anytls://$(urlenc "${ANYTLS_PWD}")@${tls_host}:${PORT_ANYTLS}?${tls_security_query}&alpn=h2,http/1.1&fp=ios#anytls")
 
-  # WARP 10
-  links_warp+=("vless://${UUID}@${ip}:${PORT_VLESSR_W}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality-warp")
-  links_warp+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR_W}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality-warp")
-  links_warp+=("trojan://${UUID}@${ip}:${PORT_TROJANR_W}?security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality-warp")
-  links_warp+=("hy2://$(urlenc "${HY2_PWD}")@${tls_host}:${PORT_HY2_W}?${tls_security_query}#hysteria2-warp")
-  local VMESS_JSON_W; VMESS_JSON_W=$(cat <<JSON
+  if [[ "$warp_active" == true ]]; then
+    links_warp+=("vless://${UUID}@${ip}:${PORT_VLESSR_W}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality-warp")
+    links_warp+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR_W}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality-warp")
+    links_warp+=("trojan://${UUID}@${ip}:${PORT_TROJANR_W}?security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality-warp")
+    links_warp+=("hy2://$(urlenc "${HY2_PWD}")@${tls_host}:${PORT_HY2_W}?${tls_security_query}#hysteria2-warp")
+    local VMESS_JSON_W; VMESS_JSON_W=$(cat <<JSON
 {"v":"2","ps":"vmess-ws-warp","add":"${ip}","port":"${PORT_VMESS_WS_W}","id":"${UUID}","aid":"0","net":"ws","type":"none","host":"","path":"${VMESS_WS_PATH}","tls":""}
 JSON
-  )
-  links_warp+=("vmess://$(printf "%s" "$VMESS_JSON_W" | b64enc)")
-  links_warp+=("hy2://$(urlenc "${HY2_PWD2}")@${tls_host}:${PORT_HY2_OBFS_W}?${tls_security_query}&alpn=h3&obfs=salamander&obfs-password=$(urlenc "${HY2_OBFS_PWD}")#hysteria2-obfs-warp")
-  links_warp+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022_W}#ss2022-warp")
-  links_warp+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS_W}#ss-warp")
-  links_warp+=("tuic://${UUID}:$(urlenc "${UUID}")@${tls_host}:${PORT_TUIC_W}?congestion_control=bbr&alpn=h3&${tls_security_query}#tuic-v5-warp")
-  links_warp+=("anytls://$(urlenc "${ANYTLS_PWD}")@${tls_host}:${PORT_ANYTLS_W}?${tls_security_query}&alpn=h2,http/1.1&fp=ios#anytls-warp")
+    )
+    links_warp+=("vmess://$(printf "%s" "$VMESS_JSON_W" | b64enc)")
+    links_warp+=("hy2://$(urlenc "${HY2_PWD2}")@${tls_host}:${PORT_HY2_OBFS_W}?${tls_security_query}&alpn=h3&obfs=salamander&obfs-password=$(urlenc "${HY2_OBFS_PWD}")#hysteria2-obfs-warp")
+    links_warp+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022_W}#ss2022-warp")
+    links_warp+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS_W}#ss-warp")
+    links_warp+=("tuic://${UUID}:$(urlenc "${UUID}")@${tls_host}:${PORT_TUIC_W}?congestion_control=bbr&alpn=h3&${tls_security_query}#tuic-v5-warp")
+    links_warp+=("anytls://$(urlenc "${ANYTLS_PWD}")@${tls_host}:${PORT_ANYTLS_W}?${tls_security_query}&alpn=h2,http/1.1&fp=ios#anytls-warp")
+  fi
 
   mkdir -p "$(dirname "$SHARE_LINKS_FILE")"
   links_tmp="$(mktemp "${SHARE_LINKS_FILE}.tmp.XXXXXX")" || {
@@ -2621,7 +2779,9 @@ JSON
   }
   {
     printf '%s\n' "${links_direct[@]}"
-    printf '%s\n' "${links_warp[@]}"
+    if [[ "$warp_active" == true ]]; then
+      printf '%s\n' "${links_warp[@]}"
+    fi
   } > "$links_tmp"
   chmod 600 "$links_tmp"
   if ! mv -f "$links_tmp" "$SHARE_LINKS_FILE"; then
@@ -2630,15 +2790,19 @@ JSON
     return 1
   fi
 
-  echo -e "${C_BLUE}${C_BOLD}分享链接（20 个）${C_RESET}"
+  echo -e "${C_BLUE}${C_BOLD}分享链接（${link_count} 个）${C_RESET}"
   hr
   echo -e "${C_CYAN}${C_BOLD}【直连节点（10）】${C_RESET}（vless-reality / vless-grpc-reality / trojan-reality / vmess-ws / hy2 / hy2-obfs / ss2022 / ss / tuic / anytls）"
   for l in "${links_direct[@]}"; do echo "  $l"; done
-  hr
-  echo -e "${C_CYAN}${C_BOLD}【WARP 节点（10）】${C_RESET}（同上 10 种，带 -warp）"
-  echo -e "${C_DIM}说明：带 -warp 的 10 个节点走 Cloudflare WARP 出口，流媒体解锁更友好${C_RESET}"
+  if [[ "$warp_active" == true ]]; then
+    hr
+    echo -e "${C_CYAN}${C_BOLD}【WARP 节点（10）】${C_RESET}（同上 10 种，带 -warp）"
+    echo -e "${C_DIM}说明：带 -warp 的 10 个节点走 Cloudflare WARP 出口，流媒体解锁更友好${C_RESET}"
+    for l in "${links_warp[@]}"; do echo "  $l"; done
+  else
+    warn "WARP 未就绪，未生成可能误走直连的 -warp 链接。"
+  fi
   echo -e "${C_DIM}提示：${tls_tip}；客户端如不识别 AnyTLS 链接，可手动按域名、端口、SNI 和密码添加${C_RESET}"
-  for l in "${links_warp[@]}"; do echo "  $l"; done
   hr
   info "导入链接已更新：$SHARE_LINKS_FILE"
 }
@@ -3567,6 +3731,12 @@ show_service_status(){
   load_env || true
   load_creds || true
   load_ports || true
+  load_warp 2>/dev/null || true
+  local warp_active=false node_count=10
+  if warp_profile_ready; then
+    warp_active=true
+    node_count=20
+  fi
 
   clear >/dev/null 2>&1 || true
   hr
@@ -3633,9 +3803,9 @@ show_service_status(){
   fi
   echo -e "  GeoFiles 规则: 上次更新 [${geo_ver}] | geoip.db (${geo_geoip}) | geosite.db (${geo_geosite})"
 
-  # 3. 20 节点监听状态探测
+  # 3. 节点监听状态探测
   echo
-  echo -e "${C_BOLD}【3. 20 节点端口监听监控】${C_RESET}"
+  echo -e "${C_BOLD}【3. ${node_count} 节点端口监听监控】${C_RESET}"
   local listening_ports=""
   if command -v ss >/dev/null 2>&1; then
     listening_ports="$(ss -tulpn 2>/dev/null || true)"
@@ -3677,17 +3847,21 @@ show_service_status(){
   printf "    %-18s : %b\n" "9. TUIC v5" "$(check_port_status "${PORT_TUIC:-}" "udp")"
   printf "    %-18s : %b\n" "10. AnyTLS" "$(check_port_status "${PORT_ANYTLS:-}" "tcp")"
 
-  echo -e "  ${C_CYAN}[WARP 10 节点]${C_RESET}"
-  printf "    %-18s : %b\n" "11. VLESS-Reality-W" "$(check_port_status "${PORT_VLESSR_W:-}" "tcp")"
-  printf "    %-18s : %b\n" "12. VLESS-gRPC-W" "$(check_port_status "${PORT_VLESS_GRPCR_W:-}" "tcp")"
-  printf "    %-18s : %b\n" "13. Trojan-Real-W" "$(check_port_status "${PORT_TROJANR_W:-}" "tcp")"
-  printf "    %-18s : %b\n" "14. Hysteria2-W" "$(check_port_status "${PORT_HY2_W:-}" "udp")"
-  printf "    %-18s : %b\n" "15. VMess-WS-W" "$(check_port_status "${PORT_VMESS_WS_W:-}" "tcp")"
-  printf "    %-18s : %b\n" "16. Hy2-Obfs-W" "$(check_port_status "${PORT_HY2_OBFS_W:-}" "udp")"
-  printf "    %-18s : %b\n" "17. SS-2022-W" "$(check_port_status "${PORT_SS2022_W:-}" "tcp/udp")"
-  printf "    %-18s : %b\n" "18. Shadowsocks-W" "$(check_port_status "${PORT_SS_W:-}" "tcp/udp")"
-  printf "    %-18s : %b\n" "19. TUIC-v5-W" "$(check_port_status "${PORT_TUIC_W:-}" "udp")"
-  printf "    %-18s : %b\n" "20. AnyTLS-W" "$(check_port_status "${PORT_ANYTLS_W:-}" "tcp")"
+  if [[ "$warp_active" == true ]]; then
+    echo -e "  ${C_CYAN}[WARP 10 节点]${C_RESET}"
+    printf "    %-18s : %b\n" "11. VLESS-Reality-W" "$(check_port_status "${PORT_VLESSR_W:-}" "tcp")"
+    printf "    %-18s : %b\n" "12. VLESS-gRPC-W" "$(check_port_status "${PORT_VLESS_GRPCR_W:-}" "tcp")"
+    printf "    %-18s : %b\n" "13. Trojan-Real-W" "$(check_port_status "${PORT_TROJANR_W:-}" "tcp")"
+    printf "    %-18s : %b\n" "14. Hysteria2-W" "$(check_port_status "${PORT_HY2_W:-}" "udp")"
+    printf "    %-18s : %b\n" "15. VMess-WS-W" "$(check_port_status "${PORT_VMESS_WS_W:-}" "tcp")"
+    printf "    %-18s : %b\n" "16. Hy2-Obfs-W" "$(check_port_status "${PORT_HY2_OBFS_W:-}" "udp")"
+    printf "    %-18s : %b\n" "17. SS-2022-W" "$(check_port_status "${PORT_SS2022_W:-}" "tcp/udp")"
+    printf "    %-18s : %b\n" "18. Shadowsocks-W" "$(check_port_status "${PORT_SS_W:-}" "tcp/udp")"
+    printf "    %-18s : %b\n" "19. TUIC-v5-W" "$(check_port_status "${PORT_TUIC_W:-}" "udp")"
+    printf "    %-18s : %b\n" "20. AnyTLS-W" "$(check_port_status "${PORT_ANYTLS_W:-}" "tcp")"
+  else
+    echo -e "  ${C_YELLOW}[WARP 未就绪：相关端口未启用]${C_RESET}"
+  fi
 
   # 4. DNS 与健康检查
   echo
@@ -3775,7 +3949,7 @@ banner(){
   echo -e "  系统加速: ${quick_bbr}  |  证书模式: ${quick_tls}"
   hr
   echo -e "  ${C_BOLD}【核心部署与运行】${C_RESET}"
-  echo -e "    ${C_BLUE}1)${C_RESET} 安装 / 部署（20 节点，含旧版自动升级）"
+  echo -e "    ${C_BLUE}1)${C_RESET} 安装 / 部署（直连 10 + WARP 就绪时额外 10）"
   echo -e "    ${C_GREEN}2)${C_RESET} 查看服务运行状态"
   echo -e "    ${C_GREEN}3)${C_RESET} 查看节点分享链接"
   echo -e "    ${C_GREEN}4)${C_RESET} 重启 sing-box 服务"
@@ -3791,7 +3965,8 @@ banner(){
   echo -e "   ${C_YELLOW}10)${C_RESET} 更新 GeoFiles 规则文件 (GeoIP/GeoSite/规则集)"
   echo -e "   ${C_YELLOW}11)${C_RESET} 从 GitHub 更新管理脚本"
   echo -e "   ${C_YELLOW}12)${C_RESET} 一键系统网络诊断"
-  echo -e "   ${C_RED}13)${C_RESET} 彻底卸载 Sing-Box-Plus"
+  echo -e "   ${C_YELLOW}13)${C_RESET} 获取 / 修复 WARP 出口"
+  echo -e "   ${C_RED}14)${C_RESET} 彻底卸载 Sing-Box-Plus"
   echo
   echo -e "    ${C_RED}0)${C_RESET} 退出管理脚本"
   hr
@@ -4043,14 +4218,14 @@ deploy_native(){
   write_systemd
   open_firewall
   systemctl restart "${SYSTEMD_SERVICE}" || die "sing-box 启动失败"
-  echo; echo -e "${C_BOLD}${C_GREEN}★ 部署完成（20 节点）${C_RESET}"; echo
+  echo; echo -e "${C_BOLD}${C_GREEN}★ Sing-Box-Plus 部署完成${C_RESET}"; echo
   print_links_grouped
   exit 0
 }
 
 ensure_installed_or_hint(){
   if [[ ! -f "$CONF_JSON" ]]; then
-    warn "尚未安装，请先选择 1) 安装/部署（20 节点）"
+    warn "尚未安装，请先选择 1) 安装/部署"
     return 1
   fi
   return 0
@@ -4074,6 +4249,222 @@ restore_runtime_file(){
   elif [[ -f "$backup_dir/${backup_name}.missing" ]]; then
     rm -f -- "$target_path" || return 1
   fi
+}
+
+backup_warp_repair(){
+  local backup_dir="$1"
+  backup_runtime_file "$SB_DIR/env.conf" env.conf "$backup_dir" || return 1
+  backup_runtime_file "$CONF_JSON" config.json "$backup_dir" || return 1
+  backup_runtime_file "$SB_DIR/warp.env" warp.env "$backup_dir" || return 1
+  backup_runtime_file "$SB_DIR/creds.env" creds.env "$backup_dir" || return 1
+  backup_runtime_file "$SB_DIR/ports.env" ports.env "$backup_dir" || return 1
+  backup_runtime_file "$SHARE_LINKS_FILE" share-links.txt "$backup_dir" || return 1
+  backup_runtime_file "$WGCF_DIR/wgcf-account.toml" wgcf-account.toml "$backup_dir" || return 1
+  backup_runtime_file "$WGCF_DIR/wgcf-profile.conf" wgcf-profile.conf "$backup_dir" || return 1
+  backup_runtime_file "$CERT_DIR/fullchain.pem" fullchain.pem "$backup_dir" || return 1
+  backup_runtime_file "$CERT_DIR/key.pem" key.pem "$backup_dir" || return 1
+}
+
+restore_warp_repair(){
+  local backup_dir="$1" restore_failed=0
+  restore_runtime_file "$backup_dir" env.conf "$SB_DIR/env.conf" || restore_failed=1
+  restore_runtime_file "$backup_dir" config.json "$CONF_JSON" || restore_failed=1
+  restore_runtime_file "$backup_dir" warp.env "$SB_DIR/warp.env" || restore_failed=1
+  restore_runtime_file "$backup_dir" creds.env "$SB_DIR/creds.env" || restore_failed=1
+  restore_runtime_file "$backup_dir" ports.env "$SB_DIR/ports.env" || restore_failed=1
+  restore_runtime_file "$backup_dir" share-links.txt "$SHARE_LINKS_FILE" || restore_failed=1
+  restore_runtime_file "$backup_dir" wgcf-account.toml "$WGCF_DIR/wgcf-account.toml" || restore_failed=1
+  restore_runtime_file "$backup_dir" wgcf-profile.conf "$WGCF_DIR/wgcf-profile.conf" || restore_failed=1
+  restore_runtime_file "$backup_dir" fullchain.pem "$CERT_DIR/fullchain.pem" || restore_failed=1
+  restore_runtime_file "$backup_dir" key.pem "$CERT_DIR/key.pem" || restore_failed=1
+  return "$restore_failed"
+}
+
+verify_warp_egress(){
+  (
+    local tmp_dir verify_config run_log port="" proxy_pid="" proxy_ready=false
+    local trace="" warp_state="" candidate attempt
+
+    tmp_dir="$(mktemp -d "$SB_DIR/.warp-verify.XXXXXX")" || return 1
+    case "$tmp_dir" in
+      "$SB_DIR"/.warp-verify.*) ;;
+      *) return 1 ;;
+    esac
+    chmod 0700 "$tmp_dir" 2>/dev/null || true
+    verify_config="$tmp_dir/config.json"
+    run_log="$tmp_dir/sing-box.log"
+
+    cleanup(){
+      trap - EXIT INT TERM
+      if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>/dev/null; then
+        kill "$proxy_pid" 2>/dev/null || true
+        wait "$proxy_pid" 2>/dev/null || true
+      fi
+      rm -rf -- "$tmp_dir"
+    }
+    trap cleanup EXIT INT TERM
+
+    for candidate in $(seq 29400 29499); do
+      if ! ss -H -ltn "sport = :$candidate" 2>/dev/null | grep -q .; then
+        port="$candidate"
+        break
+      fi
+    done
+    [[ -n "$port" ]] || return 1
+
+    if ! jq --argjson port "$port" '
+      (.dns.final) as $resolver
+      | ([.endpoints[]? | select(.tag == "warp")]) as $warp
+      | ([.outbounds[]? | select(.tag == "direct")]) as $direct
+      | if ($warp | length) != 1 or ($direct | length) != 1 or ($resolver == null) then
+          error("missing WARP verification dependency")
+        else
+          {
+            log: {level: "warn", timestamp: true},
+            dns: .dns,
+            inbounds: [{
+              type: "socks",
+              tag: "warp-verify-in",
+              listen: "127.0.0.1",
+              listen_port: $port
+            }],
+            endpoints: $warp,
+            outbounds: $direct,
+            route: {
+              rules: [{
+                inbound: ["warp-verify-in"],
+                action: "route",
+                outbound: "warp"
+              }],
+              default_domain_resolver: $resolver,
+              final: "direct"
+            }
+          }
+        end
+    ' "$CONF_JSON" > "$verify_config"; then
+      return 1
+    fi
+    chmod 0600 "$verify_config" 2>/dev/null || true
+    "$BIN_PATH" check -c "$verify_config" >/dev/null 2>&1 || return 1
+
+    (
+      cd "$tmp_dir"
+      exec "$BIN_PATH" run -c "$verify_config"
+    ) > "$run_log" 2>&1 &
+    proxy_pid=$!
+
+    for _ in $(seq 1 50); do
+      if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .; then
+        proxy_ready=true
+        break
+      fi
+      kill -0 "$proxy_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if [[ "$proxy_ready" != true ]]; then
+      mkdir -p "$WGCF_DIR" 2>/dev/null || true
+      [[ ! -f "$run_log" ]] || install -m 0600 "$run_log" "$WGCF_DIR/warp-verify-last-error.log" 2>/dev/null || true
+      return 1
+    fi
+
+    for attempt in $(seq 1 8); do
+      trace="$(curl -fsS --max-time 5 --noproxy '' \
+        --proxy "socks5h://127.0.0.1:$port" \
+        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+      warp_state="$(printf '%s\n' "$trace" | awk -F= '$1=="warp" {print $2; exit}')"
+      [[ "$warp_state" =~ ^(on|plus)$ ]] && break
+      [[ "$attempt" -lt 8 ]] && sleep 1
+    done
+    if [[ ! "$warp_state" =~ ^(on|plus)$ ]]; then
+      mkdir -p "$WGCF_DIR" 2>/dev/null || true
+      [[ ! -f "$run_log" ]] || install -m 0600 "$run_log" "$WGCF_DIR/warp-verify-last-error.log" 2>/dev/null || true
+      return 1
+    fi
+    rm -f -- "$WGCF_DIR/warp-verify-last-error.log"
+  )
+}
+
+repair_warp(){
+  [[ "$EUID" -eq 0 || "${SBP_SKIP_ROOT:-0}" -eq 1 || -n "${TEST_ROOT:-}" ]] \
+    || die "WARP 修复需要 root 权限，请使用 sudo 运行"
+  ensure_installed_or_hint || return 1
+  load_env || true
+  load_creds || true
+  load_ports || true
+  ensure_dirs
+
+  local backup_root="$SB_DIR/backups" backup_dir timestamp old_umask
+  local service_active=false restart_attempted=false failure="" restore_failed=false
+  if command -v flock >/dev/null 2>&1; then
+    exec 7>"$SB_DIR/.warp-repair.lock"
+    flock -n 7 || { warn "另一个 WARP 修复正在进行，请稍后重试"; return 1; }
+  fi
+
+  old_umask="$(umask)"
+  umask 077
+  mkdir -p "$backup_root" || { umask "$old_umask"; return 1; }
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  backup_dir="$(mktemp -d "$backup_root/warp-repair-${timestamp}.XXXXXX")" || { umask "$old_umask"; return 1; }
+  chmod 0700 "$backup_dir" || { umask "$old_umask"; return 1; }
+  if ! backup_warp_repair "$backup_dir"; then
+    umask "$old_umask"
+    warn "WARP 修复前备份失败，未修改运行配置：$backup_dir"
+    return 1
+  fi
+
+  ENABLE_WARP=true
+  if ! ensure_warp_profile; then
+    umask "$old_umask"
+    warn "WARP 账号仍不可用；sing-box 配置和服务均未改动。"
+    return 1
+  fi
+  if ! save_env; then
+    failure="保存 WARP 开关失败"
+  elif ! write_config; then
+    failure="生成 sing-box 配置失败"
+  elif ! load_warp 2>/dev/null || ! warp_profile_ready; then
+    failure="WARP 配置完整性复核失败"
+  elif ! jq -e '[.endpoints[]? | select(.tag == "warp")] | length == 1' "$CONF_JSON" >/dev/null 2>&1; then
+    failure="生成配置中缺少 WARP endpoint"
+  elif ! verify_warp_egress; then
+    failure="WARP 出口连通性验证失败（Cloudflare trace 未返回 warp=on/plus）"
+  fi
+
+  if [[ -z "$failure" ]] && command -v systemctl >/dev/null 2>&1 \
+      && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
+    service_active=true
+    restart_attempted=true
+    if ! systemctl restart "$SYSTEMD_SERVICE"; then
+      failure="sing-box 重启失败"
+    fi
+  fi
+
+  if [[ -n "$failure" ]]; then
+    warn "$failure，正在恢复修复前配置"
+    restore_warp_repair "$backup_dir" || restore_failed=true
+    load_env || true
+    load_warp 2>/dev/null || true
+    if [[ "$restart_attempted" == true ]]; then
+      systemctl restart "$SYSTEMD_SERVICE" >/dev/null 2>&1 || restore_failed=true
+    fi
+    umask "$old_umask"
+    if [[ "$restore_failed" == true ]]; then
+      warn "自动回滚不完整，请从以下目录手动恢复：$backup_dir"
+    else
+      warn "已恢复修复前配置：$backup_dir"
+    fi
+    return 1
+  fi
+
+  open_firewall || warn "WARP 已启用，但防火墙规则更新失败，请手动检查端口"
+  print_links_grouped || warn "WARP 已启用，但导入链接文件更新失败"
+  umask "$old_umask"
+  if [[ "$service_active" == true ]]; then
+    info "WARP 已启用并完成 sing-box 重启"
+  else
+    info "WARP 已写入配置；sing-box 当前未运行，未执行重启"
+  fi
+  info "修复前备份：$backup_dir"
 }
 
 backup_runtime_update(){
@@ -4349,6 +4740,7 @@ usage(){
                                  从 GitHub 拉取最新管理脚本并应用轻量更新
   sudo bash sbp.sh --reissue-cert
                                  重新签发自签证书使其匹配当前 Reality SNI（会重启 sing-box）
+  sudo bash sbp.sh --repair-warp  获取或修复 WARP 配置（成功后会重启 sing-box）
   sudo bash sbp.sh --uninstall   彻底卸载 Sing-Box-Plus
   bash sbp.sh --help             显示本帮助
 
@@ -4381,7 +4773,6 @@ menu(){
         warn "sing-box 安装/升级失败"
         exit 1
       fi
-      ensure_warp_profile || true
       if ! write_config; then
         warn "生成配置失败"
         exit 1
@@ -4413,7 +4804,8 @@ menu(){
     10) update_geofiles; read -rp "回车返回..." _ || true; menu ;;
     11) update_script_from_remote; read -rp "回车返回..." _ || true; menu ;;
     12) run_diagnostics; read -rp "回车返回..." _ || true; menu ;;
-    13) uninstall_all ;;
+    13) repair_warp; read -rp "回车返回..." _ || true; menu ;;
+    14) uninstall_all ;;
     0|q|Q) exit 0 ;;
     *) echo -e "${C_YELLOW}无效选项，请重新选择${C_RESET}"; sleep 1; menu ;;
   esac
@@ -4429,6 +4821,7 @@ main(){
     --update-runtime) update_runtime_components ;;
     --update-script) update_script_from_remote ;;
     --reissue-cert) reissue_managed_certificate ;;
+    --repair-warp) repair_warp ;;
     --uninstall) uninstall_all ;;
     -h|--help) usage ;;
     *)

@@ -149,8 +149,8 @@ if ! echo "$status_out" | grep -q "Sing-Box-Plus 综合运行状态看板"; then
   echo "FAIL: show_service_status must render title banner" >&2
   exit 1
 fi
-if ! echo "$status_out" | grep -q "20 节点端口监听监控"; then
-  echo "FAIL: show_service_status must render 20 node status section" >&2
+if ! echo "$status_out" | grep -q "10 节点端口监听监控"; then
+  echo "FAIL: show_service_status must render only enabled nodes" >&2
   exit 1
 fi
 

@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**一键部署 20 节点多协议代理服务的 Bash 管理脚本**，基于 [sing-box](https://github.com/SagerNet/sing-box) 核心。
+**一键部署最多 20 节点的多协议代理服务 Bash 管理脚本**，基于 [sing-box](https://github.com/SagerNet/sing-box) 核心。
 
 ---
 
@@ -10,11 +10,11 @@
 
 | 类别 | 详情 |
 |------|------|
-| **20 节点** | 10 直连 + 10 WARP 出口，每种协议各一个，互不冲突 |
+| **最多 20 节点** | 固定 10 个直连节点；WARP 配置验证通过后再启用 10 个 WARP 出口节点 |
 | **10 种协议** | VLESS Reality · VLESS gRPC Reality · Trojan Reality · Hysteria2 · VMess WS · Hysteria2 obfs · SS2022 · Shadowsocks · TUIC v5 · AnyTLS |
 | **版本智能升级** | 部署或更新时自动比对官方最新 Release，识别旧版自动升级并支持安全回滚 |
 | **GeoFiles 更新** | 一键更新 GeoIP / GeoSite 数据库及 SRS 规则集，多 CDN 镜像防封锁自动切换 |
-| **运行状态看板** | 实时查看主进程 PID、内存占用、20 节点端口监听监控、DNS 切换与证书到期倒计时 |
+| **运行状态看板** | 实时查看主进程 PID、内存占用、当前已启用节点的端口监听、DNS 切换与证书到期倒计时 |
 | **WARP 出口** | Cloudflare WARP 线路，解锁 Netflix / Disney+ 等流媒体更友好 |
 | **DNS 故障切换** | Cloudflare DoH → Google DoH → UDP 1.0.0.1，连续失败确认与恢复冷却避免探测抖动重启 |
 | **自定义路由** | 按域名 / geosite 指定出口或 block 阻断，支持同出口规则整理及 JSON 导入、导出 |
@@ -29,7 +29,7 @@
 
 - Linux VPS（推荐 Debian 11+ / Ubuntu 20.04+）
 - Root 权限
-- 20 个可用端口（脚本自动随机分配并配置防火墙）
+- 至少 10 个可用端口；WARP 启用时共使用 20 个端口（脚本自动随机分配并配置防火墙）
 
 ---
 
@@ -101,14 +101,14 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 
 ```text
 =============================================================
- 🚀 Sing-Box-Plus 管理脚本 v3.2.0 🚀
+ 🚀 Sing-Box-Plus 管理脚本 v3.2.4 🚀
  脚本更新地址: https://github.com/yayitinyu/sing-box-plus
 =============================================================
   服务状态: 运行中 (Active)  |  核心版本: sing-box v1.12.7
   系统加速: 已启用 BBR       |  证书模式: 自签证书
 =============================================================
   【核心部署与运行】
-    1) 安装 / 部署（20 节点，含旧版自动升级）
+    1) 安装 / 部署（直连 10 + WARP 就绪时额外 10）
     2) 查看服务运行状态
     3) 查看节点分享链接
     4) 重启 sing-box 服务
@@ -124,7 +124,8 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
    10) 更新 GeoFiles 规则文件 (GeoIP/GeoSite/规则集)
    11) 从 GitHub 更新管理脚本
    12) 一键系统网络诊断
-   13) 彻底卸载 Sing-Box-Plus
+   13) 获取 / 修复 WARP 出口
+   14) 彻底卸载 Sing-Box-Plus
 
     0) 退出管理脚本
 =============================================================
@@ -189,7 +190,7 @@ openssl x509 -in /opt/sing-box/cert/fullchain.pem -noout -subject
 
 ### WARP 节点（10 个，带 `-warp` 后缀）
 
-流量经由 Cloudflare WARP 出口，适用于：
+只有在 WARP 账号、WireGuard profile 和 sing-box endpoint 全部校验通过后才会启用并输出。流量经由 Cloudflare WARP 出口，适用于：
 
 - 解锁 Netflix、Disney+、ChatGPT 等受地域限制的服务
 - 规避服务器 IP 被目标网站封锁
@@ -266,9 +267,10 @@ geosite:netflix, suffix:openai.com, domain:example.com, keyword:google, regex:.*
 | 主配置 | `/opt/sing-box/config.json` | sing-box 运行配置 |
 | 环境配置 | `/opt/sing-box/env.conf` | 运行参数与功能开关 |
 | 凭证信息 | `/opt/sing-box/creds.env` | UUID、密码、密钥 |
-| 端口信息 | `/opt/sing-box/ports.env` | 20 个端口分配 |
-| 导入链接 | `/opt/sing-box/share-links.txt` | 自动刷新的 20 个链接，仅 root 可读 |
-| WARP 配置 | `/opt/sing-box/warp.env` | WireGuard 密钥与端点 |
+| 端口信息 | `/opt/sing-box/ports.env` | 最多 20 个端口分配 |
+| 导入链接 | `/opt/sing-box/share-links.txt` | 自动刷新的 10 或 20 个链接，仅 root 可读 |
+| WARP 配置 | `/opt/sing-box/warp.env` | WireGuard 密钥与端点，仅 root 可读 |
+| WARP 错误日志 | `/opt/sing-box/wgcf/wgcf-last-error.log` | 最近一次 wgcf 失败详情，仅 root 可读 |
 | 自定义路由 | `/opt/sing-box/routes.json` | 用户自定义路由规则 |
 | 证书目录 | `/opt/sing-box/cert/` | TLS 证书与私钥 |
 | 规则目录 | `/opt/sing-box/data/` | GeoIP / GeoSite 及 SRS 规则集 |
@@ -324,7 +326,7 @@ DNS_FAILURE_THRESHOLD=3 DNS_RECOVERY_THRESHOLD=5 DNS_SWITCH_COOLDOWN=600 bash sb
 
 ## 📱 客户端导入
 
-安装完成后会输出并保存 20 个分享链接到 `/opt/sing-box/share-links.txt`，可直接导入以下客户端：
+安装完成后会输出并保存分享链接到 `/opt/sing-box/share-links.txt`：WARP 就绪时为 20 个，否则仅保存 10 个直连链接。可直接导入以下客户端：
 
 - **v2rayN** / **v2rayNG**
 - **Clash Meta** / **Mihomo**
@@ -356,7 +358,15 @@ DNS_FAILURE_THRESHOLD=3 DNS_RECOVERY_THRESHOLD=5 DNS_SWITCH_COOLDOWN=600 bash sb
 <details>
 <summary><b>WARP 注册失败？</b></summary>
 
-部分 IP 段可能被 Cloudflare 限制注册 WARP。脚本会自动禁用 WARP 节点，直连 10 个节点仍可正常使用。
+Cloudflare 可能对共享 NAT、机房 IPv4 或 IPv6 前缀的注册请求返回 `429 Too Many Requests`。脚本只请求一次并立即停止，不再连续重试；失败栈写入仅 root 可读的错误日志，同时不会监听、放行或发布伪装成 WARP 的节点，10 个直连节点仍可使用。
+
+限流解除后可从菜单选择 `13) 获取 / 修复 WARP 出口`，或运行：
+
+```bash
+sudo bash /root/sbp.sh --repair-warp
+```
+
+如果该机房出口持续被限流，可在另一条网络上用 `wgcf register` 生成 `wgcf-account.toml`，通过 SCP 安全传到 `/opt/sing-box/wgcf/wgcf-account.toml`，设置权限为 `600`，再运行 `--repair-warp`。不要在聊天、Issue 或日志中粘贴账号文件内容。
 </details>
 
 <details>

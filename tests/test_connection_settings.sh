@@ -97,6 +97,16 @@ TLS_DOMAIN=""
 TLS_CERT_PATH="$CERT_DIR/fullchain.pem"
 TLS_KEY_PATH="$CERT_DIR/key.pem"
 REALITY_SERVER=www.lovelive-anime.jp
+WARP_PRIVATE_KEY="$(printf 'A%.0s' {1..43})="
+WARP_PEER_PUBLIC_KEY="$(printf 'B%.0s' {1..43})="
+WARP_ENDPOINT_HOST=engage.cloudflareclient.com
+WARP_ENDPOINT_PORT=2408
+WARP_ADDRESS_V4=172.16.0.2/32
+WARP_ADDRESS_V6=2606:4700:110:8765::2/128
+WARP_RESERVED_1=0
+WARP_RESERVED_2=0
+WARP_RESERVED_3=0
+save_warp
 save_env
 
 print_links_grouped > "$test_root/self-signed-links.log"
@@ -175,18 +185,18 @@ assert_equal 6 "$(grep -c 'security=reality&sni=edge.example.com' "$SHARE_LINKS_
 ENABLE_WARP=false
 save_env
 write_config
-assert_equal 6 "$(jq '[.inbounds[] | select(.tls.reality.enabled == true and .tls.server_name == "edge.example.com" and .tls.reality.handshake.server == "edge.example.com")] | length' "$CONF_JSON")" \
+assert_equal 3 "$(jq '[.inbounds[] | select(.tls.reality.enabled == true and .tls.server_name == "edge.example.com" and .tls.reality.handshake.server == "edge.example.com")] | length' "$CONF_JSON")" \
   "the service config must follow the updated Reality SNI"
 
 TLS_CERT_MODE=manual
 TLS_DOMAIN=vpn.example.com
 save_env
 print_links_grouped > "$test_root/domain-links.log"
-assert_equal 8 "$(grep -c '@vpn.example.com:' "$SHARE_LINKS_FILE")" \
+assert_equal 4 "$(grep -c '@vpn.example.com:' "$SHARE_LINKS_FILE")" \
   "certificate-backed links must follow the configured certificate domain"
-assert_equal 8 "$(grep -c 'sni=vpn.example.com' "$SHARE_LINKS_FILE")" \
+assert_equal 4 "$(grep -c 'sni=vpn.example.com' "$SHARE_LINKS_FILE")" \
   "certificate-backed links must use the certificate domain as SNI"
-assert_equal 8 "$(grep -c 'insecure=0&sni=vpn.example.com' "$SHARE_LINKS_FILE")" \
+assert_equal 4 "$(grep -c 'insecure=0&sni=vpn.example.com' "$SHARE_LINKS_FILE")" \
   "public certificate-backed links must enforce certificate verification (insecure=0)"
 if grep -Eq '(^|[?&])(insecure|allowInsecure)=1([&#]|$)' "$SHARE_LINKS_FILE"; then
   echo "FAIL: invalid public certificate state must not downgrade link security" >&2
