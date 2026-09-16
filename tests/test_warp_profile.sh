@@ -29,6 +29,7 @@ export BIN_PATH="$test_root/bin/sing-box"
 export WGCF_BIN="$test_root/bin/wgcf"
 export SBP_SCRIPT_PATH="$test_root/root/sbp.sh"
 export SYSTEMD_SERVICE="test-sing-box.service"
+export SBP_SERVICE_STABILITY_CHECKS=3 SBP_SERVICE_STABILITY_INTERVAL=0
 
 mkdir -p "$SBP_BIN_DIR" "$SB_DIR" "$CERT_DIR" "$test_root/root"
 
@@ -407,6 +408,7 @@ fi
 
 # The repair command must restart only after a valid endpoint is written, with rollback on failure.
 printf '%s\n' '{"endpoints":[],"marker":"before-repair"}' > "$CONF_JSON"
+empty_route_json > "$ROUTE_JSON"
 ENABLE_WARP=false
 save_env
 
@@ -420,19 +422,90 @@ write_config(){
 open_firewall(){ printf '%s\n' called >> "$test_root/firewall.calls"; }
 print_links_grouped(){ printf '%s\n' called >> "$test_root/link.calls"; }
 verify_warp_egress(){ return 0; }
+curl(){
+  local output="" url=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "-o" && $# -ge 2 ]]; then
+      output="$2"
+      shift 2
+      continue
+    fi
+    [[ "$1" != http://* && "$1" != https://* ]] || url="$1"
+    shift
+  done
+  [[ -n "$output" ]] || return 2
+  [[ ! -f "$test_root/fail-ruleset-download" ]] || return 22
+  [[ -z "$url" ]] || printf '%s\n' "$url" >> "$test_root/ruleset-curl.calls"
+  printf '%s\n' 'mock-srs-data' > "$output"
+}
 systemctl(){
   case "${1:-}" in
     is-active) return 0 ;;
+    show)
+      if [[ -f "$test_root/delayed-restart-armed" ]]; then
+        local checks=0
+        [[ ! -f "$test_root/delayed-checks" ]] || checks=$(<"$test_root/delayed-checks")
+        checks=$((checks + 1))
+        printf '%s\n' "$checks" > "$test_root/delayed-checks"
+        if (( checks >= 2 )); then
+          rm -f -- "$test_root/delayed-restart-armed"
+          printf '%s\n' 4343
+          return 0
+        fi
+      fi
+      printf '%s\n' 4242
+      ;;
     restart)
       printf '%s\n' restart >> "$test_root/systemctl.calls"
       if [[ -f "$test_root/fail-restart-once" ]]; then
         rm -f -- "$test_root/fail-restart-once"
         return 1
       fi
+      if [[ -f "$test_root/arm-delayed-restart" ]]; then
+        rm -f -- "$test_root/arm-delayed-restart" "$test_root/delayed-checks"
+        touch "$test_root/delayed-restart-armed"
+      fi
       ;;
     *) return 0 ;;
   esac
 }
+
+: > "$test_root/systemctl.calls"
+cat > "$ROUTE_JSON" <<'JSON'
+{
+  "rules": [{"rule_set": ["broken-remote"], "outbound": "direct"}],
+  "rule_set": [{"type": "remote", "tag": "broken-remote", "format": "binary", "url": "https://rules.example.invalid/missing.srs"}],
+  "outbounds": [],
+  "default_outbound": "direct"
+}
+JSON
+touch "$test_root/fail-ruleset-download"
+if repair_warp > "$test_root/repair-ruleset-preflight.log" 2>&1; then
+  echo "FAIL: WARP repair must reject an unavailable existing remote rule-set" >&2
+  exit 1
+fi
+assert_equal before-repair "$(jq -r '.marker' "$CONF_JSON")" \
+  "rule-set preflight failure must preserve the runtime config"
+grep -Fqx 'ENABLE_WARP=false' "$SB_DIR/env.conf"
+assert_equal 0 "$(wc -l < "$test_root/systemctl.calls" | tr -d ' ')" \
+  "rule-set preflight failure must not restart the service"
+rm -f -- "$test_root/fail-ruleset-download"
+cat > "$ROUTE_JSON" <<'JSON'
+{
+  "rules": [{"rule_set": ["geosite-geosite-category-ads"], "action": "reject"}],
+  "rule_set": [{
+    "type": "remote",
+    "tag": "geosite-geosite-category-ads",
+    "format": "binary",
+    "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geosite-category-ads.srs",
+    "download_detour": "direct",
+    "update_interval": "1d"
+  }],
+  "outbounds": [],
+  "default_outbound": "direct"
+}
+JSON
+: > "$test_root/ruleset-curl.calls"
 
 : > "$test_root/systemctl.calls"
 : > "$test_root/firewall.calls"
@@ -443,6 +516,14 @@ assert_equal after-repair "$(jq -r '.marker' "$CONF_JSON")" "repair must install
 assert_equal 1 "$(wc -l < "$test_root/systemctl.calls" | tr -d ' ')" "successful repair restart count"
 assert_equal 1 "$(wc -l < "$test_root/firewall.calls" | tr -d ' ')" "firewall update after restart"
 assert_equal 1 "$(wc -l < "$test_root/link.calls" | tr -d ' ')" "link refresh after restart"
+assert_equal geosite-category-ads "$(jq -r '.rule_set[0].tag' "$ROUTE_JSON")" \
+  "successful repair must persist the normalized legacy rule-set"
+grep -Fqx 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads.srs' \
+  "$test_root/ruleset-curl.calls"
+if grep -Fq 'geosite-geosite-' "$test_root/ruleset-curl.calls"; then
+  echo "FAIL: WARP repair must normalize legacy generated geosite URLs before preflight" >&2
+  exit 1
+fi
 
 printf '%s\n' '{"endpoints":[],"marker":"rollback-baseline"}' > "$CONF_JSON"
 ENABLE_WARP=false
@@ -460,5 +541,23 @@ assert_equal 2 "$(wc -l < "$test_root/systemctl.calls" | tr -d ' ')" \
   "failed repair must restart once for apply and once for rollback"
 assert_equal 0 "$(wc -l < "$test_root/firewall.calls" | tr -d ' ')" \
   "firewall must not change before a successful restart"
+
+printf '%s\n' '{"endpoints":[],"marker":"delayed-rollback-baseline"}' > "$CONF_JSON"
+ENABLE_WARP=false
+save_env
+: > "$test_root/arm-delayed-restart"
+: > "$test_root/systemctl.calls"
+: > "$test_root/firewall.calls"
+if repair_warp > "$test_root/repair-delayed-rollback.log" 2>&1; then
+  echo "FAIL: a delayed post-restart crash must fail WARP repair" >&2
+  exit 1
+fi
+assert_equal delayed-rollback-baseline "$(jq -r '.marker' "$CONF_JSON")" \
+  "delayed restart failure must restore config"
+grep -Fqx 'ENABLE_WARP=false' "$SB_DIR/env.conf"
+assert_equal 2 "$(wc -l < "$test_root/systemctl.calls" | tr -d ' ')" \
+  "delayed failure must restart once for apply and once for rollback"
+assert_equal 0 "$(wc -l < "$test_root/firewall.calls" | tr -d ' ')" \
+  "delayed restart failure must not update the firewall"
 
 printf '%s\n' 'All WARP profile regression tests passed.'

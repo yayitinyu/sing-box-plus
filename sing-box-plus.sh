@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（直连 10 + WARP 就绪时额外 10）
-#  Version: v3.3.0
+#  Version: v3.3.1
 # ============================================================
 
 set -Eeuo pipefail
@@ -333,7 +333,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.3.0"
+SCRIPT_VERSION="v3.3.1"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -349,6 +349,35 @@ hr(){ printf "${C_DIM}==========================================================
 info(){ echo -e "[${C_CYAN}信息${C_RESET}] $*"; }
 warn(){ echo -e "[${C_YELLOW}警告${C_RESET}] $*"; }
 die(){  echo -e "[${C_RED}错误${C_RESET}] $*" >&2; exit 1; }
+
+# systemctl restart may return before asynchronous rule-set initialization fails.
+wait_service_stable(){
+  local service="$1"
+  local checks="${SBP_SERVICE_STABILITY_CHECKS:-10}"
+  local interval="${SBP_SERVICE_STABILITY_INTERVAL:-0.5}"
+  local stable_pid="" current_pid attempt
+
+  [[ "$checks" =~ ^[1-9][0-9]*$ ]] || checks=10
+  [[ "$interval" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]] || interval=0.5
+
+  for ((attempt=1; attempt<=checks; attempt++)); do
+    [[ "$interval" == "0" ]] || sleep "$interval"
+    systemctl is-active --quiet "$service" || return 1
+    current_pid="$(systemctl show "$service" --property=MainPID --value 2>/dev/null || true)"
+    [[ "$current_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    if [[ -z "$stable_pid" ]]; then
+      stable_pid="$current_pid"
+    elif [[ "$current_pid" != "$stable_pid" ]]; then
+      return 1
+    fi
+  done
+}
+
+restart_service_stably(){
+  local service="$1"
+  systemctl restart "$service" || return 1
+  wait_service_stable "$service"
+}
 
 valid_duration(){
   [[ "${1:-}" =~ ^([0-9]+(ms|s|m|h))+$ ]]
@@ -746,16 +775,51 @@ ensure_route_file(){
   fi
 }
 
+canonicalize_generated_geosite_rule_sets(){
+  # Only migrate the exact URL pattern emitted by older versions; leave user-defined tags untouched.
+  jq -c '
+    def canonical_geosite_tag:
+      sub("^geosite-(geosite-)+"; "geosite-");
+    def generated_duplicate_geosite:
+      type == "object"
+      and (.type == "remote")
+      and ((.tag | type) == "string")
+      and (.tag | test("^geosite-(geosite-)+"))
+      and (.url == ("https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/" + .tag + ".srs"));
+    [if (.rule_set | type) == "array" then
+       .rule_set[] | select(generated_duplicate_geosite)
+       | {old:.tag, new:(.tag | canonical_geosite_tag)}
+     else empty end] as $renames
+    | def rename_generated_tag($value):
+        reduce $renames[] as $rename ($value;
+          if . == $rename.old then $rename.new else . end);
+    if (.rule_set | type) == "array" then
+      .rule_set |= map(
+        if generated_duplicate_geosite then
+          (.tag |= canonical_geosite_tag)
+          | .url = ("https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/" + .tag + ".srs")
+        else . end)
+    else . end
+    | if (.rules | type) == "array" then
+        .rules |= walk(
+          if type == "object" and ((.rule_set? | type) == "array") then
+            .rule_set |= map(rename_generated_tag(.))
+          else . end)
+      else . end
+  ' "$1"
+}
+
 load_route_json(){
   if [[ -s "$ROUTE_JSON" ]] && jq -e 'type == "object"' "$ROUTE_JSON" >/dev/null 2>&1; then
-    jq -c '.rules = (.rules // []) | .rule_set = (.rule_set // []) | .outbounds = (.outbounds // []) | .default_outbound = (.default_outbound // "direct")' "$ROUTE_JSON"
+    canonicalize_generated_geosite_rule_sets "$ROUTE_JSON" \
+      | jq -c '.rules = (.rules // []) | .rule_set = (.rule_set // []) | .outbounds = (.outbounds // []) | .default_outbound = (.default_outbound // "direct")'
   else
     empty_route_json
   fi
 }
 
 normalize_route_file(){
-  jq -ces '
+  canonicalize_generated_geosite_rule_sets "$1" | jq -ces '
     def nonempty_string:
       if type == "string" then length > 0 and (test("[[:cntrl:]]") | not) else false end;
     def valid_tag:
@@ -831,7 +895,7 @@ normalize_route_file(){
     | if ([.outbounds[].tag] | length != (unique | length)) then error("远程出口 tag 重复")
       elif ([.rule_set[].tag] | length != (unique | length)) then error("规则集 tag 重复")
       else del(.format, .version) end
-  ' "$1"
+  '
 }
 
 validate_route_references(){
@@ -847,6 +911,59 @@ validate_route_references(){
     | if all(.rule_set[] | select(has("download_detour")); .download_detour as $tag | ($outbounds | index($tag)) != null) then .
       else error("规则集下载引用了不存在的出口") end
   ' "$1" >/dev/null
+}
+
+validate_remote_rule_sets(){
+  local source_file="$1" entries tag url tmp
+  local timeout_seconds="${SBP_REMOTE_RULESET_TIMEOUT:-20}"
+  [[ "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || timeout_seconds=20
+
+  if ! entries="$(jq -r '
+      (.rule_set // [])[]
+      | select(.type == "remote")
+      | [.tag, .url]
+      | @tsv
+    ' "$source_file" 2>/dev/null)"; then
+    warn "无法读取远程规则集定义。"
+    return 1
+  fi
+
+  while IFS=$'\t' read -r tag url; do
+    [[ -n "$tag" && -n "$url" ]] || continue
+    case "$url" in
+      http://*|https://*) ;;
+      *)
+        warn "远程规则集 ${tag} 仅支持 HTTP/HTTPS 地址。"
+        return 1
+        ;;
+    esac
+
+    tmp="$(mktemp "$SB_DIR/.rule-set-preflight.XXXXXX")" || return 1
+    if command -v curl >/dev/null 2>&1; then
+      if ! curl -fsSL --retry 1 --connect-timeout 5 --max-time "$timeout_seconds" \
+          -o "$tmp" "$url" 2>/dev/null; then
+        rm -f -- "$tmp"
+        warn "远程规则集 ${tag} 下载失败，已取消应用。"
+        return 1
+      fi
+    elif command -v wget >/dev/null 2>&1; then
+      if ! wget -qO "$tmp" --timeout=5 --tries=2 "$url" 2>/dev/null; then
+        rm -f -- "$tmp"
+        warn "远程规则集 ${tag} 下载失败，已取消应用。"
+        return 1
+      fi
+    else
+      rm -f -- "$tmp"
+      warn "缺少 curl/wget，无法验证远程规则集 ${tag}。"
+      return 1
+    fi
+    if [[ ! -s "$tmp" ]]; then
+      rm -f -- "$tmp"
+      warn "远程规则集 ${tag} 下载结果为空，已取消应用。"
+      return 1
+    fi
+    rm -f -- "$tmp"
+  done <<< "$entries"
 }
 
 merge_route_files(){
@@ -932,6 +1049,9 @@ parse_route_match_json(){
     case "$key" in
       geosite)
         code="$value"
+        while [[ "$code" == geosite-* ]]; do
+          code="${code#geosite-}"
+        done
         if ! valid_route_tag "$code"; then
           warn "跳过无效 geosite：$code"
           continue
@@ -3153,8 +3273,11 @@ JSON
 
 # ===== 自定义路由菜单 =====
 apply_custom_routing(){
-  local route_bak="${1:-}" conf_bak rollback_failed=0
-  if ! normalize_route_file "$ROUTE_JSON" | validate_route_references -; then
+  local route_bak="${1:-}" conf_bak normalized_route rollback_failed=0
+  normalized_route="$(mktemp "$SB_DIR/.routes-preflight.XXXXXX")" || return 1
+  if ! normalize_route_file "$ROUTE_JSON" > "$normalized_route" \
+      || ! validate_route_references "$normalized_route"; then
+    rm -f -- "$normalized_route"
     if [[ -n "$route_bak" && -f "$route_bak" ]] && ! cp "$route_bak" "$ROUTE_JSON"; then
       warn "分流引用校验失败，且无法恢复原分流配置。"
       return 1
@@ -3162,7 +3285,30 @@ apply_custom_routing(){
     warn "分流引用校验失败，已回滚自定义路由。"
     return 1
   fi
-  conf_bak="$(mktemp)" || return 1
+  if ! validate_remote_rule_sets "$normalized_route"; then
+    rm -f -- "$normalized_route"
+    if [[ -n "$route_bak" && -f "$route_bak" ]] && ! cp "$route_bak" "$ROUTE_JSON"; then
+      warn "远程规则集预检失败，且无法恢复原分流配置。"
+      return 1
+    fi
+    warn "远程规则集预检失败，已回滚自定义路由。"
+    return 1
+  fi
+  if [[ -n "$route_bak" && -f "$route_bak" ]]; then
+    if ! chmod 600 "$normalized_route" || ! mv -f -- "$normalized_route" "$ROUTE_JSON"; then
+      rm -f -- "$normalized_route"
+      cp "$route_bak" "$ROUTE_JSON" 2>/dev/null || true
+      warn "保存规范化分流配置失败，已回滚自定义路由。"
+      return 1
+    fi
+  else
+    rm -f -- "$normalized_route"
+  fi
+  conf_bak="$(mktemp)" || {
+    [[ -n "$route_bak" && -f "$route_bak" ]] && cp "$route_bak" "$ROUTE_JSON" 2>/dev/null || true
+    warn "创建运行配置备份失败，已回滚自定义路由。"
+    return 1
+  }
   if [[ -f "$CONF_JSON" ]] && ! cp "$CONF_JSON" "$conf_bak"; then
     [[ -n "$route_bak" && -f "$route_bak" ]] && cp "$route_bak" "$ROUTE_JSON"
     rm -f "$conf_bak"
@@ -3187,7 +3333,7 @@ apply_custom_routing(){
   fi
 
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
-    if ! { systemctl restart "${SYSTEMD_SERVICE}" && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; }; then
+    if ! restart_service_stably "${SYSTEMD_SERVICE}"; then
       if [[ -n "$route_bak" && -f "$route_bak" ]]; then
         cp "$route_bak" "$ROUTE_JSON" || rollback_failed=1
       fi
@@ -3199,8 +3345,8 @@ apply_custom_routing(){
         return 1
       fi
       rm -f "$conf_bak"
-      if systemctl restart "${SYSTEMD_SERVICE}" && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
-        warn "服务重启失败，已回滚分流配置并恢复服务。"
+      if restart_service_stably "${SYSTEMD_SERVICE}"; then
+        warn "服务重启后未能稳定运行，已回滚分流配置并恢复服务。"
       else
         warn "已回滚分流配置，但服务仍无法启动，请检查服务日志。"
       fi
@@ -3960,13 +4106,13 @@ apply_connection_settings(){
       && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
     service_active=true
   fi
-  if [[ "$service_active" == true ]] && ! systemctl restart "${SYSTEMD_SERVICE}"; then
+  if [[ "$service_active" == true ]] && ! restart_service_stably "${SYSTEMD_SERVICE}"; then
     restore_connection_files "$backup_dir" "$had_env" "$had_config" "$had_cert" "$had_key"
     load_env || true
-    systemctl restart "${SYSTEMD_SERVICE}" >/dev/null 2>&1 \
+    restart_service_stably "${SYSTEMD_SERVICE}" >/dev/null 2>&1 \
       || warn "原配置已恢复，但服务恢复启动失败"
     remove_connection_backup "$backup_dir"
-    warn "服务重启失败，域名、证书与 SNI 设置已回滚"
+    warn "服务重启后未能稳定运行，域名、证书与 SNI 设置已回滚"
     return 1
   fi
 
@@ -4317,7 +4463,7 @@ banner(){
 
 # ===== 业务流程 =====
 restart_service(){
-  systemctl restart "${SYSTEMD_SERVICE}" || die "重启失败"
+  restart_service_stably "${SYSTEMD_SERVICE}" || die "重启后服务未能稳定运行"
   systemctl --no-pager status "${SYSTEMD_SERVICE}" | sed -n '1,6p' || true
 }
 
@@ -4622,6 +4768,7 @@ backup_warp_repair(){
   local backup_dir="$1"
   backup_runtime_file "$SB_DIR/env.conf" env.conf "$backup_dir" || return 1
   backup_runtime_file "$CONF_JSON" config.json "$backup_dir" || return 1
+  backup_runtime_file "$ROUTE_JSON" routes.json "$backup_dir" || return 1
   backup_runtime_file "$SB_DIR/warp.env" warp.env "$backup_dir" || return 1
   backup_runtime_file "$SB_DIR/creds.env" creds.env "$backup_dir" || return 1
   backup_runtime_file "$SB_DIR/ports.env" ports.env "$backup_dir" || return 1
@@ -4636,6 +4783,7 @@ restore_warp_repair(){
   local backup_dir="$1" restore_failed=0
   restore_runtime_file "$backup_dir" env.conf "$SB_DIR/env.conf" || restore_failed=1
   restore_runtime_file "$backup_dir" config.json "$CONF_JSON" || restore_failed=1
+  restore_runtime_file "$backup_dir" routes.json "$ROUTE_JSON" || restore_failed=1
   restore_runtime_file "$backup_dir" warp.env "$SB_DIR/warp.env" || restore_failed=1
   restore_runtime_file "$backup_dir" creds.env "$SB_DIR/creds.env" || restore_failed=1
   restore_runtime_file "$backup_dir" ports.env "$SB_DIR/ports.env" || restore_failed=1
@@ -4762,7 +4910,8 @@ repair_warp(){
   load_ports || true
   ensure_dirs
 
-  local backup_root="$SB_DIR/backups" backup_dir timestamp old_umask
+  local backup_root="$SB_DIR/backups" backup_dir timestamp old_umask route_check
+  local route_changed=false
   local service_active=false restart_attempted=false failure="" restore_failed=false
   if command -v flock >/dev/null 2>&1; then
     exec 7>"$SB_DIR/.warp-repair.lock"
@@ -4781,22 +4930,58 @@ repair_warp(){
     return 1
   fi
 
+  if [[ -s "$ROUTE_JSON" ]]; then
+    route_check="$(mktemp "$backup_dir/routes-preflight.XXXXXX")" || {
+      umask "$old_umask"
+      return 1
+    }
+    if ! normalize_route_file "$ROUTE_JSON" > "$route_check" \
+        || ! validate_route_references "$route_check"; then
+      rm -f -- "$route_check"
+      umask "$old_umask"
+      warn "现有自定义路由校验失败；WARP 配置和服务均未改动。"
+      return 1
+    fi
+    if ! validate_remote_rule_sets "$route_check"; then
+      rm -f -- "$route_check"
+      umask "$old_umask"
+      warn "现有远程规则集预检失败；WARP 配置和服务均未改动。"
+      return 1
+    fi
+    if jq -en --slurpfile current "$ROUTE_JSON" --slurpfile candidate "$route_check" \
+        '$current[0] == $candidate[0]' >/dev/null; then
+      rm -f -- "$route_check"
+      route_check=""
+    else
+      route_changed=true
+    fi
+  fi
+
   ENABLE_WARP=true
   if ! ensure_warp_backend; then
+    [[ -z "$route_check" ]] || rm -f -- "$route_check"
     umask "$old_umask"
     warn "WARP 账号仍不可用；sing-box 配置和服务均未改动。"
     return 1
   fi
-  if ! save_env; then
+  if [[ "$route_changed" == true ]]; then
+    if ! chmod 600 "$route_check" || ! mv -f -- "$route_check" "$ROUTE_JSON"; then
+      failure="保存规范化分流配置失败"
+    else
+      route_check=""
+      info "已规范化旧版生成的 geosite 规则集配置。"
+    fi
+  fi
+  if [[ -z "$failure" ]] && ! save_env; then
     failure="保存 WARP 开关失败"
-  elif ! write_config; then
+  elif [[ -z "$failure" ]] && ! write_config; then
     failure="生成 sing-box 配置失败"
-  elif ! warp_backend_config_ready; then
+  elif [[ -z "$failure" ]] && ! warp_backend_config_ready; then
     failure="WARP 配置完整性复核失败"
-  elif ! jq -e '([.endpoints[]? | select(.tag == "warp")] + [.outbounds[]? | select(.tag == "warp")]) | length == 1' \
+  elif [[ -z "$failure" ]] && ! jq -e '([.endpoints[]? | select(.tag == "warp")] + [.outbounds[]? | select(.tag == "warp")]) | length == 1' \
       "$CONF_JSON" >/dev/null 2>&1; then
     failure="生成配置中缺少唯一的 WARP 出口"
-  elif ! verify_warp_egress; then
+  elif [[ -z "$failure" ]] && ! verify_warp_egress; then
     failure="WARP 出口连通性验证失败（Cloudflare trace 未返回 warp=on/plus）"
   fi
 
@@ -4804,8 +4989,8 @@ repair_warp(){
       && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
     service_active=true
     restart_attempted=true
-    if ! systemctl restart "$SYSTEMD_SERVICE"; then
-      failure="sing-box 重启失败"
+    if ! restart_service_stably "$SYSTEMD_SERVICE"; then
+      failure="sing-box 重启后未能稳定运行"
     fi
   fi
 
@@ -4815,7 +5000,7 @@ repair_warp(){
     load_env || true
     load_warp 2>/dev/null || true
     if [[ "$restart_attempted" == true ]]; then
-      systemctl restart "$SYSTEMD_SERVICE" >/dev/null 2>&1 || restore_failed=true
+      restart_service_stably "$SYSTEMD_SERVICE" >/dev/null 2>&1 || restore_failed=true
     fi
     umask "$old_umask"
     if [[ "$restore_failed" == true ]]; then

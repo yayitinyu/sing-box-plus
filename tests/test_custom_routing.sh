@@ -32,6 +32,7 @@ export DNS_HEALTH_BIN="$test_root/bin/dns-health" EVENT_LOG_BIN="$test_root/bin/
 export SYSTEMD_UNIT_DIR="$test_root/systemd" SYSTEMD_SERVICE="test-sing-box.service"
 export DNS_HEALTH_SERVICE="test-dns-health.service" DNS_HEALTH_TIMER="test-dns-health.timer"
 export SBP_SCRIPT_PATH="$test_root/sbp.sh"
+export SBP_SERVICE_STABILITY_CHECKS=3 SBP_SERVICE_STABILITY_INTERVAL=0
 
 # shellcheck source=../sing-box-plus.sh
 source "$main_script"
@@ -50,17 +51,50 @@ prepare_tls_certificate(){ return 0; }
 ensure_installed_or_hint(){ return 0; }
 systemctl(){
   case "${1:-}" in
-    is-active) [[ -f "$test_root/service-active" ]] ;;
+    is-active)
+      if [[ -f "$test_root/delayed-restart-armed" ]]; then
+        local checks=0
+        [[ ! -f "$test_root/delayed-checks" ]] || checks=$(<"$test_root/delayed-checks")
+        checks=$((checks + 1))
+        printf '%s\n' "$checks" > "$test_root/delayed-checks"
+        if (( checks >= 2 )); then
+          rm -f -- "$test_root/delayed-restart-armed" "$test_root/service-active"
+          return 1
+        fi
+      fi
+      [[ -f "$test_root/service-active" ]]
+      ;;
+    show) printf '%s\n' 4242 ;;
     restart)
       printf '%s\n' restart >> "$test_root/restarts"
       if [[ -f "$test_root/fail-restart" && ! -f "$test_root/restart-failed" ]]; then
         touch "$test_root/restart-failed"
         return 1
       fi
+      touch "$test_root/service-active"
+      if [[ -f "$test_root/arm-delayed-restart" ]]; then
+        rm -f -- "$test_root/arm-delayed-restart" "$test_root/delayed-checks"
+        touch "$test_root/delayed-restart-armed"
+      fi
       return 0
       ;;
     *) echo "Unexpected systemctl call in routing test" >&2; return 1 ;;
   esac
+}
+
+curl(){
+  local output=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "-o" && $# -ge 2 ]]; then
+      output="$2"
+      shift 2
+      continue
+    fi
+    shift
+  done
+  [[ -n "$output" ]] || return 2
+  [[ ! -f "$test_root/fail-ruleset-download" ]] || return 22
+  printf '%s\n' 'mock-srs-data' > "$output"
 }
 
 cat > "$SB_DIR/creds.env" <<'EOF'
@@ -90,7 +124,9 @@ assert_same_json(){
   jq -en --slurpfile first "$1" --slurpfile second "$2" '$first[0] == $second[0]' >/dev/null || fail "$3"
 }
 reset_state(){
-  rm -f -- "$SB_DIR/fail-check" "$test_root/fail-restart" "$test_root/restart-failed"
+  rm -f -- "$SB_DIR/fail-check" "$test_root/fail-restart" "$test_root/restart-failed" \
+    "$test_root/fail-ruleset-download" "$test_root/arm-delayed-restart" \
+    "$test_root/delayed-restart-armed" "$test_root/delayed-checks"
   : > "$test_root/restarts"
   touch "$test_root/service-active"
   printf 'ENABLE_WARP=false\n' > "$SB_DIR/env.conf"
@@ -137,12 +173,45 @@ test_block(){
   assert_json '.route.rules[0].action == "reject" and .route.rules[1].outbound == "direct"' "$CONF_JSON" "adding a route after block must preserve ordering and reset the selected action"
   remove_custom_route_rule <<< '1' > "$test_root/remove-block.log" 2>&1
   assert_json '.rules | length == 1 and .[0].outbound == "direct"' "$ROUTE_JSON" "block must remain removable through the existing menu"
-  add_custom_route_rule <<< $'5\ngeosite:category-ads-all\nGeosite block\n' > "$test_root/geosite-block.log" 2>&1
+  add_custom_route_rule <<< $'5\ngeosite:geosite-category-ads-all\nGeosite block\n' > "$test_root/geosite-block.log" 2>&1
   assert_json '.rules[-1].action == "reject" and .rules[-1].rule_set == ["geosite-category-ads-all"] and .rule_set[0].type == "remote"' "$ROUTE_JSON" "geosite block must retain its remote rule-set dependency"
+  assert_json '.rule_set[0].url | endswith("/geosite-category-ads-all.srs")' "$ROUTE_JSON" "an already-prefixed geosite name must not gain a duplicate prefix"
   check_with_core
   write_bundle_fixture
   select_route_outbound <<< '6' > "$test_root/select-remote.log"
   [[ "$SBP_SELECTED_OUTBOUND" == "remote-vps" && "$SBP_SELECTED_ACTION" == "route" ]] || fail "remote outlet numbering must follow block"
+}
+
+test_legacy_geosite_normalization(){
+  reset_state
+  cp "$ROUTE_JSON" "$test_root/route-backup.json"
+  cat > "$ROUTE_JSON" <<'JSON'
+{
+  "rules": [{
+    "type": "logical",
+    "mode": "or",
+    "rules": [
+      {"rule_set": ["geosite-geosite-category-ads"]},
+      {"domain_suffix": ["legacy-ads.example"]}
+    ],
+    "action": "reject"
+  }],
+  "rule_set": [{
+    "type": "remote",
+    "tag": "geosite-geosite-category-ads",
+    "format": "binary",
+    "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geosite-category-ads.srs",
+    "download_detour": "direct",
+    "update_interval": "1d"
+  }],
+  "outbounds": [],
+  "default_outbound": "direct"
+}
+JSON
+  apply_custom_routing "$test_root/route-backup.json" > "$test_root/legacy-geosite.log" 2>&1
+  assert_json '.route.rules[0].rules[0].rule_set == ["geosite-category-ads"]' "$CONF_JSON" "nested legacy duplicate geosite references must be normalized"
+  assert_json '.route.rule_set[0].tag == "geosite-category-ads" and (.route.rule_set[0].url | endswith("/geosite-category-ads.srs"))' "$CONF_JSON" "legacy generated rule-set definitions must use the canonical tag and URL"
+  assert_json '.rules[0].rules[0].rule_set == ["geosite-category-ads"] and .rule_set[0].tag == "geosite-category-ads"' "$ROUTE_JSON" "successful application must persist the normalized legacy rule-set"
 }
 
 test_round_trip(){
@@ -386,6 +455,20 @@ test_rollback(){
   assert_unchanged "$before_restarts" "$test_root/restarts" "reference validation failure must not restart the service"
 
   reset_state
+  cp "$ROUTE_JSON" "$test_root/route-backup.json"
+  before_conf=$(file_hash "$CONF_JSON")
+  before_restarts=$(file_hash "$test_root/restarts")
+  printf '%s\n' '{"rules":[{"rule_set":["broken-remote"],"outbound":"direct"}],"rule_set":[{"type":"remote","tag":"broken-remote","format":"binary","url":"https://rules.example.invalid/missing.srs"}]}' > "$ROUTE_JSON"
+  touch "$test_root/fail-ruleset-download"
+  if apply_custom_routing "$test_root/route-backup.json" > "$test_root/remote-rollback.log" 2>&1; then
+    fail "an unavailable remote rule-set must fail before generating runtime config"
+  fi
+  assert_same_json "$test_root/route-backup.json" "$ROUTE_JSON" "remote rule-set failure must restore saved routing rules"
+  assert_unchanged "$before_conf" "$CONF_JSON" "remote rule-set failure must preserve runtime config"
+  assert_unchanged "$before_restarts" "$test_root/restarts" "remote rule-set failure must not restart the service"
+  grep -Fq 'broken-remote' "$test_root/remote-rollback.log" || fail "remote rule-set failure must identify the failing tag"
+
+  reset_state
   before_route=$(file_hash "$ROUTE_JSON")
   before_conf=$(file_hash "$CONF_JSON")
   cp "$ROUTE_JSON" "$test_root/route-backup.json"
@@ -397,6 +480,19 @@ test_rollback(){
   assert_unchanged "$before_route" "$ROUTE_JSON" "failed restart must restore saved routing rules"
   assert_unchanged "$before_conf" "$CONF_JSON" "failed restart must restore runtime config"
   [[ "$(wc -l < "$test_root/restarts" | tr -d '[:space:]')" == 2 ]] || fail "rollback must attempt to restart with the original config"
+
+  reset_state
+  before_route=$(file_hash "$ROUTE_JSON")
+  before_conf=$(file_hash "$CONF_JSON")
+  cp "$ROUTE_JSON" "$test_root/route-backup.json"
+  printf '%s\n' '{"rules":[{"domain":["delayed.example"],"outbound":"direct"}]}' > "$ROUTE_JSON"
+  touch "$test_root/arm-delayed-restart"
+  if apply_custom_routing "$test_root/route-backup.json" > "$test_root/delayed-rollback.log" 2>&1; then
+    fail "a delayed post-restart crash must fail the routing update"
+  fi
+  assert_unchanged "$before_route" "$ROUTE_JSON" "delayed restart failure must restore saved routing rules"
+  assert_unchanged "$before_conf" "$CONF_JSON" "delayed restart failure must restore runtime config"
+  [[ "$(wc -l < "$test_root/restarts" | tr -d '[:space:]')" == 2 ]] || fail "delayed failure rollback must restart with the original config"
 }
 
 test_import_check_failure(){
@@ -427,7 +523,7 @@ case "${1:-all}" in
   preview) test_organize_preview ;;
   rollback) test_rollback ;;
   all)
-    for test_name in test_block test_round_trip test_merge test_organize test_organize_preview test_invalid_imports test_cancel_and_export_protection test_rollback test_import_check_failure test_menu; do
+    for test_name in test_block test_legacy_geosite_normalization test_round_trip test_merge test_organize test_organize_preview test_invalid_imports test_cancel_and_export_protection test_rollback test_import_check_failure test_menu; do
       "$test_name"
       printf 'PASS: %s\n' "$test_name"
     done

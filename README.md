@@ -102,7 +102,7 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 
 ```text
 =============================================================
- 🚀 Sing-Box-Plus 管理脚本 v3.2.4 🚀
+ 🚀 Sing-Box-Plus 管理脚本 v3.3.1 🚀
  脚本更新地址: https://github.com/yayitinyu/sing-box-plus
 =============================================================
   服务状态: 运行中 (Active)  |  核心版本: sing-box v1.12.7
@@ -238,7 +238,7 @@ geosite:netflix, suffix:openai.com, domain:example.com, keyword:google, regex:.*
 - **合并（默认）**：追加新规则，保留现有优先级和默认出口；完全相同的规则不会重复添加。同名远程出口或规则集必须配置一致，否则取消导入。
 - **替换**：确认后替换全部分流规则、规则集、远程出口和默认出口。可使用空规则文件清空这些设置。
 
-导入支持本脚本导出的文件，也兼容原有 `routes.json`。导入会校验文件结构和依赖引用，再使用本机 sing-box 检查生成的配置；校验或服务重启失败时回滚。修改前的规则备份保存在 `/opt/sing-box/backups/routes-import-*`。使用 WARP 的配置需要先开启 WARP，本地规则集需要在目标服务器存在对应文件。
+导入支持本脚本导出的文件，也兼容原有 `routes.json`。`geosite:` 后可填写数据集名或完整的 `geosite-` tag，脚本会自动去除重复前缀。应用前会校验文件结构、依赖引用并实际下载远程规则集，再使用本机 sing-box 检查生成的配置；校验失败、规则集返回 404，或服务重启后未能稳定运行时都会回滚。修改前的规则备份保存在 `/opt/sing-box/backups/routes-import-*`。使用 WARP 的配置需要先开启 WARP，本地规则集需要在目标服务器存在对应文件。
 
 导出默认保存为 `/opt/sing-box/routes-export-时间戳.json`，权限为 `600`。**文件包含远程出口的认证信息，请妥善保管。** 以下为只包含一条 block 规则的示例：
 
@@ -373,6 +373,8 @@ WARP_BACKEND=proxy WARP_SOCKS_PORT=40000 bash sbp.sh
 ```bash
 sudo bash /root/sbp.sh --repair-warp
 ```
+
+从 v3.3.1 起，修复流程也会迁移旧版误生成的 `geosite-geosite-*` 规则集，先验证远程规则可下载，再在重启后持续确认服务状态；若发生 404 或延迟崩溃，会恢复修复前配置。
 
 可用以下命令检查官方后端：
 

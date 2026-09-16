@@ -37,6 +37,7 @@ export WGCF_BIN="$test_root/bin/wgcf"
 export SYSTEMD_UNIT_DIR="$test_root/systemd"
 export DNS_HEALTH_SERVICE="test-dns-health.service"
 export DNS_HEALTH_TIMER="test-dns-health.timer"
+export SBP_SERVICE_STABILITY_CHECKS=3 SBP_SERVICE_STABILITY_INTERVAL=0
 
 # uninstall_all 还会删除若干硬编码路径（/var/lib/sing-box、/usr/local/bin/sbp、
 # /tmp/sing-box*、/tmp/sbp*），这些无法通过环境变量重定向，因此在检测到真实
@@ -122,7 +123,10 @@ chmod 0755 "$test_root/bin/curl"
 export PATH="$test_root/bin:$PATH"
 
 systemctl(){
-  return 0
+  case "${1:-}" in
+    show) printf '%s\n' 4242 ;;
+    *) return 0 ;;
+  esac
 }
 
 update_geofiles > "$test_root/geofiles.log" 2>&1

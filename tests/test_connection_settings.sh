@@ -30,6 +30,7 @@ export SHARE_LINKS_FILE="$test_root/state/share-links.txt"
 export BIN_PATH="${SBP_REAL_SING_BOX_BIN:-$test_root/bin/sing-box}"
 export SYSTEMD_SERVICE="test-sing-box.service"
 export SBP_SKIP_ROOT=1
+export SBP_SERVICE_STABILITY_CHECKS=3 SBP_SERVICE_STABILITY_INTERVAL=0
 
 # shellcheck source=../sing-box-plus.sh
 source "$main_script"
@@ -268,6 +269,7 @@ print_links_grouped(){
 systemctl(){
   case "${1:-}" in
     is-active) return 0 ;;
+    show) printf '%s\n' 4242 ;;
     restart)
       printf '%s\n' "$REALITY_SERVER" >> "$test_root/restarts"
       if [[ -f "$test_root/fail-restart-once" ]]; then
