@@ -146,6 +146,71 @@ if grep -Fq 'stack trace' "$test_root/rate-limit.log"; then
 fi
 grep -Fq '429 Too Many Requests' "$WGCF_DIR/wgcf-last-error.log"
 
+# Repository files must stay readable by apt's unprivileged helper even when
+# repair_warp applies a restrictive umask for credential backups.
+cat > "$test_root/os-release" <<'EOF'
+VERSION_CODENAME=noble
+EOF
+WARP_OS_RELEASE="$test_root/os-release"
+WARP_APT_KEYRING="$test_root/apt/keyrings/cloudflare-warp.gpg"
+WARP_APT_SOURCE_LIST="$test_root/apt/sources/cloudflare-client.list"
+WARP_CLI_MANAGED_MARKER="$test_root/state/warp-cli-managed"
+cat > "$SBP_BIN_DIR/apt-get" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$TEST_ROOT/apt-get.calls"
+if [[ "$*" == *'cloudflare-warp'* ]]; then
+  cat > "$TEST_ROOT/bin/warp-cli" <<'CLI'
+#!/usr/bin/env bash
+exit 0
+CLI
+  chmod 0755 "$TEST_ROOT/bin/warp-cli"
+fi
+EOF
+cat > "$SBP_BIN_DIR/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "-o" && $# -ge 2 ]]; then
+    output="$2"
+    break
+  fi
+  shift
+done
+[[ -n "$output" ]]
+printf '%s\n' 'mock-cloudflare-key' > "$output"
+EOF
+cat > "$SBP_BIN_DIR/gpg" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--output" && $# -ge 2 ]]; then
+    output="$2"
+    break
+  fi
+  shift
+done
+[[ -n "$output" ]]
+printf '%s\n' 'mock-dearmored-key' > "$output"
+EOF
+chmod 0755 "$SBP_BIN_DIR/apt-get" "$SBP_BIN_DIR/curl" "$SBP_BIN_DIR/gpg"
+: > "$test_root/apt-get.calls"
+(
+  umask 077
+  install_warp_cli
+)
+assert_equal 644 "$(stat -c '%a' "$WARP_APT_KEYRING")" \
+  "the Cloudflare apt keyring must remain readable under a restrictive umask"
+assert_equal 644 "$(stat -c '%a' "$WARP_APT_SOURCE_LIST")" \
+  "the Cloudflare apt source must remain readable under a restrictive umask"
+grep -Fq 'noble main' "$WARP_APT_SOURCE_LIST"
+grep -Fq "signed-by=$WARP_APT_KEYRING" "$WARP_APT_SOURCE_LIST"
+grep -Fq 'cloudflare-warp' "$test_root/apt-get.calls"
+rm -f -- "$SBP_BIN_DIR/apt-get" "$SBP_BIN_DIR/curl" "$SBP_BIN_DIR/gpg" "$SBP_BIN_DIR/warp-cli"
+hash -r
+
 # Default auto mode must use Cloudflare's official client and never touch the
 # rate-limited wgcf registration API when no legacy profile/account exists.
 reset_warp_state

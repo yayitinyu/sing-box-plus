@@ -1630,6 +1630,10 @@ ensure_creds(){
 
 # ===== WARP（官方客户端，本地 SOCKS5 代理） =====
 WARP_CLI_MANAGED_MARKER=${WARP_CLI_MANAGED_MARKER:-$SB_DIR/.warp-cli-installed-by-sbp}
+WARP_OS_RELEASE=${WARP_OS_RELEASE:-/etc/os-release}
+WARP_APT_KEYRING=${WARP_APT_KEYRING:-/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg}
+WARP_APT_SOURCE_LIST=${WARP_APT_SOURCE_LIST:-/etc/apt/sources.list.d/cloudflare-client.list}
+WARP_YUM_REPO=${WARP_YUM_REPO:-/etc/yum.repos.d/cloudflare-warp.repo}
 
 valid_warp_proxy_settings(){
   [[ "${WARP_SOCKS_HOST:-}" == "127.0.0.1" || "${WARP_SOCKS_HOST:-}" == "::1" ]] || return 1
@@ -1687,19 +1691,23 @@ install_warp_cli(){
     DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg >/dev/null 2>&1 || return 1
-    codename="$(awk -F= '$1=="VERSION_CODENAME" {gsub(/\"/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null)"
+    codename="$(awk -F= '$1=="VERSION_CODENAME" {gsub(/\"/, "", $2); print $2; exit}' "$WARP_OS_RELEASE" 2>/dev/null)"
     [[ -n "$codename" ]] || { warn "无法识别系统代号，不能配置 Cloudflare 官方软件源"; return 1; }
+    install -d -m 0755 "$(dirname "$WARP_APT_KEYRING")" "$(dirname "$WARP_APT_SOURCE_LIST")" || return 1
     key_tmp="$(mktemp)" || return 1
     if ! curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_tmp" \
         || ! gpg --batch --yes --dearmor \
-          --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg "$key_tmp"; then
+          --output "$WARP_APT_KEYRING" "$key_tmp"; then
       rm -f -- "$key_tmp"
       warn "Cloudflare WARP 软件源密钥安装失败"
       return 1
     fi
     rm -f -- "$key_tmp"
-    printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' \
-      "$codename" > /etc/apt/sources.list.d/cloudflare-client.list
+    # repair_warp 使用 umask 077 保护备份；apt 的 _apt 用户仍需读取仓库密钥和源文件。
+    chmod 0644 "$WARP_APT_KEYRING" || return 1
+    printf 'deb [signed-by=%s] https://pkg.cloudflareclient.com/ %s main\n' \
+      "$WARP_APT_KEYRING" "$codename" > "$WARP_APT_SOURCE_LIST"
+    chmod 0644 "$WARP_APT_SOURCE_LIST" || return 1
     if ! DEBIAN_FRONTEND=noninteractive apt-get update -y \
         || ! DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflare-warp; then
       warn "cloudflare-warp 安装失败；当前发行版可能不在 Cloudflare 支持列表中"
@@ -1710,14 +1718,19 @@ install_warp_cli(){
     command -v dnf >/dev/null 2>&1 && repo_manager=dnf || repo_manager=yum
     info "正在从 Cloudflare 官方软件源安装 cloudflare-warp"
     "$repo_manager" install -y epel-release >/dev/null 2>&1 || true
+    install -d -m 0755 "$(dirname "$WARP_YUM_REPO")" || return 1
     curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
-      -o /etc/yum.repos.d/cloudflare-warp.repo || return 1
+      -o "$WARP_YUM_REPO" || return 1
+    chmod 0644 "$WARP_YUM_REPO" || return 1
     "$repo_manager" install -y cloudflare-warp || return 1
   else
     warn "当前包管理器不受官方 WARP 客户端支持；可导入已有 WireGuard profile"
     return 1
   fi
 
+  if ! command -v warp-cli >/dev/null 2>&1; then
+    hash -r
+  fi
   if ! command -v warp-cli >/dev/null 2>&1; then
     warn "cloudflare-warp 已执行安装，但未找到 warp-cli"
     return 1
