@@ -27,7 +27,7 @@ export WGCF_DIR="$test_root/state/wgcf"
 export DIAG_DIR="$test_root/state/diagnostics"
 export ROUTE_JSON="$test_root/state/routes.json"
 export SHARE_LINKS_FILE="$test_root/state/share-links.txt"
-export BIN_PATH="$test_root/bin/sing-box"
+export BIN_PATH="${SBP_REAL_SING_BOX_BIN:-$test_root/bin/sing-box}"
 export SYSTEMD_SERVICE="test-sing-box.service"
 export SBP_SKIP_ROOT=1
 
@@ -54,15 +54,25 @@ assert_file_unchanged(){
   assert_equal "$expected_hash" "$actual_hash" "$message"
 }
 
-cat > "$SB_DIR/creds.env" <<'EOF'
+test_reality_private=reality-private
+test_reality_public=reality-public
+test_ss2022_key=ss2022-key
+if [[ -n "${SBP_REAL_SING_BOX_BIN:-}" ]]; then
+  reality_pair="$($BIN_PATH generate reality-keypair)"
+  test_reality_private="$(printf '%s\n' "$reality_pair" | awk -F': ' '$1=="PrivateKey" {print $2; exit}')"
+  test_reality_public="$(printf '%s\n' "$reality_pair" | awk -F': ' '$1=="PublicKey" {print $2; exit}')"
+  test_ss2022_key="$($BIN_PATH generate rand --base64 32)"
+fi
+
+cat > "$SB_DIR/creds.env" <<EOF
 UUID=11111111-1111-4111-8111-111111111111
 HY2_PWD=hy2-password
-REALITY_PRIV=reality-private
-REALITY_PUB=reality-public
+REALITY_PRIV=$test_reality_private
+REALITY_PUB=$test_reality_public
 REALITY_SID=1234abcd
 HY2_PWD2=hy2-obfs-password
 HY2_OBFS_PWD=obfs-password
-SS2022_KEY=ss2022-key
+SS2022_KEY=$test_ss2022_key
 SS_PWD=ss-password
 TUIC_UUID=11111111-1111-4111-8111-111111111111
 TUIC_PWD=11111111-1111-4111-8111-111111111111
@@ -181,6 +191,44 @@ assert_equal 8 "$(grep -c 'insecure=1&sni=edge.example.com' "$SHARE_LINKS_FILE")
   "certificate-backed links must follow the updated self-signed SNI and allow insecure"
 assert_equal 6 "$(grep -c 'security=reality&sni=edge.example.com' "$SHARE_LINKS_FILE")" \
   "Reality links must follow the updated SNI"
+
+# Existing WireGuard deployments must keep their endpoint, while new official-client
+# deployments must render the same logical WARP tag as a loopback SOCKS outbound.
+ENABLE_WARP=true
+WARP_BACKEND=wireguard
+save_env
+(
+  ensure_warp_backend(){ WARP_BACKEND=wireguard; return 0; }
+  write_config
+)
+assert_equal 1 "$(jq '[.endpoints[]? | select(.tag == "warp" and .type == "wireguard")] | length' "$CONF_JSON")" \
+  "the legacy backend must remain a WireGuard endpoint"
+assert_equal 0 "$(jq '[.outbounds[]? | select(.tag == "warp")] | length' "$CONF_JSON")" \
+  "the legacy backend must not duplicate the WARP tag as an outbound"
+
+WARP_BACKEND=proxy
+WARP_SOCKS_HOST=127.0.0.1
+WARP_SOCKS_PORT=40000
+save_env
+(
+  ensure_warp_backend(){ WARP_BACKEND=proxy; return 0; }
+  write_config
+)
+assert_equal 0 "$(jq '[.endpoints[]? | select(.tag == "warp")] | length' "$CONF_JSON")" \
+  "the official-client backend must not emit a WireGuard endpoint"
+assert_equal 1 "$(jq '[.outbounds[]? | select(.tag == "warp" and .type == "socks" and .server == "127.0.0.1" and .server_port == 40000)] | length' "$CONF_JSON")" \
+  "the official-client backend must use the loopback SOCKS proxy"
+assert_equal 10 "$(jq '[.inbounds[] | select(.tag | endswith("-warp"))] | length' "$CONF_JSON")" \
+  "the official-client backend must enable all WARP listener variants"
+
+PORT_VLESSR=40000
+WARP_SOCKS_PORT=40000
+save_all_ports
+if [[ "$WARP_SOCKS_PORT" == "40000" ]]; then
+  echo "FAIL: the WARP proxy port must not collide with an existing node port" >&2
+  exit 1
+fi
+assert_equal 40001 "$WARP_SOCKS_PORT" "the first free loopback proxy port must be selected deterministically"
 
 ENABLE_WARP=false
 save_env

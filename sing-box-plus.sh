@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（直连 10 + WARP 就绪时额外 10）
-#  Version: v3.2.4
+#  Version: v3.3.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -288,6 +288,9 @@ SHARE_LINKS_FILE=${SHARE_LINKS_FILE:-$SB_DIR/share-links.txt}
 
 # 功能开关（保持稳定默认）
 ENABLE_WARP=${ENABLE_WARP:-true}
+WARP_BACKEND=${WARP_BACKEND:-auto}
+WARP_SOCKS_HOST=${WARP_SOCKS_HOST:-127.0.0.1}
+WARP_SOCKS_PORT=${WARP_SOCKS_PORT:-40000}
 ENABLE_VLESS_REALITY=${ENABLE_VLESS_REALITY:-true}
 ENABLE_VLESS_GRPCR=${ENABLE_VLESS_GRPCR:-true}
 ENABLE_TROJAN_REALITY=${ENABLE_TROJAN_REALITY:-true}
@@ -330,7 +333,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.2.4"
+SCRIPT_VERSION="v3.3.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -372,6 +375,25 @@ normalize_runtime_settings(){
      (( WARP_KEEPALIVE_INTERVAL < 1 || WARP_KEEPALIVE_INTERVAL > 65535 )); then
     warn "WARP_KEEPALIVE_INTERVAL 无效，已恢复为 25"
     WARP_KEEPALIVE_INTERVAL=25
+  fi
+  case "${WARP_BACKEND:-auto}" in
+    auto|proxy|wireguard) ;;
+    *)
+      warn "WARP_BACKEND 无效，已恢复为 auto"
+      WARP_BACKEND=auto
+      ;;
+  esac
+  if [[ "${WARP_SOCKS_HOST:-}" != "127.0.0.1" && "${WARP_SOCKS_HOST:-}" != "::1" ]]; then
+    warn "WARP_SOCKS_HOST 必须是本机回环地址，已恢复为 127.0.0.1"
+    WARP_SOCKS_HOST=127.0.0.1
+  fi
+  if [[ ! "${WARP_SOCKS_PORT:-}" =~ ^[0-9]+$ ]] ||
+     (( ${#WARP_SOCKS_PORT} > 5 )) ||
+     (( 10#$WARP_SOCKS_PORT < 1 || 10#$WARP_SOCKS_PORT > 65535 )); then
+    warn "WARP_SOCKS_PORT 无效，已恢复为 40000"
+    WARP_SOCKS_PORT=40000
+  else
+    WARP_SOCKS_PORT=$((10#$WARP_SOCKS_PORT))
   fi
   if [[ ! "$DNS_FAILURE_THRESHOLD" =~ ^[0-9]+$ ]] ||
      (( DNS_FAILURE_THRESHOLD < 1 || DNS_FAILURE_THRESHOLD > 100 )); then
@@ -525,6 +547,32 @@ gen_port() {
 }
 rand_ports_reset(){ PORTS=(); }
 
+warp_socks_port_conflicts_with_node(){
+  local candidate="$1" var_name
+  for var_name in PORT_VLESSR PORT_VLESS_GRPCR PORT_TROJANR PORT_HY2 PORT_VMESS_WS PORT_HY2_OBFS PORT_SS2022 PORT_SS PORT_TUIC PORT_ANYTLS \
+                  PORT_VLESSR_W PORT_VLESS_GRPCR_W PORT_TROJANR_W PORT_HY2_W PORT_VMESS_WS_W PORT_HY2_OBFS_W PORT_SS2022_W PORT_SS_W PORT_TUIC_W PORT_ANYTLS_W; do
+    [[ "${!var_name:-}" == "$candidate" ]] && return 0
+  done
+  return 1
+}
+
+reserve_warp_socks_port(){
+  [[ "${ENABLE_WARP:-false}" == "true" && "${WARP_BACKEND:-auto}" != "wireguard" ]] || return 0
+  valid_warp_proxy_settings || return 1
+
+  local original_port="$WARP_SOCKS_PORT" candidate
+  if warp_socks_port_conflicts_with_node "$WARP_SOCKS_PORT"; then
+    for candidate in $(seq 40000 40100); do
+      if ! warp_socks_port_conflicts_with_node "$candidate"; then
+        WARP_SOCKS_PORT="$candidate"
+        warn "WARP 本地代理端口 ${original_port} 与节点端口冲突，已改用 ${candidate}"
+        break
+      fi
+    done
+  fi
+  PORTS+=("$WARP_SOCKS_PORT")
+}
+
 PORT_VLESSR=""; PORT_VLESS_GRPCR=""; PORT_TROJANR=""; PORT_HY2=""; PORT_VMESS_WS=""
 PORT_HY2_OBFS=""; PORT_SS2022=""; PORT_SS=""; PORT_TUIC=""; PORT_ANYTLS=""
 PORT_VLESSR_W=""; PORT_VLESS_GRPCR_W=""; PORT_TROJANR_W=""; PORT_HY2_W=""; PORT_VMESS_WS_W=""
@@ -561,6 +609,7 @@ save_all_ports(){
            PORT_VLESSR_W PORT_VLESS_GRPCR_W PORT_TROJANR_W PORT_HY2_W PORT_VMESS_WS_W PORT_HY2_OBFS_W PORT_SS2022_W PORT_SS_W PORT_TUIC_W PORT_ANYTLS_W; do
     [[ -n "${!v:-}" ]] && PORTS+=("${!v}")
   done
+  reserve_warp_socks_port
   [[ -z "${PORT_VLESSR:-}" ]] && PORT_VLESSR=$(gen_port)
   [[ -z "${PORT_VLESS_GRPCR:-}" ]] && PORT_VLESS_GRPCR=$(gen_port)
   [[ -z "${PORT_TROJANR:-}" ]] && PORT_TROJANR=$(gen_port)
@@ -602,6 +651,9 @@ ENABLE_SS=$ENABLE_SS
 ENABLE_TUIC=$ENABLE_TUIC
 ENABLE_ANYTLS=$ENABLE_ANYTLS
 ENABLE_WARP=$ENABLE_WARP
+WARP_BACKEND=$WARP_BACKEND
+WARP_SOCKS_HOST=$WARP_SOCKS_HOST
+WARP_SOCKS_PORT=$WARP_SOCKS_PORT
 REALITY_SERVER=$REALITY_SERVER
 REALITY_SERVER_PORT=$REALITY_SERVER_PORT
 GRPC_SERVICE=$GRPC_SERVICE
@@ -1576,7 +1628,192 @@ ensure_creds(){
   save_creds
 }
 
-# ===== WARP（wgcf） =====
+# ===== WARP（官方客户端，本地 SOCKS5 代理） =====
+WARP_CLI_MANAGED_MARKER=${WARP_CLI_MANAGED_MARKER:-$SB_DIR/.warp-cli-installed-by-sbp}
+
+valid_warp_proxy_settings(){
+  [[ "${WARP_SOCKS_HOST:-}" == "127.0.0.1" || "${WARP_SOCKS_HOST:-}" == "::1" ]] || return 1
+  [[ "${WARP_SOCKS_PORT:-}" =~ ^[0-9]+$ ]] || return 1
+  (( ${#WARP_SOCKS_PORT} <= 5 )) || return 1
+  (( 10#$WARP_SOCKS_PORT >= 1 && 10#$WARP_SOCKS_PORT <= 65535 ))
+}
+
+warp_proxy_config_ready(){
+  [[ "${ENABLE_WARP:-false}" == "true" && "${WARP_BACKEND:-auto}" == "proxy" ]] || return 1
+  valid_warp_proxy_settings
+}
+
+warp_proxy_url(){
+  if [[ "${WARP_SOCKS_HOST:-127.0.0.1}" == "::1" ]]; then
+    printf 'socks5h://[::1]:%s' "$WARP_SOCKS_PORT"
+  else
+    printf 'socks5h://127.0.0.1:%s' "$WARP_SOCKS_PORT"
+  fi
+}
+
+warp_proxy_listener_ready(){
+  local listeners=""
+  if command -v ss >/dev/null 2>&1; then
+    listeners="$(ss -H -ltn "sport = :${WARP_SOCKS_PORT}" 2>/dev/null || true)"
+  elif command -v netstat >/dev/null 2>&1; then
+    listeners="$(netstat -lnt 2>/dev/null || true)"
+  else
+    return 1
+  fi
+
+  if [[ "$WARP_SOCKS_HOST" == "::1" ]]; then
+    printf '%s\n' "$listeners" | grep -Eq "(^|[[:space:]])(\\[::1\\]|::1):${WARP_SOCKS_PORT}([[:space:]]|$)"
+  else
+    printf '%s\n' "$listeners" | grep -Eq "(^|[[:space:]])127\\.0\\.0\\.1:${WARP_SOCKS_PORT}([[:space:]]|$)"
+  fi
+}
+
+install_warp_cli(){
+  command -v warp-cli >/dev/null 2>&1 && return 0
+
+  local arch codename key_tmp repo_manager=""
+  arch="$(arch_map)"
+  case "$arch" in
+    amd64|arm64) ;;
+    *)
+      warn "官方 Cloudflare WARP Linux 客户端不支持当前架构：$arch"
+      return 1
+      ;;
+  esac
+
+  ensure_dirs
+  if command -v apt-get >/dev/null 2>&1; then
+    info "正在从 Cloudflare 官方软件源安装 cloudflare-warp"
+    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg >/dev/null 2>&1 || return 1
+    codename="$(awk -F= '$1=="VERSION_CODENAME" {gsub(/\"/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null)"
+    [[ -n "$codename" ]] || { warn "无法识别系统代号，不能配置 Cloudflare 官方软件源"; return 1; }
+    key_tmp="$(mktemp)" || return 1
+    if ! curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_tmp" \
+        || ! gpg --batch --yes --dearmor \
+          --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg "$key_tmp"; then
+      rm -f -- "$key_tmp"
+      warn "Cloudflare WARP 软件源密钥安装失败"
+      return 1
+    fi
+    rm -f -- "$key_tmp"
+    printf 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ %s main\n' \
+      "$codename" > /etc/apt/sources.list.d/cloudflare-client.list
+    if ! DEBIAN_FRONTEND=noninteractive apt-get update -y \
+        || ! DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflare-warp; then
+      warn "cloudflare-warp 安装失败；当前发行版可能不在 Cloudflare 支持列表中"
+      return 1
+    fi
+    repo_manager=apt
+  elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+    command -v dnf >/dev/null 2>&1 && repo_manager=dnf || repo_manager=yum
+    info "正在从 Cloudflare 官方软件源安装 cloudflare-warp"
+    "$repo_manager" install -y epel-release >/dev/null 2>&1 || true
+    curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
+      -o /etc/yum.repos.d/cloudflare-warp.repo || return 1
+    "$repo_manager" install -y cloudflare-warp || return 1
+  else
+    warn "当前包管理器不受官方 WARP 客户端支持；可导入已有 WireGuard profile"
+    return 1
+  fi
+
+  if ! command -v warp-cli >/dev/null 2>&1; then
+    warn "cloudflare-warp 已执行安装，但未找到 warp-cli"
+    return 1
+  fi
+  printf 'package_manager=%s\n' "$repo_manager" > "$WARP_CLI_MANAGED_MARKER"
+  chmod 0600 "$WARP_CLI_MANAGED_MARKER" 2>/dev/null || true
+}
+
+record_warp_cli_failure(){
+  local phase="$1" log_file="$2" saved_log="$WGCF_DIR/warp-cli-last-error.log"
+  mkdir -p "$WGCF_DIR" || true
+  install -m 0600 "$log_file" "$saved_log" 2>/dev/null || true
+  warn "官方 WARP 客户端${phase}失败，未启用 WARP 节点。"
+  [[ -s "$saved_log" ]] && warn "完整错误日志：$saved_log"
+}
+
+run_warp_cli_logged(){
+  local phase="$1" log_file="$2"
+  shift 2
+  if warp-cli --accept-tos "$@" > "$log_file" 2>&1; then
+    return 0
+  fi
+  record_warp_cli_failure "$phase" "$log_file"
+  return 1
+}
+
+warp_cli_registration_ready(){
+  warp-cli --accept-tos registration show >/dev/null 2>&1
+}
+
+ensure_warp_proxy(){
+  [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
+  normalize_runtime_settings
+  valid_warp_proxy_settings || return 1
+  install_warp_cli || return 1
+
+  local log_file="$WGCF_DIR/warp-cli.log" trace="" warp_state="" attempt
+  mkdir -p "$WGCF_DIR" || return 1
+  chmod 0700 "$WGCF_DIR" 2>/dev/null || true
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    printf '%s\n' 'systemd is required by the official Cloudflare WARP Linux client' > "$log_file"
+    record_warp_cli_failure "服务启动" "$log_file"
+    return 1
+  fi
+  if ! systemctl enable --now warp-svc.service > "$log_file" 2>&1; then
+    record_warp_cli_failure "服务启动" "$log_file"
+    return 1
+  fi
+
+  if ! warp_cli_registration_ready; then
+    info "正在通过官方客户端注册 Cloudflare WARP"
+    run_warp_cli_logged "注册" "$log_file" registration new || return 1
+    if ! warp_cli_registration_ready; then
+      printf '%s\n' 'warp-cli registration new returned success but registration is still missing' > "$log_file"
+      record_warp_cli_failure "注册校验" "$log_file"
+      return 1
+    fi
+  fi
+
+  # 新版 proxy 模式要求 MASQUE；旧版不支持该子命令时仍以最终连通性结果为准。
+  warp-cli --accept-tos tunnel protocol set MASQUE > "$log_file" 2>&1 || true
+  run_warp_cli_logged "代理模式设置" "$log_file" mode proxy || return 1
+  run_warp_cli_logged "代理端口设置" "$log_file" proxy port "$WARP_SOCKS_PORT" || return 1
+  run_warp_cli_logged "连接" "$log_file" connect || return 1
+
+  for attempt in $(seq 1 20); do
+    warp_proxy_listener_ready && break
+    [[ "$attempt" -lt 20 ]] && sleep 0.5
+  done
+  if ! warp_proxy_listener_ready; then
+    printf 'warp-cli did not open the expected loopback listener %s:%s\n' \
+      "$WARP_SOCKS_HOST" "$WARP_SOCKS_PORT" > "$log_file"
+    record_warp_cli_failure "本地代理检查" "$log_file"
+    return 1
+  fi
+
+  for attempt in $(seq 1 8); do
+    trace="$(curl -fsS --max-time 8 --noproxy '' --proxy "$(warp_proxy_url)" \
+      https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+    warp_state="$(printf '%s\n' "$trace" | awk -F= '$1=="warp" {print $2; exit}')"
+    [[ "$warp_state" =~ ^(on|plus)$ ]] && break
+    [[ "$attempt" -lt 8 ]] && sleep 1
+  done
+  if [[ ! "$warp_state" =~ ^(on|plus)$ ]]; then
+    printf '%s\n' 'Cloudflare trace did not report warp=on or warp=plus through the local proxy' > "$log_file"
+    record_warp_cli_failure "出口校验" "$log_file"
+    return 1
+  fi
+
+  WARP_BACKEND=proxy
+  rm -f -- "$WGCF_DIR/warp-cli-last-error.log" "$log_file"
+  info "官方 WARP 本地代理已就绪：${WARP_SOCKS_HOST}:${WARP_SOCKS_PORT}"
+}
+
+# ===== WARP（wgcf WireGuard，兼容已有 profile） =====
 WGCF_BIN=${WGCF_BIN:-/usr/local/bin/wgcf}
 install_wgcf(){
   [[ -x "$WGCF_BIN" ]] && return 0
@@ -1709,13 +1946,10 @@ parse_warp_profile(){
   warp_profile_ready
 }
 
-ensure_warp_profile(){
-  [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
+reuse_warp_profile(){
+  local wd="$WGCF_DIR" profile_file="$WGCF_DIR/wgcf-profile.conf"
 
-  local wd="$WGCF_DIR" tmp_dir log_file account_file account_source profile_file
-  local new_account=false register_ok=false timestamp backup_file
-
-  # 先尝试读取旧 env，并做一次规范化补齐
+  # 先尝试读取旧 env，并做一次规范化补齐。
   if load_warp 2>/dev/null; then
     WARP_PRIVATE_KEY="$(pad_b64 "${WARP_PRIVATE_KEY:-}")"
     WARP_PEER_PUBLIC_KEY="$(pad_b64 "${WARP_PEER_PUBLIC_KEY:-}")"
@@ -1723,17 +1957,16 @@ ensure_warp_profile(){
     : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
     # 如果关键字段都在，就直接用旧的（已经补齐），无需重建
     if warp_profile_ready; then
-      save_warp
+      save_warp || return 1
       return 0
     fi
   fi
 
-  mkdir -p "$wd" || return 1
+  mkdir -p "$wd" 2>/dev/null || return 1
   chmod 0700 "$wd" 2>/dev/null || true
 
   # wgcf profile 本身已包含 sing-box 所需的全部 WireGuard 参数。
   # 优先复用人工导入或上次已生成的有效 profile，避免再次访问注册 API。
-  profile_file="$wd/wgcf-profile.conf"
   if parse_warp_profile "$profile_file" 2>/dev/null; then
     chmod 0600 "$profile_file" 2>/dev/null || true
     save_warp || return 1
@@ -1741,6 +1974,19 @@ ensure_warp_profile(){
     info "已复用现有 WARP profile，无需重新注册"
     return 0
   fi
+  return 1
+}
+
+ensure_warp_profile(){
+  [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
+
+  local wd="$WGCF_DIR" tmp_dir log_file account_file account_source profile_file
+  local new_account=false register_ok=false timestamp backup_file
+
+  reuse_warp_profile && return 0
+
+  mkdir -p "$wd" || return 1
+  chmod 0700 "$wd" 2>/dev/null || true
 
   # 走到这里说明旧 env 不完整；开始用 wgcf 重建
   install_wgcf || { warn "wgcf 安装失败，WARP 节点不会启用"; return 1; }
@@ -1794,6 +2040,71 @@ ensure_warp_profile(){
   rm -f -- "$wd/wgcf-last-error.log"
   rm -rf -- "$tmp_dir"
   info "WARP 配置已生成并通过完整性检查"
+}
+
+warp_backend_config_ready(){
+  case "${WARP_BACKEND:-auto}" in
+    proxy)
+      warp_proxy_config_ready
+      ;;
+    wireguard)
+      load_warp 2>/dev/null || true
+      warp_profile_ready
+      ;;
+    auto)
+      # 旧版 env.conf 没有 WARP_BACKEND；有效 profile 必须继续无缝可用。
+      load_warp 2>/dev/null || true
+      warp_profile_ready
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+warp_backend_label(){
+  case "${WARP_BACKEND:-auto}" in
+    proxy) printf 'official-proxy' ;;
+    wireguard) printf 'wgcf-wireguard' ;;
+    auto) printf 'auto' ;;
+    *) printf 'disabled' ;;
+  esac
+}
+
+ensure_warp_backend(){
+  [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
+  normalize_runtime_settings
+
+  case "$WARP_BACKEND" in
+    proxy)
+      ensure_warp_proxy
+      ;;
+    wireguard)
+      ensure_warp_profile && WARP_BACKEND=wireguard
+      ;;
+    auto)
+      # 升级时优先保留已有 WireGuard profile，避免改变现有 UDP 能力和出口状态。
+      if reuse_warp_profile; then
+        WARP_BACKEND=wireguard
+        return 0
+      fi
+      # 已导入的账号可离线生成 profile；这里不会创建新 wgcf 账号。
+      if wgcf_account_ready "$WGCF_DIR/wgcf-account.toml"; then
+        if ensure_warp_profile; then
+          WARP_BACKEND=wireguard
+          return 0
+        fi
+        warn "已有 wgcf 账号无法生成有效 profile，将尝试官方 WARP 客户端"
+      fi
+      if ensure_warp_proxy; then
+        WARP_BACKEND=proxy
+        return 0
+      fi
+      warn "官方 WARP 客户端不可用；默认模式不会再调用易触发 HTTP 429 的 wgcf 新账号注册。"
+      warn "可修复官方客户端后重试，或导入已有 wgcf-profile.conf。"
+      return 1
+      ;;
+  esac
 }
 
 # ===== 版本探测与比对 =====
@@ -2422,12 +2733,19 @@ EOF
 
 # ===== systemd =====
 write_systemd(){
-write_runtime_helpers
-cat > "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" <<EOF
+  local warp_unit_after="network-online.target" warp_unit_wants=""
+  load_env || true
+  if warp_proxy_config_ready; then
+    warp_unit_after+=" warp-svc.service"
+    warp_unit_wants="Wants=warp-svc.service"
+  fi
+  write_runtime_helpers
+  cat > "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" <<EOF
 [Unit]
 Description=Sing-Box-Plus
-After=network-online.target
+After=${warp_unit_after}
 Requires=network-online.target
+${warp_unit_wants}
 
 [Service]
 Type=simple
@@ -2446,9 +2764,9 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
-systemctl enable --now "${DNS_HEALTH_TIMER}" >/dev/null 2>&1 || true
+  systemctl daemon-reload
+  systemctl enable "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
+  systemctl enable --now "${DNS_HEALTH_TIMER}" >/dev/null 2>&1 || true
 }
 
 # ===== 写 config.json（使用你提供的稳定配置逻辑） =====
@@ -2457,7 +2775,7 @@ write_config(){
   apply_runtime_overrides
   normalize_runtime_settings
   ensure_creds; save_all_ports; prepare_tls_certificate || return 1
-  if [[ "$ENABLE_WARP" == "true" ]] && ! ensure_warp_profile; then
+  if [[ "$ENABLE_WARP" == "true" ]] && ! ensure_warp_backend; then
     ENABLE_WARP=false
     warn "WARP 当前不可用，本次仅部署 10 个直连节点。"
   fi
@@ -2481,6 +2799,8 @@ write_config(){
   --arg ANYTLS "$ANYTLS_PWD" \
   --arg TCPKA "$TCP_KEEP_ALIVE" --arg TCPKAI "$TCP_KEEP_ALIVE_INTERVAL" --arg UDPT "$UDP_TIMEOUT" \
   --argjson WARP_KEEPALIVE "$WARP_KEEPALIVE_INTERVAL" \
+  --arg WARP_BACKEND "${WARP_BACKEND:-auto}" \
+  --arg WARP_SOCKS_HOST "${WARP_SOCKS_HOST:-127.0.0.1}" --argjson WARP_SOCKS_PORT "${WARP_SOCKS_PORT:-40000}" \
   --argjson P1 "$PORT_VLESSR" --argjson P2 "$PORT_VLESS_GRPCR" --argjson P3 "$PORT_TROJANR" \
   --argjson P4 "$PORT_HY2" --argjson P5 "$PORT_VMESS_WS" --argjson P6 "$PORT_HY2_OBFS" \
   --argjson P7 "$PORT_SS2022" --argjson P8 "$PORT_SS" --argjson P9 "$PORT_TUIC" --argjson P10 "$PORT_ANYTLS" \
@@ -2518,8 +2838,17 @@ write_config(){
   def inbound_tuic($port): ({type:"tuic", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$TUICUUID, password:$TUICPWD}], congestion_control:"bbr", tls:inbound_tls(["h3"])} + listen_tuning);
   def inbound_anytls($port): ({type:"anytls", listen:"0.0.0.0", listen_port:$port, users:[{name:"anytls", password:$ANYTLS}], tls:inbound_tls(["h2","http/1.1"])} + listen_tuning);
 
-  def warp_ready:
-    $ENABLE_WARP=="true" and ($WPRIV|length)>0 and ($WPPUB|length)>0 and ($WHOST|length)>0 and ($WPORT>0) and (([$W4, $W6] | map(select(. != "")) | length)>0);
+  def warp_wireguard_ready:
+    $ENABLE_WARP=="true" and $WARP_BACKEND=="wireguard"
+    and ($WPRIV|length)>0 and ($WPPUB|length)>0 and ($WHOST|length)>0 and ($WPORT>0)
+    and (([$W4, $W6] | map(select(. != "")) | length)>0);
+
+  def warp_proxy_ready:
+    $ENABLE_WARP=="true" and $WARP_BACKEND=="proxy"
+    and ($WARP_SOCKS_HOST=="127.0.0.1" or $WARP_SOCKS_HOST=="::1")
+    and ($WARP_SOCKS_PORT>0);
+
+  def warp_ready: warp_wireguard_ready or warp_proxy_ready;
 
   def warp_endpoint:
     {type:"wireguard", tag:"warp",
@@ -2536,6 +2865,9 @@ write_config(){
       udp_timeout:$UDPT,
       domain_resolver:"dns-doh-primary"
     };
+
+  def warp_proxy_outbound:
+    {type:"socks", tag:"warp", server:$WARP_SOCKS_HOST, server_port:$WARP_SOCKS_PORT};
 
   def custom_rule_sets:
     (($CUSTOM_ROUTES.rule_set // []) | map(select((.tag // "") != "")));
@@ -2634,7 +2966,7 @@ write_config(){
       strategy:"prefer_ipv4",
       cache_capacity:4096
     },
-    endpoints: (if warp_ready then [warp_endpoint] else [] end),
+    endpoints: (if warp_wireguard_ready then [warp_endpoint] else [] end),
     inbounds: ([
       (inbound_vless_flow($P1) + {tag:"vless-reality"}),
       (inbound_vless($P2) + {tag:"vless-grpcr", transport:{type:"grpc", service_name:$GRPC}}),
@@ -2659,6 +2991,7 @@ write_config(){
       (inbound_anytls($PW10) + {tag:"anytls-warp"})
     ] else [] end)),
     outbounds: ([direct_outbound]
+      + (if warp_proxy_ready then [warp_proxy_outbound] else [] end)
       + (if custom_uses_outbound("direct-ipv4") then [direct_ipv4_outbound] else [] end)
       + (if custom_uses_outbound("direct-ipv6") then [direct_ipv6_outbound] else [] end)
       + custom_outbounds),
@@ -2685,8 +3018,7 @@ write_config(){
 open_firewall(){
   local rules=() warp_active=false
   load_env || true
-  load_warp 2>/dev/null || true
-  warp_profile_ready && warp_active=true
+  warp_backend_config_ready && warp_active=true
   rules+=("${PORT_VLESSR}/tcp" "${PORT_VLESS_GRPCR}/tcp" "${PORT_TROJANR}/tcp" "${PORT_VMESS_WS}/tcp")
   rules+=("${PORT_HY2}/udp" "${PORT_HY2_OBFS}/udp" "${PORT_TUIC}/udp" "${PORT_ANYTLS}/tcp")
   rules+=("${PORT_SS2022}/tcp" "${PORT_SS2022}/udp" "${PORT_SS}/tcp" "${PORT_SS}/udp")
@@ -2717,12 +3049,11 @@ open_firewall(){
 # ===== 分享链接（分组输出 + 提示） =====
 print_links_grouped(){
   load_env; load_creds; load_ports
-  load_warp 2>/dev/null || true
   local ip; ip=$(get_ip)
   local tls_host tls_security_query tls_tip links_tmp l
   local warp_active=false link_count=10
   local links_direct=() links_warp=()
-  if warp_profile_ready; then
+  if warp_backend_config_ready; then
     warp_active=true
     link_count=20
   fi
@@ -2935,7 +3266,7 @@ select_route_outbound(){
   choice="${choice//$'\r'/}"
   case "$choice" in
     1)
-      if ! load_warp >/dev/null 2>&1; then
+      if ! warp_backend_config_ready >/dev/null 2>&1; then
         warn "尚未检测到 WARP 配置；应用时会尝试生成，失败则该规则无法通过检查。"
       fi
       SBP_SELECTED_OUTBOUND="warp"
@@ -3129,7 +3460,7 @@ set_custom_default_outbound(){
       target="direct-ipv6"
       ;;
     4)
-      if ! load_warp >/dev/null 2>&1; then
+      if ! warp_backend_config_ready >/dev/null 2>&1; then
         warn "尚未检测到 WARP 配置；应用时会尝试生成，失败则无法生效。"
       fi
       target="warp"
@@ -3731,9 +4062,8 @@ show_service_status(){
   load_env || true
   load_creds || true
   load_ports || true
-  load_warp 2>/dev/null || true
   local warp_active=false node_count=10
-  if warp_profile_ready; then
+  if warp_backend_config_ready; then
     warp_active=true
     node_count=20
   fi
@@ -4040,7 +4370,14 @@ run_diagnostics(){
     echo "TCP 拥塞控制: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
     echo "TCP keepalive: ${TCP_KEEP_ALIVE}/${TCP_KEEP_ALIVE_INTERVAL}"
     echo "UDP timeout: ${UDP_TIMEOUT}"
-    echo "WARP keepalive: ${WARP_KEEPALIVE_INTERVAL}s"
+    echo "WARP backend: $(warp_backend_label)"
+    if [[ "${WARP_BACKEND:-auto}" == "wireguard" ]]; then
+      echo "WARP keepalive: ${WARP_KEEPALIVE_INTERVAL}s"
+    elif [[ "${WARP_BACKEND:-auto}" == "proxy" ]]; then
+      echo "WARP local proxy: ${WARP_SOCKS_HOST}:${WARP_SOCKS_PORT}"
+      systemctl is-active warp-svc.service 2>/dev/null | sed 's/^/warp-svc: /'
+      warp-cli --accept-tos status 2>/dev/null | sed 's/^/warp-cli: /'
+    fi
     echo "DNS 切换阈值: 故障 ${DNS_FAILURE_THRESHOLD} 次 / 恢复 ${DNS_RECOVERY_THRESHOLD} 次"
     echo "DNS 恢复冷却: ${DNS_SWITCH_COOLDOWN}s"
     conntrack_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
@@ -4115,6 +4452,22 @@ rotate_ports(){
 }
 
 # ===== 一键彻底卸载与深度清理 =====
+uninstall_managed_warp_cli(){
+  [[ -f "$WARP_CLI_MANAGED_MARKER" ]] || return 0
+  local package_manager
+  package_manager="$(awk -F= '$1=="package_manager" {print $2; exit}' "$WARP_CLI_MANAGED_MARKER" 2>/dev/null)"
+  info "正在移除由 Sing-Box-Plus 安装的官方 WARP 客户端..."
+  warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now warp-svc.service >/dev/null 2>&1 || true
+  fi
+  case "$package_manager" in
+    apt) DEBIAN_FRONTEND=noninteractive apt-get purge -y cloudflare-warp >/dev/null 2>&1 || true ;;
+    dnf) dnf remove -y cloudflare-warp >/dev/null 2>&1 || true ;;
+    yum) yum remove -y cloudflare-warp >/dev/null 2>&1 || true ;;
+  esac
+}
+
 uninstall_all(){
   clear >/dev/null 2>&1 || true
   hr
@@ -4125,7 +4478,7 @@ uninstall_all(){
   echo -e "  2. 终止所有运行中的 sing-box、wgcf 残留进程"
   echo -e "  3. 清理防火墙中放行的全部 20 个节点端口规则 (UFW / Firewalld / iptables)"
   echo -e "  4. 清理所有安装目录、配置文件、凭证、证书与日志 ($SB_DIR, $SBP_ROOT, /var/lib/sing-box)"
-  echo -e "  5. 清理 sing-box、wgcf 及所有辅助脚本二进制文件"
+  echo -e "  5. 清理 sing-box、wgcf，以及由本脚本安装的官方 WARP 客户端"
   hr
   read -rp "确定要彻底卸载 Sing-Box-Plus 吗？(y/N): " confirm_uninstall
   if [[ "${confirm_uninstall,,}" != "y" && "${confirm_uninstall,,}" != "yes" ]]; then
@@ -4143,6 +4496,7 @@ uninstall_all(){
     systemctl stop "${DNS_HEALTH_SERVICE}" >/dev/null 2>&1 || true
     systemctl disable "${DNS_HEALTH_SERVICE}" >/dev/null 2>&1 || true
   fi
+  uninstall_managed_warp_cli
 
   rm -f "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" 2>/dev/null || true
   rm -f "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_SERVICE}" "${SYSTEMD_UNIT_DIR}/${DNS_HEALTH_TIMER}" 2>/dev/null || true
@@ -4314,9 +4668,11 @@ verify_warp_egress(){
 
     if ! jq --argjson port "$port" '
       (.dns.final) as $resolver
-      | ([.endpoints[]? | select(.tag == "warp")]) as $warp
+      | ([.endpoints[]? | select(.tag == "warp")]) as $warp_endpoints
+      | ([.outbounds[]? | select(.tag == "warp")]) as $warp_outbounds
       | ([.outbounds[]? | select(.tag == "direct")]) as $direct
-      | if ($warp | length) != 1 or ($direct | length) != 1 or ($resolver == null) then
+      | if (($warp_endpoints | length) + ($warp_outbounds | length)) != 1
+          or ($direct | length) != 1 or ($resolver == null) then
           error("missing WARP verification dependency")
         else
           {
@@ -4328,8 +4684,8 @@ verify_warp_egress(){
               listen: "127.0.0.1",
               listen_port: $port
             }],
-            endpoints: $warp,
-            outbounds: $direct,
+            endpoints: $warp_endpoints,
+            outbounds: ($direct + $warp_outbounds),
             route: {
               rules: [{
                 inbound: ["warp-verify-in"],
@@ -4413,7 +4769,7 @@ repair_warp(){
   fi
 
   ENABLE_WARP=true
-  if ! ensure_warp_profile; then
+  if ! ensure_warp_backend; then
     umask "$old_umask"
     warn "WARP 账号仍不可用；sing-box 配置和服务均未改动。"
     return 1
@@ -4422,10 +4778,11 @@ repair_warp(){
     failure="保存 WARP 开关失败"
   elif ! write_config; then
     failure="生成 sing-box 配置失败"
-  elif ! load_warp 2>/dev/null || ! warp_profile_ready; then
+  elif ! warp_backend_config_ready; then
     failure="WARP 配置完整性复核失败"
-  elif ! jq -e '[.endpoints[]? | select(.tag == "warp")] | length == 1' "$CONF_JSON" >/dev/null 2>&1; then
-    failure="生成配置中缺少 WARP endpoint"
+  elif ! jq -e '([.endpoints[]? | select(.tag == "warp")] + [.outbounds[]? | select(.tag == "warp")]) | length == 1' \
+      "$CONF_JSON" >/dev/null 2>&1; then
+    failure="生成配置中缺少唯一的 WARP 出口"
   elif ! verify_warp_egress; then
     failure="WARP 出口连通性验证失败（Cloudflare trace 未返回 warp=on/plus）"
   fi

@@ -146,6 +146,52 @@ if grep -Fq 'stack trace' "$test_root/rate-limit.log"; then
 fi
 grep -Fq '429 Too Many Requests' "$WGCF_DIR/wgcf-last-error.log"
 
+# Default auto mode must use Cloudflare's official client and never touch the
+# rate-limited wgcf registration API when no legacy profile/account exists.
+reset_warp_state
+WARP_BACKEND=auto
+cat > "$SBP_BIN_DIR/warp-cli" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$TEST_ROOT/warp-cli.calls"
+case "$*" in
+  *'registration show'*) [[ -f "$TEST_ROOT/warp-cli.registered" ]] ;;
+  *'registration new'*) : > "$TEST_ROOT/warp-cli.registered" ;;
+esac
+EOF
+cat > "$SBP_BIN_DIR/systemctl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "$TEST_ROOT/warp-systemctl.calls"
+EOF
+cat > "$SBP_BIN_DIR/ss" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'LISTEN 0 4096 127.0.0.1:40000 0.0.0.0:*'
+EOF
+cat > "$SBP_BIN_DIR/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'fl=mock' 'warp=on'
+EOF
+chmod 0755 "$SBP_BIN_DIR/warp-cli" "$SBP_BIN_DIR/systemctl" "$SBP_BIN_DIR/ss" "$SBP_BIN_DIR/curl"
+: > "$test_root/warp-cli.calls"
+: > "$test_root/warp-systemctl.calls"
+ensure_warp_backend > "$test_root/official-proxy.log" 2>&1
+assert_equal proxy "$WARP_BACKEND" "auto mode must select the official proxy backend"
+assert_equal 0 "$(wc -l < "$test_root/wgcf.calls" | tr -d ' ')" \
+  "auto mode must not invoke wgcf without an imported account or profile"
+assert_equal 1 "$(grep -c 'registration new' "$test_root/warp-cli.calls")" \
+  "the official client must register exactly once"
+assert_equal 1 "$(grep -c 'mode proxy' "$test_root/warp-cli.calls")" \
+  "the official client must enter local proxy mode"
+assert_equal 1 "$(grep -c 'proxy port 40000' "$test_root/warp-cli.calls")" \
+  "the official client must bind the configured proxy port"
+assert_equal 1 "$(grep -c 'connect' "$test_root/warp-cli.calls")" \
+  "the official client must connect once"
+rm -f -- "$SBP_BIN_DIR/warp-cli" "$SBP_BIN_DIR/systemctl" "$SBP_BIN_DIR/ss" "$SBP_BIN_DIR/curl"
+rm -f -- "$test_root/warp-cli.registered"
+hash -r
+WARP_BACKEND=wireguard
+
 # A valid imported profile is self-contained and must not hit the registration API.
 reset_warp_state
 cat > "$WGCF_DIR/wgcf-profile.conf" <<PROFILE
@@ -253,6 +299,25 @@ if find "$SB_DIR" -maxdepth 1 -type d -name '.warp-verify.*' -print -quit | grep
   echo "FAIL: WARP verification temporary directory was not cleaned" >&2
   exit 1
 fi
+
+cat > "$CONF_JSON" <<'JSON'
+{
+  "dns": {"servers": [], "final": "dns-test"},
+  "endpoints": [],
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "socks", "tag": "warp", "server": "127.0.0.1", "server_port": 40000}
+  ]
+}
+JSON
+: > "$test_root/sing-box.calls"
+: > "$test_root/ss.calls"
+: > "$test_root/curl.calls"
+verify_warp_egress
+assert_equal 1 "$(grep -c '^run ' "$test_root/sing-box.calls")" \
+  "verification must accept the official-client SOCKS outbound"
+assert_equal 1 "$(wc -l < "$test_root/curl.calls" | tr -d ' ')" \
+  "official-client verification must prove WARP egress"
 rm -f -- "$BIN_PATH" "$SBP_BIN_DIR/ss" "$SBP_BIN_DIR/curl"
 
 # Repair backups must restore account and profile credentials byte-for-byte.
