@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（直连 10 + WARP 就绪时额外 10）
-#  Version: v3.3.1
+#  Version: v3.4.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -333,7 +333,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.3.1"
+SCRIPT_VERSION="v3.4.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -2865,15 +2865,16 @@ EOF
 }
 
 # ===== systemd =====
-write_systemd(){
+write_singbox_unit(){
   local warp_unit_after="network-online.target" warp_unit_wants=""
-  load_env || true
+  local unit_path="${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" unit_tmp
   if warp_proxy_config_ready; then
     warp_unit_after+=" warp-svc.service"
     warp_unit_wants="Wants=warp-svc.service"
   fi
-  write_runtime_helpers
-  cat > "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" <<EOF
+  mkdir -p "$SYSTEMD_UNIT_DIR" || return 1
+  unit_tmp="$(mktemp "${unit_path}.tmp.XXXXXX")" || return 1
+  if ! cat > "$unit_tmp" <<EOF
 [Unit]
 Description=Sing-Box-Plus
 After=${warp_unit_after}
@@ -2897,7 +2898,21 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
+  then
+    rm -f -- "$unit_tmp"
+    return 1
+  fi
+  if ! chmod 0644 "$unit_tmp" || ! mv -f -- "$unit_tmp" "$unit_path"; then
+    rm -f -- "$unit_tmp"
+    return 1
+  fi
+}
+
+write_systemd(){
+  load_env || true
+  write_runtime_helpers || return 1
+  write_singbox_unit || return 1
+  systemctl daemon-reload || return 1
   systemctl enable "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
   systemctl enable --now "${DNS_HEALTH_TIMER}" >/dev/null 2>&1 || true
 }
@@ -4768,6 +4783,7 @@ backup_warp_repair(){
   local backup_dir="$1"
   backup_runtime_file "$SB_DIR/env.conf" env.conf "$backup_dir" || return 1
   backup_runtime_file "$CONF_JSON" config.json "$backup_dir" || return 1
+  backup_runtime_file "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" sing-box.service "$backup_dir" || return 1
   backup_runtime_file "$ROUTE_JSON" routes.json "$backup_dir" || return 1
   backup_runtime_file "$SB_DIR/warp.env" warp.env "$backup_dir" || return 1
   backup_runtime_file "$SB_DIR/creds.env" creds.env "$backup_dir" || return 1
@@ -4783,6 +4799,7 @@ restore_warp_repair(){
   local backup_dir="$1" restore_failed=0
   restore_runtime_file "$backup_dir" env.conf "$SB_DIR/env.conf" || restore_failed=1
   restore_runtime_file "$backup_dir" config.json "$CONF_JSON" || restore_failed=1
+  restore_runtime_file "$backup_dir" sing-box.service "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" || restore_failed=1
   restore_runtime_file "$backup_dir" routes.json "$ROUTE_JSON" || restore_failed=1
   restore_runtime_file "$backup_dir" warp.env "$SB_DIR/warp.env" || restore_failed=1
   restore_runtime_file "$backup_dir" creds.env "$SB_DIR/creds.env" || restore_failed=1
@@ -4902,6 +4919,8 @@ verify_warp_egress(){
 }
 
 repair_warp(){
+  local profile_to_import="${1:-}"
+  local previous_warp_ready=false previous_proxy_backend=false
   [[ "$EUID" -eq 0 || "${SBP_SKIP_ROOT:-0}" -eq 1 || -n "${TEST_ROOT:-}" ]] \
     || die "WARP 修复需要 root 权限，请使用 sudo 运行"
   ensure_installed_or_hint || return 1
@@ -4910,9 +4929,28 @@ repair_warp(){
   load_ports || true
   ensure_dirs
 
+  if [[ -n "$profile_to_import" ]]; then
+    if warp_proxy_config_ready; then
+      previous_proxy_backend=true
+    fi
+    if warp_backend_config_ready; then
+      previous_warp_ready=true
+    fi
+    if [[ ! -f "$profile_to_import" || ! -r "$profile_to_import" ]]; then
+      warn "WARP WireGuard profile 不存在或不可读"
+      return 1
+    fi
+    ENABLE_WARP=true
+    if ! parse_warp_profile "$profile_to_import"; then
+      warn "WARP WireGuard profile 无效，未改动运行配置"
+      return 1
+    fi
+  fi
+
   local backup_root="$SB_DIR/backups" backup_dir timestamp old_umask route_check
   local route_changed=false
-  local service_active=false restart_attempted=false failure="" restore_failed=false
+  local service_active=false restart_attempted=false unit_changed=false
+  local failure="" restore_failed=false
   if command -v flock >/dev/null 2>&1; then
     exec 7>"$SB_DIR/.warp-repair.lock"
     flock -n 7 || { warn "另一个 WARP 修复正在进行，请稍后重试"; return 1; }
@@ -4958,13 +4996,25 @@ repair_warp(){
   fi
 
   ENABLE_WARP=true
-  if ! ensure_warp_backend; then
-    [[ -z "$route_check" ]] || rm -f -- "$route_check"
-    umask "$old_umask"
-    warn "WARP 账号仍不可用；sing-box 配置和服务均未改动。"
-    return 1
+  if [[ -n "$profile_to_import" ]]; then
+    if ! save_private_file "$profile_to_import" "$WGCF_DIR/wgcf-profile.conf" \
+        || ! save_warp; then
+      failure="保存导入的 WARP WireGuard profile 失败"
+    else
+      WARP_BACKEND=wireguard
+    fi
   fi
-  if [[ "$route_changed" == true ]]; then
+  if [[ -z "$failure" ]] && ! ensure_warp_backend; then
+    if [[ -n "$profile_to_import" ]]; then
+      failure="导入的 WARP WireGuard profile 未能启用"
+    else
+      [[ -z "$route_check" ]] || rm -f -- "$route_check"
+      umask "$old_umask"
+      warn "WARP 账号仍不可用；sing-box 配置和服务均未改动。"
+      return 1
+    fi
+  fi
+  if [[ -z "$failure" && "$route_changed" == true ]]; then
     if ! chmod 600 "$route_check" || ! mv -f -- "$route_check" "$ROUTE_JSON"; then
       failure="保存规范化分流配置失败"
     else
@@ -4985,6 +5035,15 @@ repair_warp(){
     failure="WARP 出口连通性验证失败（Cloudflare trace 未返回 warp=on/plus）"
   fi
 
+  if [[ -z "$failure" && -n "$profile_to_import" ]]; then
+    if ! write_singbox_unit; then
+      failure="更新 sing-box 服务依赖失败"
+    else
+      unit_changed=true
+      systemctl daemon-reload || failure="重新加载 sing-box 服务依赖失败"
+    fi
+  fi
+
   if [[ -z "$failure" ]] && command -v systemctl >/dev/null 2>&1 \
       && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
     service_active=true
@@ -4999,6 +5058,9 @@ repair_warp(){
     restore_warp_repair "$backup_dir" || restore_failed=true
     load_env || true
     load_warp 2>/dev/null || true
+    if [[ "$unit_changed" == true ]]; then
+      systemctl daemon-reload || restore_failed=true
+    fi
     if [[ "$restart_attempted" == true ]]; then
       restart_service_stably "$SYSTEMD_SERVICE" >/dev/null 2>&1 || restore_failed=true
     fi
@@ -5011,8 +5073,19 @@ repair_warp(){
     return 1
   fi
 
-  open_firewall || warn "WARP 已启用，但防火墙规则更新失败，请手动检查端口"
-  print_links_grouped || warn "WARP 已启用，但导入链接文件更新失败"
+  if [[ -z "$profile_to_import" || "$previous_warp_ready" != true ]]; then
+    open_firewall || warn "WARP 已启用，但防火墙规则更新失败，请手动检查端口"
+    print_links_grouped || warn "WARP 已启用，但导入链接文件更新失败"
+  fi
+  if [[ "$previous_proxy_backend" == true && "$service_active" == true \
+        && -f "$WARP_CLI_MANAGED_MARKER" ]]; then
+    # The script owns this daemon; release its memory only after native WARP is live.
+    if systemctl disable --now warp-svc.service >/dev/null 2>&1; then
+      info "已停止并禁用脚本安装的 warp-svc；官方客户端配置保留以便回退。"
+    else
+      warn "原 WARP 出口已切到 WireGuard，但无法停止 warp-svc；请检查服务状态。"
+    fi
+  fi
   umask "$old_umask"
   if [[ "$service_active" == true ]]; then
     info "WARP 已启用并完成 sing-box 重启"
@@ -5296,6 +5369,8 @@ usage(){
   sudo bash sbp.sh --reissue-cert
                                  重新签发自签证书使其匹配当前 Reality SNI（会重启 sing-box）
   sudo bash sbp.sh --repair-warp  获取或修复 WARP 配置（成功后会重启 sing-box）
+  sudo bash sbp.sh --migrate-warp-profile /root/wgcf-profile.conf
+                                 导入 WireGuard profile，验证并切换低内存 WARP 出口
   sudo bash sbp.sh --uninstall   彻底卸载 Sing-Box-Plus
   bash sbp.sh --help             显示本帮助
 
@@ -5377,6 +5452,13 @@ main(){
     --update-script) update_script_from_remote ;;
     --reissue-cert) reissue_managed_certificate ;;
     --repair-warp) repair_warp ;;
+    --migrate-warp-profile)
+      if [[ $# -ne 2 ]]; then
+        usage >&2
+        return 1
+      fi
+      repair_warp "$2"
+      ;;
     --uninstall) uninstall_all ;;
     -h|--help) usage ;;
     *)

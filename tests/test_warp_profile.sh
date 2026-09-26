@@ -29,9 +29,10 @@ export BIN_PATH="$test_root/bin/sing-box"
 export WGCF_BIN="$test_root/bin/wgcf"
 export SBP_SCRIPT_PATH="$test_root/root/sbp.sh"
 export SYSTEMD_SERVICE="test-sing-box.service"
+export SYSTEMD_UNIT_DIR="$test_root/systemd"
 export SBP_SERVICE_STABILITY_CHECKS=3 SBP_SERVICE_STABILITY_INTERVAL=0
 
-mkdir -p "$SBP_BIN_DIR" "$SB_DIR" "$CERT_DIR" "$test_root/root"
+mkdir -p "$SBP_BIN_DIR" "$SB_DIR" "$CERT_DIR" "$SYSTEMD_UNIT_DIR" "$test_root/root"
 
 # shellcheck source=../sing-box-plus.sh
 source "$main_script"
@@ -466,6 +467,8 @@ systemctl(){
         touch "$test_root/delayed-restart-armed"
       fi
       ;;
+    daemon-reload) printf '%s\n' daemon-reload >> "$test_root/systemctl.calls" ;;
+    disable) printf '%s\n' "$*" >> "$test_root/systemctl.calls" ;;
     *) return 0 ;;
   esac
 }
@@ -559,5 +562,86 @@ assert_equal 2 "$(wc -l < "$test_root/systemctl.calls" | tr -d ' ')" \
   "delayed failure must restart once for apply and once for rollback"
 assert_equal 0 "$(wc -l < "$test_root/firewall.calls" | tr -d ' ')" \
   "delayed restart failure must not update the firewall"
+
+# An imported native profile must replace the proxy backend before releasing its daemon.
+import_profile="$test_root/import-warp.conf"
+cat > "$import_profile" <<PROFILE
+[Interface]
+PrivateKey = $test_private_key
+Address = 172.16.0.3/32
+[Peer]
+PublicKey = $test_peer_key
+Endpoint = engage.cloudflareclient.com:2408
+PROFILE
+printf '%s\n' '{"outbounds":[{"type":"socks","tag":"warp"}],"marker":"proxy-baseline"}' > "$CONF_JSON"
+ENABLE_WARP=true
+WARP_BACKEND=proxy
+save_env
+write_singbox_unit
+grep -Fq 'Wants=warp-svc.service' "$SYSTEMD_UNIT_DIR/$SYSTEMD_SERVICE"
+: > "$WARP_CLI_MANAGED_MARKER"
+: > "$test_root/systemctl.calls"
+: > "$test_root/firewall.calls"
+: > "$test_root/link.calls"
+repair_warp "$import_profile" > "$test_root/migrate-success.log" 2>&1
+grep -Fqx 'WARP_BACKEND=wireguard' "$SB_DIR/env.conf"
+if grep -Fq 'warp-svc.service' "$SYSTEMD_UNIT_DIR/$SYSTEMD_SERVICE"; then
+  echo "FAIL: native WARP migration must remove the proxy service dependency" >&2
+  exit 1
+fi
+assert_equal '172.16.0.3/32' "$(grep '^WARP_ADDRESS_V4=' "$SB_DIR/warp.env" | cut -d= -f2-)" \
+  "migration must use the imported profile"
+assert_equal 'daemon-reload' "$(sed -n '1p' "$test_root/systemctl.calls")" \
+  "migration must reload the updated unit before restarting"
+assert_equal 'restart' "$(sed -n '2p' "$test_root/systemctl.calls")" \
+  "migration must restart sing-box before releasing warp-svc"
+assert_equal 'disable --now warp-svc.service' "$(sed -n '3p' "$test_root/systemctl.calls")" \
+  "migration must stop the script-managed daemon after a stable restart"
+assert_equal 0 "$(wc -l < "$test_root/firewall.calls" | tr -d ' ')" \
+  "migration from a working proxy must not update the firewall"
+assert_equal 0 "$(wc -l < "$test_root/link.calls" | tr -d ' ')" \
+  "migration from a working proxy must not rewrite share links"
+
+# Re-importing a native profile must use the new key, not reload the old warp.env.
+sed 's/172\.16\.0\.3\/32/172.16.0.4\/32/' "$import_profile" > "$test_root/second-import.conf"
+: > "$test_root/systemctl.calls"
+repair_warp "$test_root/second-import.conf" > "$test_root/migrate-reimport.log" 2>&1
+assert_equal '172.16.0.4/32' "$(grep '^WARP_ADDRESS_V4=' "$SB_DIR/warp.env" | cut -d= -f2-)" \
+  "re-import must use the newly supplied profile"
+assert_equal 2 "$(wc -l < "$test_root/systemctl.calls" | tr -d ' ')" \
+  "re-import must not stop the already unused warp-svc"
+
+# A failed native switch restores the proxy unit, profile, and service state.
+printf '%s\n' '{"outbounds":[{"type":"socks","tag":"warp"}],"marker":"proxy-rollback"}' > "$CONF_JSON"
+WARP_BACKEND=proxy
+save_env
+write_singbox_unit
+profile_hash_before="$(sha256sum "$WGCF_DIR/wgcf-profile.conf" | awk '{print $1}')"
+sed 's/172\.16\.0\.3\/32/172.16.0.5\/32/' "$import_profile" > "$test_root/third-import.conf"
+: > "$test_root/fail-restart-once"
+: > "$test_root/systemctl.calls"
+if repair_warp "$test_root/third-import.conf" > "$test_root/migrate-rollback.log" 2>&1; then
+  echo "FAIL: a failed migration restart must roll back" >&2
+  exit 1
+fi
+grep -Fqx 'WARP_BACKEND=proxy' "$SB_DIR/env.conf"
+grep -Fq 'Wants=warp-svc.service' "$SYSTEMD_UNIT_DIR/$SYSTEMD_SERVICE"
+assert_equal "$profile_hash_before" "$(sha256sum "$WGCF_DIR/wgcf-profile.conf" | awk '{print $1}')" \
+  "failed migration must restore the prior profile"
+assert_equal proxy-rollback "$(jq -r '.marker' "$CONF_JSON")" \
+  "failed migration must restore the prior runtime config"
+if grep -Fq 'disable ' "$test_root/systemctl.calls"; then
+  echo "FAIL: failed migration must leave warp-svc available" >&2
+  exit 1
+fi
+
+printf '%s\n' invalid > "$test_root/invalid-warp.conf"
+: > "$test_root/systemctl.calls"
+if repair_warp "$test_root/invalid-warp.conf" > "$test_root/migrate-invalid.log" 2>&1; then
+  echo "FAIL: invalid imported profile must be rejected" >&2
+  exit 1
+fi
+assert_equal 0 "$(wc -l < "$test_root/systemctl.calls" | tr -d ' ')" \
+  "invalid profile must not touch services"
 
 printf '%s\n' 'All WARP profile regression tests passed.'

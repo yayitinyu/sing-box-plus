@@ -102,7 +102,7 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 
 ```text
 =============================================================
- 🚀 Sing-Box-Plus 管理脚本 v3.3.1 🚀
+ 🚀 Sing-Box-Plus 管理脚本 v3.4.0 🚀
  脚本更新地址: https://github.com/yayitinyu/sing-box-plus
 =============================================================
   服务状态: 运行中 (Active)  |  核心版本: sing-box v1.12.7
@@ -192,6 +192,14 @@ openssl x509 -in /opt/sing-box/cert/fullchain.pem -noout -subject
 ### WARP 节点（10 个，带 `-warp` 后缀）
 
 新安装只有在官方 WARP 注册、本地回环代理和 Cloudflare trace 的 `warp=on/plus` 校验全部通过后，才会启用并输出 WARP 节点。默认由 `warp-cli` 以 `127.0.0.1:40000` 本地代理方式提供 `warp` 出口，不会接管服务器默认路由；升级时若已有完整的 wgcf WireGuard profile，则继续原样使用，`--repair-warp` 会再执行实际出口校验。
+
+从 v3.4.0 起，小内存服务器可改用 sing-box 内建 WireGuard 出口，省去常驻的 `warp-svc`。请使用**未在其他设备上连接**的独立 `wgcf-profile.conf`，以免同一身份互相抢占连接。将文件安全传到服务器并更新至包含该命令的管理脚本后运行：
+
+```bash
+sudo bash /root/sbp.sh --migrate-warp-profile /root/wgcf-profile.conf
+```
+
+命令会备份原配置、校验新 profile 和 WARP 出口、更新 sing-box 服务依赖，并在 sing-box 稳定运行后停止由本脚本安装的 `warp-svc`。失败时恢复原配置和服务依赖；官方客户端及其注册信息会保留，方便回退。`wgcf-account.toml` 不需要上传。未提供独立 profile 时，官方本地代理仍是默认后端。
 
 - 解锁 Netflix、Disney+、ChatGPT 等受地域限制的服务
 - 规避服务器 IP 被目标网站封锁
