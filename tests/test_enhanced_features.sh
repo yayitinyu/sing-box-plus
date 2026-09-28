@@ -102,50 +102,62 @@ chmod 0755 "$BIN_PATH"
 local_v=$(get_singbox_local_version "$BIN_PATH")
 assert_equal "1.11.5" "$local_v" "must correctly extract semver from version output"
 
-# 3. 测试 GeoFiles 模拟更新与落地路径
+# 3. Only configured remote rule sets are checked; the check never restarts sing-box.
 # 模拟 curl
 cat > "$test_root/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 out=""
+url=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
+    http://*|https://*) url="$1"; shift ;;
     *) shift ;;
   esac
 done
 if [[ -n "$out" ]]; then
-  printf 'mock-geo-content\n' > "$out"
+  printf '%s\n' "$url" >> "$TEST_ROOT/ruleset-curl.calls"
+  printf 'mock-srs-content\n' > "$out"
   exit 0
 fi
 printf '{"Status":0}\n'
 EOF
 chmod 0755 "$test_root/bin/curl"
 export PATH="$test_root/bin:$PATH"
+export TEST_ROOT="$test_root"
 
 systemctl(){
   case "${1:-}" in
     show) printf '%s\n' 4242 ;;
+    restart) printf '%s\n' restart >> "$test_root/restarts" ;;
     *) return 0 ;;
   esac
 }
 
-update_geofiles > "$test_root/geofiles.log" 2>&1
-if [[ ! -f "$DATA_DIR/geoip.db" ]]; then
-  echo "FAIL: geoip.db must exist in $DATA_DIR" >&2
+cat > "$ROUTE_JSON" <<'EOF'
+{"rules":[],"rule_set":[{"type":"remote","tag":"test-rule","url":"https://rules.example.invalid/test.srs","format":"binary","update_interval":"1d"}],"outbounds":[],"default_outbound":"direct"}
+EOF
+check_remote_rule_sets > "$test_root/ruleset-check.log" 2>&1
+assert_equal "https://rules.example.invalid/test.srs" "$(cat "$test_root/ruleset-curl.calls")" \
+  "only configured remote rule sets should be checked"
+[[ ! -e "$DATA_DIR/geoip.db" && ! -e "$DATA_DIR/geosite.db" ]] || {
+  echo "FAIL: obsolete GeoIP/GeoSite databases must not be downloaded" >&2
+  exit 1
+}
+[[ ! -e "$test_root/restarts" ]] || {
+  echo "FAIL: rule-set availability check must not restart sing-box" >&2
+  exit 1
+}
+grep -q '远程规则集可访问' "$test_root/ruleset-check.log"
+sed 's#https://rules.example.invalid/test.srs#file:///tmp/test.srs#' "$ROUTE_JSON" > "$ROUTE_JSON.tmp"
+mv "$ROUTE_JSON.tmp" "$ROUTE_JSON"
+if check_remote_rule_sets > "$test_root/ruleset-invalid-url.log" 2>&1; then
+  echo "FAIL: non-HTTP remote rule-set URLs must be rejected" >&2
   exit 1
 fi
-if [[ ! -f "$DATA_DIR/geosite.db" ]]; then
-  echo "FAIL: geosite.db must exist in $DATA_DIR" >&2
-  exit 1
-fi
-if [[ ! -f "$DATA_DIR/geoip-cn.srs" ]]; then
-  echo "FAIL: geoip-cn.srs must exist in $DATA_DIR" >&2
-  exit 1
-fi
-if [[ ! -f "$SB_DIR/geofiles.version" ]]; then
-  echo "FAIL: geofiles.version must exist in $SB_DIR" >&2
-  exit 1
-fi
+grep -q '仅支持 HTTP/HTTPS' "$test_root/ruleset-invalid-url.log"
+sed 's#file:///tmp/test.srs#https://rules.example.invalid/test.srs#' "$ROUTE_JSON" > "$ROUTE_JSON.tmp"
+mv "$ROUTE_JSON.tmp" "$ROUTE_JSON"
 
 # 4. 测试 show_service_status 输出
 status_out=$(show_service_status 2>&1)
@@ -155,6 +167,10 @@ if ! echo "$status_out" | grep -q "Sing-Box-Plus 综合运行状态看板"; then
 fi
 if ! echo "$status_out" | grep -q "10 节点端口监听监控"; then
   echo "FAIL: show_service_status must render only enabled nodes" >&2
+  exit 1
+fi
+if ! echo "$status_out" | grep -q "远程规则集: 1 个"; then
+  echo "FAIL: status must report configured remote rule sets" >&2
   exit 1
 fi
 
@@ -208,6 +224,10 @@ assert_equal "direct" "$(load_route_json | jq -r '.default_outbound')" "default 
 # 导入节点并设为 default_outbound
 jq --argjson ob "$out_socks5" '.outbounds += [$ob] | .default_outbound = "ext-socks"' "$ROUTE_JSON" > "$ROUTE_JSON.tmp" && mv "$ROUTE_JSON.tmp" "$ROUTE_JSON"
 write_config
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) ;; # Git Bash reports NTFS permissions as 644 after chmod.
+  *) assert_equal "600" "$(stat -c %a "$SB_DIR/creds.env")" "credential file must be root-only" ;;
+esac
 assert_equal "ext-socks" "$(jq -r '.route.final' "$CONF_JSON")" "route.final must use configured default_outbound"
 assert_equal "socks" "$(jq -r '.outbounds[] | select(.tag == "ext-socks") | .type' "$CONF_JSON")" "outbounds must contain imported default exit"
 
@@ -277,4 +297,4 @@ if [[ -f "$BIN_PATH" ]]; then
   exit 1
 fi
 
-printf '%s\n' "PASS: enhanced features (version compare, geofiles update, status viewer, socks/http import, default outbound, uninstall) work correctly"
+printf '%s\n' "PASS: enhanced features (version compare, rule-set check, status viewer, socks/http import, default outbound, uninstall) work correctly"

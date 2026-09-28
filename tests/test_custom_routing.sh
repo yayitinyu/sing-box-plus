@@ -40,8 +40,11 @@ ensure_dirs
 mkdir -p "$SBP_BIN_DIR"
 cat > "$BIN_PATH" <<'EOF'
 #!/usr/bin/env bash
-[[ "${1:-}" == "check" ]] || exit 1
-[[ ! -f "$SB_DIR/fail-check" ]]
+case "${1:-}" in
+  version) printf 'sing-box version %s\n' "${MOCK_CORE_VERSION:-1.13.21}" ;;
+  check) [[ ! -f "$SB_DIR/fail-check" ]] ;;
+  *) exit 1 ;;
+esac
 EOF
 chmod 755 "$BIN_PATH"
 
@@ -149,12 +152,18 @@ EOF
 }
 check_with_core(){
   [[ -n "${SBP_TEST_SING_BOX:-}" ]] || return 0
-  # These tests exercise generated routing without starting listeners or requiring TLS fixtures.
-  jq '.inbounds = [] | .endpoints = []' "$CONF_JSON" > "$test_root/core-check.json"
+  # Keep one TLS inbound for compatibility tests; other routing cases need no certificate fixture.
+  if [[ "${1:-}" == tls ]]; then
+    jq '.inbounds = [.inbounds[] | select(.tag == "hy2")] | .endpoints = []' \
+      "$CONF_JSON" > "$test_root/core-check.json"
+  else
+    jq '.inbounds = [] | .endpoints = []' "$CONF_JSON" > "$test_root/core-check.json"
+  fi
   "$SBP_TEST_SING_BOX" check -c "$test_root/core-check.json" > "$test_root/core-check.log" 2>&1 || {
     cat "$test_root/core-check.log" >&2
     fail "generated routes must pass the real sing-box check"
   }
+  printf 'PASS: real sing-box %s config check\n' "$(get_singbox_local_version "$SBP_TEST_SING_BOX")"
 }
 
 test_block(){
@@ -517,13 +526,67 @@ test_menu(){
   grep -q '9).*整理分流规则' "$test_root/menu.log" || fail "routing menu must expose the organization action"
 }
 
+test_config_compatibility(){
+  reset_state
+  assert_json '(has("experimental") | not)' "$CONF_JSON" \
+    'config without remote rule sets should not create a cache file'
+  cat > "$ROUTE_JSON" <<'EOF'
+{
+  "rules": [{"domain_suffix": ["example.com"], "outbound": "direct"}],
+  "rule_set": [{
+    "type": "remote", "tag": "geosite-example", "format": "binary",
+    "url": "https://rules.example.invalid/geosite-example.srs",
+    "download_detour": "direct", "update_interval": "1d"
+  }],
+  "outbounds": [], "default_outbound": "direct"
+}
+EOF
+  TLS_CERT_MODE=acme
+  TLS_DOMAIN=example.com
+  printf 'TLS_CERT_MODE=acme\nTLS_DOMAIN=example.com\n' >> "$SB_DIR/env.conf"
+  export MOCK_CORE_VERSION=1.13.13
+  write_config > "$test_root/config-1.13.log" 2>&1 || fail 'sing-box 1.13 config generation failed'
+  assert_json '(.inbounds[] | select(.tag == "hy2") | .tls.acme.domain) == ["example.com"]' \
+    "$CONF_JSON" 'sing-box 1.13 must retain inline ACME'
+  assert_json '.route.rule_set[0].download_detour == "direct" and (has("certificate_providers") | not)' \
+    "$CONF_JSON" 'sing-box 1.13 must retain legacy rule-set download fields'
+  assert_json '.experimental.cache_file.enabled == true and (.experimental.cache_file.path | endswith("/data/cache.db"))' \
+    "$CONF_JSON" 'remote rule sets must use a persistent sing-box cache'
+  if [[ -n "${SBP_TEST_SING_BOX:-}" ]] && \
+      [[ "$(get_singbox_local_version "$SBP_TEST_SING_BOX")" == "$MOCK_CORE_VERSION" ]]; then
+    check_with_core tls
+  fi
+
+  export MOCK_CORE_VERSION=1.14.2
+  write_config > "$test_root/config-1.14.log" 2>&1 || fail 'sing-box 1.14 config generation failed'
+  assert_json '(.inbounds[] | select(.tag == "hy2") | .tls.certificate_provider) == "sbp-acme"' \
+    "$CONF_JSON" 'sing-box 1.14 must reference the shared ACME provider'
+  assert_json '(.certificate_providers | length) == 1 and
+    .certificate_providers[0].type == "acme" and
+    .certificate_providers[0].tag == "sbp-acme" and
+    .certificate_providers[0].domain == ["example.com"] and
+    .certificate_providers[0].default_server_name == "example.com"' \
+    "$CONF_JSON" 'sing-box 1.14 must define one ACME provider'
+  assert_json '.route.rule_set[0].http_client.detour == "direct" and (.route.rule_set[0] | has("download_detour") | not)' \
+    "$CONF_JSON" 'sing-box 1.14 must migrate rule-set downloads to HTTP clients'
+  assert_json '.experimental.cache_file.enabled == true and (.experimental.cache_file.path | endswith("/data/cache.db"))' \
+    "$CONF_JSON" 'sing-box 1.14 must preserve remote rule-set caching'
+  if [[ -n "${SBP_TEST_SING_BOX:-}" ]] && \
+      [[ "$(get_singbox_local_version "$SBP_TEST_SING_BOX")" == "$MOCK_CORE_VERSION" ]]; then
+    check_with_core tls
+  fi
+  unset MOCK_CORE_VERSION
+  TLS_CERT_MODE=self_signed
+}
+
 case "${1:-all}" in
   block) test_block ;;
   organize) test_organize ;;
   preview) test_organize_preview ;;
   rollback) test_rollback ;;
+  compatibility) test_config_compatibility ;;
   all)
-    for test_name in test_block test_legacy_geosite_normalization test_round_trip test_merge test_organize test_organize_preview test_invalid_imports test_cancel_and_export_protection test_rollback test_import_check_failure test_menu; do
+    for test_name in test_block test_legacy_geosite_normalization test_round_trip test_merge test_organize test_organize_preview test_invalid_imports test_cancel_and_export_protection test_rollback test_import_check_failure test_menu test_config_compatibility; do
       "$test_name"
       printf 'PASS: %s\n' "$test_name"
     done

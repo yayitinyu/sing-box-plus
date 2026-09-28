@@ -1,0 +1,86 @@
+name: Compatibility
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell-and-core:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        core_version: ["1.13.13", "1.14.2"]
+    env:
+      CORE_VERSION: ${{ matrix.core_version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq curl xz-utils unzip openssl
+      - name: Check shell syntax and regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq --version
+          for shell_script in sing-box-plus.sh tests/*.sh; do
+            bash -n "$shell_script"
+          done
+          for test_script in tests/test_*.sh; do
+            bash "$test_script"
+          done
+      - name: Download and verify official sing-box
+        id: core
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${CORE_VERSION}")
+          asset_json=$(jq -cer --arg name "sing-box-${CORE_VERSION}-linux-amd64.tar.gz" \
+            '[.assets[] | select(.name == $name)] | first' <<< "$release_json")
+          asset_url=$(jq -r '.browser_download_url' <<< "$asset_json")
+          asset_digest=$(jq -r '.digest' <<< "$asset_json")
+          [[ "$asset_digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]
+          archive="$RUNNER_TEMP/sing-box.tar.gz"
+          curl -fsSL "$asset_url" -o "$archive"
+          printf '%s  %s\n' "${asset_digest#sha256:}" "$archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/sing-box"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/sing-box"
+          core="$RUNNER_TEMP/sing-box/sing-box-${CORE_VERSION}-linux-amd64/sing-box"
+          [[ -x "$core" ]]
+          "$core" version
+          printf 'path=%s\n' "$core" >> "$GITHUB_OUTPUT"
+      - name: Validate generated config with real core
+        shell: bash
+        env:
+          SBP_TEST_SING_BOX: ${{ steps.core.outputs.path }}
+        run: bash tests/test_custom_routing.sh compatibility
+
+  wgcf-release:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install release check dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+      - name: Verify current official wgcf binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/ViRb3/wgcf/releases/latest)
+          version=$(jq -er '.tag_name | ltrimstr("v")' <<< "$release_json")
+          asset_json=$(jq -cer --arg name "wgcf_${version}_linux_amd64" \
+            '[.assets[] | select(.name == $name)] | first' <<< "$release_json")
+          asset_url=$(jq -r '.browser_download_url' <<< "$asset_json")
+          asset_digest=$(jq -r '.digest' <<< "$asset_json")
+          [[ "$asset_digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]
+          binary="$RUNNER_TEMP/wgcf"
+          curl -fsSL "$asset_url" -o "$binary"
+          printf '%s  %s\n' "${asset_digest#sha256:}" "$binary" | sha256sum -c -
+          chmod +x "$binary"
+          (cd "$RUNNER_TEMP" && "$binary" --help >/dev/null)

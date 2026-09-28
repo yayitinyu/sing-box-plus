@@ -37,6 +37,10 @@ mkdir -p "$SBP_BIN_DIR" "$SB_DIR" "$CERT_DIR" "$SYSTEMD_UNIT_DIR" "$test_root/ro
 # shellcheck source=../sing-box-plus.sh
 source "$main_script"
 
+# Profile tests use a dedicated wgcf mock; binary installation and upgrades are
+# covered separately by test_wgcf_install.sh.
+install_wgcf(){ [[ -x "$WGCF_BIN" ]]; }
+
 assert_equal(){
   local expected="$1" actual="$2" message="$3"
   if [[ "$expected" != "$actual" ]]; then

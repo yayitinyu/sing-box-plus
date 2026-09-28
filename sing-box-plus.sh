@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（直连 10 + WARP 就绪时额外 10）
-#  Version: v3.4.0
+#  Version: v3.5.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -24,7 +24,7 @@ export PATH="$SBP_BIN_DIR:$PATH"
 dl() { # 用法：dl <URL> <OUT_PATH>
   local url="$1" out="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 2 --connect-timeout 5 -o "$out" "$url"
+    curl -fsSL --retry 2 --connect-timeout 5 -m 60 -o "$out" "$url"
   elif command -v wget >/dev/null 2>&1; then
     timeout 15 wget -qO "$out" --tries=2 "$url"
   else
@@ -172,42 +172,10 @@ sbp_install_prereqs_pm() {
   return 0
 }
 
-# —— 二进制模式：直接获取 sing-box 可执行文件 —— #
+# 二进制回退和常规安装共用同一套校验、替换及服务回滚流程。
 install_singbox_binary() {
-  local arch goarch pkg tmp json url fn
-  goarch="$(detect_goarch)"
-  tmp="$(mktemp -d)" || return 1
-
-  ensure_jq_static || { echo "[ERROR] 无法获取 jq，二进制模式失败"; rm -rf "$tmp"; return 1; }
-
-  json="$(with_retry 3 curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest)" || { rm -rf "$tmp"; return 1; }
-  url="$(printf '%s' "$json" | jq -r --arg a "$goarch" '
-    .assets[] | select(.name|test("linux-" + $a + "\\.(tar\\.(xz|gz)|zip)$")) | .browser_download_url
-  ' | head -n1)"
-
-  if [ -z "$url" ] || [ "$url" = "null" ]; then
-    echo "[ERROR] 未找到匹配架构($goarch)的 sing-box 资产"; rm -rf "$tmp"; return 1
-  fi
-
-  pkg="$tmp/pkg"
-  with_retry 3 dl "$url" "$pkg" || { rm -rf "$tmp"; return 1; }
-
-  case "$url" in
-    *.tar.xz)  if command -v xz >/dev/null 2>&1; then tar -xJf "$pkg" -C "$tmp"; else echo "[ERROR] 缺少 xz；请安装 xz/xz-utils 或换 .tar.gz/.zip"; rm -rf "$tmp"; return 1; fi ;;
-    *.tar.gz)  tar -xzf "$pkg" -C "$tmp" ;;
-    *.zip)     unzip -q "$pkg" -d "$tmp" || { echo "[ERROR] 缺少 unzip"; rm -rf "$tmp"; return 1; } ;;
-    *)         echo "[ERROR] 未知包格式：$url"; rm -rf "$tmp"; return 1 ;;
-  esac
-
-  fn="$(find "$tmp" -type f -name 'sing-box' | head -n1)"
-  [ -n "$fn" ] || { echo "[ERROR] 包内未找到 sing-box"; rm -rf "$tmp"; return 1; }
-
-  local target="${BIN_PATH:-/usr/local/bin/sing-box}"
-  mkdir -p "$(dirname "$target")" "$SBP_BIN_DIR" 2>/dev/null || true
-  install -m 0755 "$fn" "$target" || { rm -rf "$tmp"; return 1; }
-  ln -sf "$target" "$SBP_BIN_DIR/sing-box" 2>/dev/null || true
-  rm -rf "$tmp"
-  echo "[OK] 已安装 sing-box 到 $target"
+  ensure_jq_static || { echo "[ERROR] 无法获取 jq，二进制模式失败"; return 1; }
+  install_singbox 1
 }
 
 # 证书兜底（有 openssl 就生成；没有就先跳过，由业务决定是否强制）
@@ -333,7 +301,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.4.0"
+SCRIPT_VERSION="v3.5.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -709,7 +677,10 @@ EOF
 }
 load_env(){ safe_source_env "$SB_DIR/env.conf" || true; }
 
-save_creds(){ cat > "$SB_DIR/creds.env" <<EOF
+save_creds(){
+  local tmp
+  tmp="$(mktemp "$SB_DIR/.creds.env.XXXXXX")" || return 1
+  if ! cat > "$tmp" <<EOF
 UUID=$UUID
 HY2_PWD=$HY2_PWD
 REALITY_PRIV=$REALITY_PRIV
@@ -723,6 +694,14 @@ TUIC_UUID=$TUIC_UUID
 TUIC_PWD=$TUIC_PWD
 ANYTLS_PWD=$ANYTLS_PWD
 EOF
+  then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$SB_DIR/creds.env"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
 }
 load_creds(){ safe_source_env "$SB_DIR/creds.env" || return 1; }
 
@@ -1948,20 +1927,88 @@ ensure_warp_proxy(){
 
 # ===== WARP（wgcf WireGuard，兼容已有 profile） =====
 WGCF_BIN=${WGCF_BIN:-/usr/local/bin/wgcf}
-install_wgcf(){
-  [[ -x "$WGCF_BIN" ]] && return 0
-  local GOA url tmp
+install_wgcf() (
+  local goarch release_json asset_fields release_tag asset_name url digest expected_hash current_hash
+  local tmp="" staged_bin="" backup_bin=""
+  ensure_deps curl jq || return 1
+  command -v sha256sum >/dev/null 2>&1 || ensure_deps coreutils || return 1
   case "$(arch_map)" in
-    amd64) GOA=amd64;; arm64) GOA=arm64;; armv7) GOA=armv7;; 386) GOA=386;; *) GOA=amd64;;
+    amd64|arm64|armv7|386) goarch="$(arch_map)" ;;
+    *) warn "wgcf 不支持当前架构"; return 1 ;;
   esac
-  url=$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest \
-        | jq -r ".assets[] | select(.name|test(\"linux_${GOA}$\")) | .browser_download_url" | head -n1)
-  [[ -n "$url" ]] || { warn "获取 wgcf 下载地址失败"; return 1; }
-  tmp=$(mktemp -d)
-  curl -fsSL "$url" -o "$tmp/wgcf"
-  install -m0755 "$tmp/wgcf" "$WGCF_BIN"
-  rm -rf "$tmp"
-}
+  if ! release_json="$(curl -fsSL --connect-timeout 5 -m 15 \
+      https://api.github.com/repos/ViRb3/wgcf/releases/latest)"; then
+    warn "获取 wgcf Release 失败，已保留当前二进制"
+    return 1
+  fi
+  if ! asset_fields="$(printf '%s' "$release_json" | jq -er --arg arch "$goarch" '
+    . as $release
+    | ([.assets[] | select(.name == ("wgcf_" + ($release.tag_name | ltrimstr("v")) + "_linux_" + $arch))] | first) as $asset
+    | select($asset != null)
+    | [$release.tag_name, $asset.name, $asset.browser_download_url, $asset.digest] | @tsv
+  ')"; then
+    warn "wgcf Release 中没有当前架构的发行包"
+    return 1
+  fi
+  IFS=$'\t' read -r release_tag asset_name url digest <<< "$asset_fields"
+  if [[ -z "$url" || ! "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+    warn "wgcf Release SHA-256 元数据无效"
+    return 1
+  fi
+  expected_hash="${digest#sha256:}"
+  if [[ -x "$WGCF_BIN" ]]; then
+    current_hash="$(sha256sum "$WGCF_BIN" | awk '{print $1}')" || return 1
+    if [[ "${current_hash,,}" == "${expected_hash,,}" ]]; then
+      info "wgcf 已是当前 Release：${release_tag}"
+      return 0
+    fi
+  fi
+
+  tmp="$(mktemp -d)" || return 1
+  trap '[[ -z "$tmp" ]] || rm -rf -- "$tmp"; [[ -z "$staged_bin" ]] || rm -f -- "$staged_bin"' EXIT
+  if ! curl -fsSL --connect-timeout 10 -m 60 "$url" -o "$tmp/wgcf"; then
+    warn "下载 wgcf 失败，已保留当前二进制"
+    return 1
+  fi
+  current_hash="$(sha256sum "$tmp/wgcf" | awk '{print $1}')" || return 1
+  if [[ "${current_hash,,}" != "${expected_hash,,}" ]]; then
+    warn "wgcf 下载文件 SHA-256 不匹配，已保留当前二进制"
+    return 1
+  fi
+  chmod 0755 "$tmp/wgcf" || return 1
+  if ! (cd "$tmp" && "$tmp/wgcf" --help >/dev/null 2>&1); then
+    warn "下载的 wgcf 无法正常执行，已保留当前二进制"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$WGCF_BIN")" || return 1
+  staged_bin="$(mktemp "${WGCF_BIN}.new.XXXXXX")" || return 1
+  install -m 0755 "$tmp/wgcf" "$staged_bin" || return 1
+  if [[ -f "$WGCF_BIN" ]]; then
+    backup_bin="$(mktemp "${WGCF_BIN}.previous.XXXXXX")" || return 1
+    if ! cp -p -- "$WGCF_BIN" "$backup_bin"; then
+      rm -f -- "$backup_bin"
+      return 1
+    fi
+  fi
+  if ! mv -f -- "$staged_bin" "$WGCF_BIN"; then
+    [[ -z "$backup_bin" ]] || rm -f -- "$backup_bin"
+    warn "替换 wgcf 失败，已保留当前二进制"
+    return 1
+  fi
+  staged_bin=""
+  if ! (cd "$tmp" && "$WGCF_BIN" --help >/dev/null 2>&1); then
+    if [[ -n "$backup_bin" ]]; then
+      mv -f -- "$backup_bin" "$WGCF_BIN" || warn "wgcf 回滚失败，备份保留在 $backup_bin"
+    else
+      rm -f -- "$WGCF_BIN" || true
+    fi
+    warn "新 wgcf 执行失败，已尝试恢复原二进制"
+    return 1
+  fi
+  [[ -z "$backup_bin" ]] || rm -f -- "$backup_bin"
+  info "wgcf 已更新至 ${release_tag}"
+)
 
 # —— Base64 清理 + 补齐：去掉引号/空白，长度 %4==2 补“==”，%4==3 补“=” ——
 pad_b64(){
@@ -2265,8 +2312,12 @@ get_singbox_remote_version() {
   fi
 
   # 1. 优先通过 GitHub Releases API 获取
-  local json
-  json="$(curl -fsSL --connect-timeout 5 -m 10 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null || true)"
+  local json=""
+  if command -v curl >/dev/null 2>&1; then
+    json="$(curl -fsSL --connect-timeout 5 -m 10 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    json="$(wget -qO- --timeout=10 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null || true)"
+  fi
   if [[ -n "$json" ]] && command -v jq >/dev/null 2>&1; then
     ver="$(printf '%s' "$json" | jq -r '.tag_name // empty' 2>/dev/null || true)"
   fi
@@ -2338,12 +2389,16 @@ install_deps(){
 }
 
 # ===== 安装 / 智能升级 sing-box =====
-install_singbox() {
+install_singbox() (
   local force="${1:-0}"
   local local_ver="" remote_ver="" needs_install=1
 
   # 基础依赖
-  ensure_deps curl jq tar || return 1
+  ensure_deps jq tar || return 1
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    ensure_deps curl || return 1
+  fi
+  command -v sha256sum >/dev/null 2>&1 || ensure_deps coreutils || return 1
   command -v xz >/dev/null 2>&1 || ensure_deps xz-utils >/dev/null 2>&1 || true
   command -v unzip >/dev/null 2>&1 || ensure_deps unzip >/dev/null 2>&1 || true
 
@@ -2382,35 +2437,46 @@ install_singbox() {
     return 0
   fi
 
-  local repo="SagerNet/sing-box"
-  local tag="${SINGBOX_TAG:-latest}"
-  local arch; arch="$(arch_map)"
-  local rel_url re url tmp pkg bin
-
+  local repo="SagerNet/sing-box" tag="${SINGBOX_TAG:-latest}"
+  local arch rel_url re release_json asset_fields release_tag asset_name url digest expected_hash actual_hash
+  local tmp="" pkg bin candidate_ver staged_bin="" backup_bin="" service_active=false
+  arch="$(arch_map)"
   info "下载 sing-box (${arch}) ..."
   if [[ "$tag" == "latest" ]]; then
     rel_url="https://api.github.com/repos/${repo}/releases/latest"
   else
     rel_url="https://api.github.com/repos/${repo}/releases/tags/${tag}"
   fi
-
+  if command -v curl >/dev/null 2>&1; then
+    release_json="$(curl -fsSL --connect-timeout 5 -m 15 "$rel_url")" || release_json=""
+  else
+    release_json="$(wget -qO- --timeout=15 "$rel_url")" || release_json=""
+  fi
+  if [[ -z "$release_json" ]]; then
+    warn "无法获取 sing-box Release 元数据，未替换当前核心"
+    return 1
+  fi
   re="^sing-box-.*-linux-${arch}\\.(tar\\.(gz|xz)|zip)$"
-  url="$(curl -fsSL --connect-timeout 5 -m 15 "$rel_url" 2>/dev/null | jq -r --arg re "$re" '.assets[] | select(.name | test($re)) | .browser_download_url' 2>/dev/null | head -n1 || true)"
-  if [[ -z "$url" || "$url" == "null" ]]; then
-    url="$(curl -fsSL --connect-timeout 5 -m 15 "https://api.github.com/repos/${repo}/releases" 2>/dev/null \
-           | jq -r --arg re "$re" '[ .[] | .assets[] | select(.name | test($re)) | .browser_download_url ][0]' 2>/dev/null || true)"
+  if ! asset_fields="$(printf '%s' "$release_json" | jq -er --arg re "$re" '
+    . as $release
+    | ([.assets[] | select(.name | test($re))] | first) as $asset
+    | select($asset != null)
+    | [$release.tag_name, $asset.name, $asset.browser_download_url, $asset.digest] | @tsv
+  ')"; then
+    warn "Release 中没有适用的 sing-box 发行包（arch=${arch} tag=${tag}）"
+    return 1
   fi
-  if [[ -z "$url" || "$url" == "null" ]]; then
-    if [[ -n "$remote_ver" ]]; then
-      url="https://github.com/${repo}/releases/download/v${remote_ver}/sing-box-${remote_ver}-linux-${arch}.tar.gz"
-    else
-      die "下载 sing-box 失败：未匹配到发行包（arch=${arch} tag=${tag})"
-      return 1
-    fi
+  IFS=$'\t' read -r release_tag asset_name url digest <<< "$asset_fields"
+  candidate_ver="${release_tag#v}"
+  if [[ -z "$url" || ! "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]] \
+      || [[ -n "$remote_ver" && "$candidate_ver" != "$remote_ver" ]]; then
+    warn "sing-box Release 版本或 SHA-256 元数据无效，未替换当前核心"
+    return 1
   fi
-
+  expected_hash="${digest#sha256:}"
   tmp="$(mktemp -d)" || return 1
-  pkg="${tmp}/pkg"
+  trap '[[ -z "$tmp" ]] || rm -rf -- "$tmp"; [[ -z "$staged_bin" ]] || rm -f -- "$staged_bin"' EXIT
+  pkg="${tmp}/${asset_name}"
 
   # 多节点/镜像加速下载
   local dl_ok=0
@@ -2418,183 +2484,114 @@ install_singbox() {
   [[ "$url" == https://github.com/* ]] && urls_to_try+=("https://ghproxy.net/$url" "https://raw.gitmirror.com/$url")
 
   for try_url in "${urls_to_try[@]}"; do
-    if curl -fL --connect-timeout 10 -m 60 "$try_url" -o "$pkg" 2>/dev/null; then
+    if dl "$try_url" "$pkg" 2>/dev/null; then
       dl_ok=1
       break
     fi
   done
 
   if [[ "$dl_ok" -ne 1 ]]; then
-    rm -rf "$tmp"
-    die "下载 sing-box 失败：$url"
+    warn "下载 sing-box 失败：$url"
+    return 1
+  fi
+  actual_hash="$(sha256sum "$pkg" | awk '{print $1}')" || return 1
+  if [[ "${actual_hash,,}" != "${expected_hash,,}" ]]; then
+    warn "sing-box 下载文件 SHA-256 不匹配，未替换当前核心"
     return 1
   fi
 
-  # 解压
-  if echo "$url" | grep -qE '\.tar\.gz$|\.tgz$'; then
-    tar -xzf "$pkg" -C "$tmp"
-  elif echo "$url" | grep -qE '\.tar\.xz$'; then
-    tar -xJf "$pkg" -C "$tmp"
-  elif echo "$url" | grep -qE '\.zip$'; then
-    unzip -q "$pkg" -d "$tmp"
+  if [[ "$asset_name" == *.tar.gz ]]; then
+    tar -xzf "$pkg" -C "$tmp" || return 1
+  elif [[ "$asset_name" == *.tar.xz ]]; then
+    tar -xJf "$pkg" -C "$tmp" || return 1
+  elif [[ "$asset_name" == *.zip ]]; then
+    unzip -q "$pkg" -d "$tmp" || return 1
   else
-    rm -rf "$tmp"
-    die "未知包格式：$url"
+    warn "未知 sing-box 发行包格式：$asset_name"
     return 1
   fi
 
   bin="$(find "$tmp" -type f -name 'sing-box' | head -n1)"
   if [[ -z "$bin" || ! -f "$bin" ]]; then
-    rm -rf "$tmp"
-    die "解压失败：未在安装包中找到 sing-box 可执行文件"
+    warn "解压失败：未在安装包中找到 sing-box 可执行文件"
     return 1
   fi
 
-  chmod 0755 "$bin"
-  if ! "$bin" version >/dev/null 2>&1; then
-    rm -rf "$tmp"
-    die "下载的 sing-box 无法正常执行，请检查系统架构兼容性"
+  chmod 0755 "$bin" || return 1
+  if [[ "$(get_singbox_local_version "$bin" || true)" != "$candidate_ver" ]]; then
+    warn "下载的 sing-box 版本与 Release 不符，未替换当前核心"
+    return 1
+  fi
+  if [[ -s "$CONF_JSON" ]] && ! "$bin" check -c "$CONF_JSON" -D "$DATA_DIR"; then
+    warn "新核心无法加载当前配置，未替换当前核心"
     return 1
   fi
 
-  mkdir -p "$(dirname "$BIN_PATH")" "$SBP_BIN_DIR" 2>/dev/null || true
+  mkdir -p "$(dirname "$BIN_PATH")" "$SBP_BIN_DIR" || return 1
+  staged_bin="$(mktemp "${BIN_PATH}.new.XXXXXX")" || return 1
+  install -m 0755 "$bin" "$staged_bin" || return 1
   if [[ -f "$BIN_PATH" ]]; then
-    cp -f "$BIN_PATH" "${BIN_PATH}.bak" 2>/dev/null || true
-  fi
-
-  if install -m 0755 "$bin" "$BIN_PATH"; then
-    ln -sf "$BIN_PATH" "$SBP_BIN_DIR/sing-box" 2>/dev/null || true
-    rm -f "${BIN_PATH}.bak" 2>/dev/null || true
-    rm -rf "$tmp"
-    local new_installed_ver
-    new_installed_ver="$(get_singbox_local_version "$BIN_PATH" || echo "最新")"
-    info "sing-box 安装/升级完成：v${new_installed_ver}"
-    return 0
-  else
-    [[ -f "${BIN_PATH}.bak" ]] && mv -f "${BIN_PATH}.bak" "$BIN_PATH" 2>/dev/null || true
-    rm -rf "$tmp"
-    die "写入 sing-box 二进制到 $BIN_PATH 失败"
-    return 1
-  fi
-}
-
-# ===== GeoFiles 规则文件更新模块 =====
-update_geofiles() {
-  ensure_dirs
-  ensure_deps curl jq || return 1
-
-  info "正在准备更新 GeoFiles (GeoIP / GeoSite / 规则集)..."
-
-  local tmp_geo
-  tmp_geo="$(mktemp -d)" || return 1
-
-  fetch_geofile() {
-    local filename="$1"
-    shift
-    local target="$tmp_geo/$filename"
-    local success=0
-
-    for u in "$@"; do
-      echo -ne "  [下载] $filename <- $u ... "
-      if curl -fsSL --connect-timeout 10 -m 60 -o "$target" "$u" 2>/dev/null && [[ -s "$target" ]]; then
-        local sz
-        sz="$(wc -c < "$target" 2>/dev/null | awk '{printf "%.2f MB", $1/1048576}')"
-        echo -e "${C_GREEN}成功 (${sz})${C_RESET}"
-        success=1
-        break
-      else
-        echo -e "${C_YELLOW}失败，尝试备用节点${C_RESET}"
-      fi
-    done
-
-    if [[ "$success" -eq 1 ]]; then
-      return 0
-    else
-      warn "未能下载 $filename，将跳过该文件"
+    backup_bin="$(mktemp "${BIN_PATH}.previous.XXXXXX")" || return 1
+    if ! cp -p -- "$BIN_PATH" "$backup_bin"; then
+      rm -f -- "$backup_bin"
       return 1
     fi
-  }
-
-  echo -e "${C_CYAN}--- 开始下载最新 GeoIP / GeoSite 规则文件 ---${C_RESET}"
-
-  # 1. geoip.db
-  fetch_geofile "geoip.db" \
-    "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db" \
-    "https://ghproxy.net/https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db" \
-    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.db" \
-    "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.db" || true
-
-  # 2. geosite.db
-  fetch_geofile "geosite.db" \
-    "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db" \
-    "https://ghproxy.net/https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db" \
-    "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.db" \
-    "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.db" || true
-
-  # 3. 常用 SRS 规则集
-  fetch_geofile "geoip-cn.srs" \
-    "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs" \
-    "https://ghproxy.net/https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs" \
-    "https://raw.gitmirror.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs" || true
-
-  fetch_geofile "geosite-cn.srs" \
-    "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs" \
-    "https://ghproxy.net/https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs" \
-    "https://raw.gitmirror.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs" || true
-
-  fetch_geofile "geosite-geolocation-!cn.srs" \
-    "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs" \
-    "https://ghproxy.net/https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs" \
-    "https://raw.gitmirror.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs" || true
-
-  # 4. 自定义路由中定义的 remote rule-sets
-  if [[ -s "$ROUTE_JSON" ]] && command -v jq >/dev/null 2>&1; then
-    local custom_tags=() custom_urls=()
-    while IFS=$'\t' read -r tag url; do
-      [[ -n "$tag" && -n "$url" ]] || continue
-      custom_tags+=("$tag")
-      custom_urls+=("$url")
-    done < <(jq -r '(.rule_set // [])[] | select(.type=="remote" and .tag != null and .url != null) | [.tag, .url] | @tsv' "$ROUTE_JSON" 2>/dev/null || true)
-
-    for ((i=0; i<${#custom_tags[@]}; i++)); do
-      local tag="${custom_tags[i]}"
-      local url="${custom_urls[i]}"
-      fetch_geofile "${tag}.srs" "$url" "https://ghproxy.net/$url" "https://raw.gitmirror.com/${url#*raw.githubusercontent.com/}" || true
-    done
   fi
-
-  local target_dirs=("$DATA_DIR" "$SB_DIR")
-  [[ -d "/var/lib/sing-box" ]] && target_dirs+=("/var/lib/sing-box")
-
-  local installed_files=0
-  for f in "$tmp_geo"/*; do
-    [[ -f "$f" ]] || continue
-    local fname; fname="$(basename "$f")"
-    for tdir in "${target_dirs[@]}"; do
-      mkdir -p "$tdir" 2>/dev/null || true
-      cp -f "$f" "$tdir/$fname" 2>/dev/null || true
-    done
-    ((installed_files++)) || true
-  done
-
-  rm -rf "$tmp_geo"
-
-  if [[ "$installed_files" -gt 0 ]]; then
-    local update_time
-    update_time="$(date '+%Y-%m-%d %H:%M:%S %z')"
-    printf 'LAST_UPDATE="%s"\nFILES_COUNT=%d\n' "$update_time" "$installed_files" > "$SB_DIR/geofiles.version"
-    info "GeoFiles 规则文件更新完成！共更新 ${installed_files} 个规则文件 (时间: ${update_time})"
-
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
-      info "正在重启 sing-box 服务以应用最新规则..."
-      systemctl restart "${SYSTEMD_SERVICE}" || warn "重启服务失败，请稍后手动重启"
-    fi
-    return 0
-  else
-    warn "GeoFiles 更新失败：所有规则文件均未成功下载，请检查网络连接"
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
+    service_active=true
+  fi
+  if ! mv -f -- "$staged_bin" "$BIN_PATH"; then
+    [[ -z "$backup_bin" ]] || rm -f -- "$backup_bin"
+    warn "替换 sing-box 核心失败，原核心未改动"
     return 1
   fi
+  staged_bin=""
+  if [[ "$SBP_BIN_DIR/sing-box" != "$BIN_PATH" ]]; then
+    ln -sf "$BIN_PATH" "$SBP_BIN_DIR/sing-box" || warn "更新 sing-box 命令链接失败"
+  fi
+  if [[ "$service_active" == true ]] && ! restart_service_stably "$SYSTEMD_SERVICE"; then
+    warn "新核心启动后未能稳定运行，正在恢复原核心"
+    if [[ -n "$backup_bin" ]]; then
+      if ! mv -f -- "$backup_bin" "$BIN_PATH"; then
+        warn "恢复原核心失败，备份保留在 $backup_bin"
+        return 1
+      fi
+    else
+      rm -f -- "$BIN_PATH" || return 1
+    fi
+    restart_service_stably "$SYSTEMD_SERVICE" || warn "原核心恢复后服务仍未稳定，请检查服务状态"
+    return 1
+  fi
+  [[ -z "$backup_bin" ]] || rm -f -- "$backup_bin"
+  info "sing-box 安装/升级完成：v${candidate_ver}"
+)
+
+# ===== 远程规则集可用性检查 =====
+check_remote_rule_sets() {
+  ensure_dirs
+  ensure_deps jq || return 1
+  if [[ ! -s "$ROUTE_JSON" ]]; then
+    info "当前未配置远程规则集"
+    return 0
+  fi
+
+  local count
+  if ! count="$(jq -er '[(.rule_set // [])[] | select(.type == "remote")] | length' "$ROUTE_JSON")"; then
+    warn "无法读取远程规则集配置"
+    return 1
+  fi
+  if (( count == 0 )); then
+    info "当前未配置远程规则集"
+    return 0
+  fi
+
+  info "正在检查 ${count} 个已配置的远程规则集..."
+  validate_remote_rule_sets "$ROUTE_JSON" || return 1
+  info "远程规则集可访问；sing-box 将按各规则集的 update_interval 自动更新"
 }
+
+# 保留旧命令入口，避免已有自动化调用失效。
+update_geofiles() { check_remote_rule_sets; }
 
 # ===== 运行时辅助：DNS 健康切换与服务事件记录 =====
 write_runtime_helpers(){
@@ -2929,7 +2926,11 @@ write_config(){
   fi
 
   local CRT="$TLS_CERT_PATH" KEY="$TLS_KEY_PATH"
-  local ROUTING_JSON BIND4 BIND6 TMP_CONF
+  local ROUTING_JSON BIND4 BIND6 TMP_CONF core_ver supports_1_14=false
+  core_ver="$(get_singbox_local_version "$BIN_PATH" 2>/dev/null || true)"
+  if [[ -n "$core_ver" ]] && ! version_lt "$core_ver" 1.14.0; then
+    supports_1_14=true
+  fi
   ROUTING_JSON="$(load_route_json)"
   BIND4="$(default_ipv4_address || true)"
   BIND6="$(default_ipv6_address || true)"
@@ -2960,20 +2961,23 @@ write_config(){
   --arg WHOST "${WARP_ENDPOINT_HOST:-}" --argjson WPORT "${WARP_ENDPOINT_PORT:-0}" \
   --arg W4 "${WARP_ADDRESS_V4:-}" --arg W6 "${WARP_ADDRESS_V6:-}" \
   --argjson WR1 "${WARP_RESERVED_1:-0}" --argjson WR2 "${WARP_RESERVED_2:-0}" --argjson WR3 "${WARP_RESERVED_3:-0}" \
-  --arg BIND4 "$BIND4" --arg BIND6 "$BIND6" --argjson CUSTOM_ROUTES "$ROUTING_JSON" \
+  --arg BIND4 "$BIND4" --arg BIND6 "$BIND6" --arg CACHEPATH "$DATA_DIR/cache.db" \
+  --argjson CUSTOM_ROUTES "$ROUTING_JSON" \
+  --argjson SUPPORTS_1_14 "$supports_1_14" \
   '
   def listen_tuning: {tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI, udp_timeout:$UDPT};
+  def acme_provider:
+    {type:"acme", tag:"sbp-acme", domain:[$TLSDOMAIN], data_directory:$ACMEDATA,
+      default_server_name:$TLSDOMAIN, email:$ACMEEMAIL, provider:$ACMEPROVIDER,
+      disable_http_challenge:$ACMEDISABLEHTTP,
+      disable_tls_alpn_challenge:$ACMEDISABLETLS};
   def inbound_tls($alpn):
     ({enabled:true}
       + (if $TLSDOMAIN != "" then {server_name:$TLSDOMAIN} else {} end)
       + (if ($alpn | length) > 0 then {alpn:$alpn} else {} end)
       + (if $TLSMODE == "acme" then
-          {acme:{
-            domain:[$TLSDOMAIN], data_directory:$ACMEDATA, default_server_name:$TLSDOMAIN,
-            email:$ACMEEMAIL, provider:$ACMEPROVIDER,
-            disable_http_challenge:$ACMEDISABLEHTTP,
-            disable_tls_alpn_challenge:$ACMEDISABLETLS
-          }}
+          if $SUPPORTS_1_14 then {certificate_provider:"sbp-acme"}
+          else {acme:(acme_provider | del(.type, .tag))} end
         else {certificate_path:$CRT, key_path:$KEY} end));
   def inbound_vless($port): ({type:"vless", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$UID}], tls:{enabled:true, server_name:$RS, reality:{enabled:true, handshake:{server:$RS, server_port:$RSP}, private_key:$RPR, short_id:[$SID]}}} + listen_tuning);
   def inbound_vless_flow($port): ({type:"vless", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$UID, flow:"xtls-rprx-vision"}], tls:{enabled:true, server_name:$RS, reality:{enabled:true, handshake:{server:$RS, server_port:$RSP}, private_key:$RPR, short_id:[$SID]}}} + listen_tuning);
@@ -3017,8 +3021,17 @@ write_config(){
   def warp_proxy_outbound:
     {type:"socks", tag:"warp", server:$WARP_SOCKS_HOST, server_port:$WARP_SOCKS_PORT};
 
-  def custom_rule_sets:
-    (($CUSTOM_ROUTES.rule_set // []) | map(select((.tag // "") != "")));
+  def custom_rule_sets($default):
+    (($CUSTOM_ROUTES.rule_set // [])
+      | map(select((.tag // "") != ""))
+      | map(if .type != "remote" then .
+            elif $SUPPORTS_1_14 then
+              (if .http_client == null then
+                 .http_client = {detour:(.download_detour // $default)}
+               else . end) | del(.download_detour)
+            elif has("http_client") then
+              error("http_client requires sing-box 1.14 or newer")
+            else . end));
 
   def normalize_outbound_ip_strategy:
     . as $ob
@@ -3100,7 +3113,8 @@ write_config(){
   def route_config:
     ({default_domain_resolver:"dns-doh-primary", final:resolved_final_outbound}
       + (if (route_rules | length) > 0 then {rules:route_rules} else {} end)
-      + (if (custom_rule_sets | length) > 0 then {rule_set:custom_rule_sets} else {} end));
+      + (if (custom_rule_sets(resolved_final_outbound) | length) > 0 then
+           {rule_set:custom_rule_sets(resolved_final_outbound)} else {} end));
 
   {
     log:{level:"info", timestamp:true},
@@ -3144,7 +3158,13 @@ write_config(){
       + (if custom_uses_outbound("direct-ipv6") then [direct_ipv6_outbound] else [] end)
       + custom_outbounds),
     route: route_config
-  }' > "$TMP_CONF"; then
+  }
+  | if $TLSMODE == "acme" and $SUPPORTS_1_14 then
+      .certificate_providers = [acme_provider]
+    else . end
+  | if any(.route.rule_set[]?; .type == "remote") then
+      .experimental.cache_file = {enabled:true, path:$CACHEPATH}
+    else . end' > "$TMP_CONF"; then
     rm -f "$TMP_CONF"
     warn "生成 sing-box JSON 配置失败，已保留原配置"
     return 1
@@ -4293,19 +4313,11 @@ show_service_status(){
     echo -e "  sing-box 核心: ${C_RED}未安装${C_RESET}"
   fi
 
-  local geo_ver="未记录" geo_geoip="未找到" geo_geosite="未找到"
-  [[ -f "$SB_DIR/geofiles.version" ]] && geo_ver="$(awk -F'=' '/LAST_UPDATE/{gsub(/"/,""); print $2}' "$SB_DIR/geofiles.version" 2>/dev/null || echo "已记录")"
-  if [[ -f "$DATA_DIR/geoip.db" ]]; then
-    geo_geoip="$(wc -c < "$DATA_DIR/geoip.db" 2>/dev/null | awk '{printf "%.2f MB", $1/1048576}')"
-  elif [[ -f "$SB_DIR/geoip.db" ]]; then
-    geo_geoip="$(wc -c < "$SB_DIR/geoip.db" 2>/dev/null | awk '{printf "%.2f MB", $1/1048576}')"
+  local remote_rule_count=0
+  if [[ -s "$ROUTE_JSON" ]] && command -v jq >/dev/null 2>&1; then
+    remote_rule_count="$(jq -r '[(.rule_set // [])[] | select(.type == "remote")] | length' "$ROUTE_JSON" 2>/dev/null || echo 0)"
   fi
-  if [[ -f "$DATA_DIR/geosite.db" ]]; then
-    geo_geosite="$(wc -c < "$DATA_DIR/geosite.db" 2>/dev/null | awk '{printf "%.2f MB", $1/1048576}')"
-  elif [[ -f "$SB_DIR/geosite.db" ]]; then
-    geo_geosite="$(wc -c < "$SB_DIR/geosite.db" 2>/dev/null | awk '{printf "%.2f MB", $1/1048576}')"
-  fi
-  echo -e "  GeoFiles 规则: 上次更新 [${geo_ver}] | geoip.db (${geo_geoip}) | geosite.db (${geo_geosite})"
+  echo -e "  远程规则集: ${remote_rule_count} 个（由 sing-box 定时更新）"
 
   # 3. 节点监听状态探测
   echo
@@ -4466,7 +4478,7 @@ banner(){
   echo
   echo -e "  ${C_BOLD}【核心与规则维护】${C_RESET}"
   echo -e "    ${C_YELLOW}9)${C_RESET} 更新 sing-box 核心版本"
-  echo -e "   ${C_YELLOW}10)${C_RESET} 更新 GeoFiles 规则文件 (GeoIP/GeoSite/规则集)"
+  echo -e "   ${C_YELLOW}10)${C_RESET} 检查远程规则集可用性"
   echo -e "   ${C_YELLOW}11)${C_RESET} 从 GitHub 更新管理脚本"
   echo -e "   ${C_YELLOW}12)${C_RESET} 一键系统网络诊断"
   echo -e "   ${C_YELLOW}13)${C_RESET} 获取 / 修复 WARP 出口"
@@ -4592,15 +4604,11 @@ run_diagnostics(){
 
 # 更新 sing-box 核心
 update_singbox(){
-  ensure_installed_or_hint || return 0
+  ensure_installed_or_hint || return 1
   info "正在检查 sing-box 核心版本..."
-  if install_singbox 1; then
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${SYSTEMD_SERVICE}"; then
-      info "正在重启 sing-box 服务..."
-      systemctl restart "${SYSTEMD_SERVICE}" || warn "重启服务失败"
-    fi
-  else
+  if ! install_singbox 1; then
     warn "更新 sing-box 失败"
+    return 1
   fi
 }
 
@@ -5360,8 +5368,10 @@ usage(){
   bash sbp.sh                    打开交互式管理菜单
   sudo bash sbp.sh --status      查看当前服务运行状态
   sudo bash sbp.sh --update-core 检查并更新 sing-box 核心版本
+  sudo bash sbp.sh --check-rule-sets
+                                 检查已配置远程规则集的可用性（不重启服务）
   sudo bash sbp.sh --update-geofiles
-                                 更新 GeoFiles 规则文件 (GeoIP/GeoSite/规则集)
+                                 旧命令别名，执行远程规则集可用性检查
   sudo bash sbp.sh --update-runtime
                                  轻量更新管理脚本与 DNS 运行时组件
   sudo bash sbp.sh --update-script
@@ -5430,8 +5440,8 @@ menu(){
     6) sbp_bootstrap; connection_settings_menu; menu ;;
     7) custom_route_menu; menu ;;
     8) enable_bbr; read -rp "回车返回..." _ || true; menu ;;
-    9) update_singbox; read -rp "回车返回..." _ || true; menu ;;
-    10) update_geofiles; read -rp "回车返回..." _ || true; menu ;;
+    9) update_singbox || true; read -rp "回车返回..." _ || true; menu ;;
+    10) check_remote_rule_sets; read -rp "回车返回..." _ || true; menu ;;
     11) update_script_from_remote; read -rp "回车返回..." _ || true; menu ;;
     12) run_diagnostics; read -rp "回车返回..." _ || true; menu ;;
     13) repair_warp; read -rp "回车返回..." _ || true; menu ;;
@@ -5447,7 +5457,7 @@ main(){
     "") menu ;;
     --status) show_service_status ;;
     --update-core) update_singbox ;;
-    --update-geofiles) update_geofiles ;;
+    --check-rule-sets|--update-geofiles) check_remote_rule_sets ;;
     --update-runtime) update_runtime_components ;;
     --update-script) update_script_from_remote ;;
     --reissue-cert) reissue_managed_certificate ;;

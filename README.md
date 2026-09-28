@@ -12,8 +12,8 @@
 |------|------|
 | **最多 20 节点** | 固定 10 个直连节点；WARP 配置验证通过后再启用 10 个 WARP 出口节点 |
 | **10 种协议** | VLESS Reality · VLESS gRPC Reality · Trojan Reality · Hysteria2 · VMess WS · Hysteria2 obfs · SS2022 · Shadowsocks · TUIC v5 · AnyTLS |
-| **版本智能升级** | 部署或更新时自动比对官方最新 Release，识别旧版自动升级并支持安全回滚 |
-| **GeoFiles 更新** | 一键更新 GeoIP / GeoSite 数据库及 SRS 规则集，多 CDN 镜像防封锁自动切换 |
+| **版本智能升级** | 校验官方 Release SHA-256 和现有配置，替换核心后检查服务稳定性，失败时恢复原核心 |
+| **远程规则集检查** | 检查当前配置的 SRS 规则集可用性；sing-box 按 `update_interval` 自动更新 |
 | **运行状态看板** | 实时查看主进程 PID、内存占用、当前已启用节点的端口监听、DNS 切换与证书到期倒计时 |
 | **WARP 出口** | 新安装默认使用 Cloudflare 官方 Linux 客户端的本地代理；已有 wgcf WireGuard profile 继续兼容 |
 | **DNS 故障切换** | Cloudflare DoH → Google DoH → UDP 1.0.0.1，连续失败确认与恢复冷却避免探测抖动重启 |
@@ -31,6 +31,18 @@
 - Root 权限
 - 至少 10 个可用端口；WARP 启用时共使用 20 个端口（脚本自动随机分配并配置防火墙）
 - 官方 WARP 自动安装需要 Cloudflare 当前支持的 Debian / Ubuntu / RHEL / Fedora 版本及 amd64 或 arm64；其他系统仍可导入已有 WireGuard profile
+
+---
+
+## 🔄 核心与规则维护
+
+菜单 `9)` 更新 sing-box 时，脚本会核对 GitHub Release 提供的 SHA-256、发行包内的核心版本，并用新核心检查现有配置。服务运行中还会验证重启后的稳定状态；失败时恢复原核心并尝试恢复服务。已部署的配置在更新核心后保持原样，下次部署或修改配置时会按本机核心版本重新生成：1.14+ 使用 `certificate_providers` 和规则集 `http_client`，1.13 保留兼容写法。
+
+菜单 `10)` 或 `sudo bash sbp.sh --check-rule-sets` 会下载并检查当前配置的远程规则集是否可访问，不写入旧版 `geoip.db` / `geosite.db`，也不重启服务。配置含远程规则集时会启用 sing-box 的持久缓存；定时更新由 sing-box 自己执行。旧参数 `--update-geofiles` 保留为检查命令的别名。
+
+使用 wgcf WireGuard 后端时，脚本会对照 wgcf 最新 Release 的 SHA-256 更新二进制；下载或校验失败会报错并保留原文件。已有 profile 的密钥不会因更新二进制而重置。
+
+仓库的兼容性工作流在 Ubuntu 上运行回归测试，并用官方 sing-box 1.13.13 与 1.14.2 校验生成配置。
 
 ---
 
@@ -102,10 +114,10 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 
 ```text
 =============================================================
- 🚀 Sing-Box-Plus 管理脚本 v3.4.0 🚀
+ 🚀 Sing-Box-Plus 管理脚本 v3.5.0 🚀
  脚本更新地址: https://github.com/yayitinyu/sing-box-plus
 =============================================================
-  服务状态: 运行中 (Active)  |  核心版本: sing-box v1.12.7
+  服务状态: 运行中 (Active)  |  核心版本: sing-box v1.14.2
   系统加速: 已启用 BBR       |  证书模式: 自签证书
 =============================================================
   【核心部署与运行】
@@ -122,7 +134,7 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 
   【核心与规则维护】
     9) 更新 sing-box 核心版本
-   10) 更新 GeoFiles 规则文件 (GeoIP/GeoSite/规则集)
+   10) 检查远程规则集可用性
    11) 从 GitHub 更新管理脚本
    12) 一键系统网络诊断
    13) 获取 / 修复 WARP 出口
@@ -283,7 +295,7 @@ geosite:netflix, suffix:openai.com, domain:example.com, keyword:google, regex:.*
 | WARP 错误日志 | `/opt/sing-box/wgcf/*-last-error.log` | 最近一次官方客户端或 wgcf 失败详情，仅 root 可读 |
 | 自定义路由 | `/opt/sing-box/routes.json` | 用户自定义路由规则 |
 | 证书目录 | `/opt/sing-box/cert/` | TLS 证书与私钥 |
-| 规则目录 | `/opt/sing-box/data/` | GeoIP / GeoSite 及 SRS 规则集 |
+| 规则目录 | `/opt/sing-box/data/` | 本地 SRS 文件及远程规则集缓存 `cache.db` |
 | 重启记录 | `/opt/sing-box/restart.log` | 服务启停日志 |
 | DNS 切换记录 | `/opt/sing-box/dns-health.log` | DNS 上游切换日志 |
 | 诊断报告 | `/opt/sing-box/diagnostics/` | 网络诊断快照 |
@@ -297,8 +309,8 @@ geosite:netflix, suffix:openai.com, domain:example.com, keyword:google, regex:.*
 可在运行脚本前通过环境变量自定义行为：
 
 ```bash
-# 指定 sing-box 版本（推荐 1.13+）
-SINGBOX_TAG=v1.13.13 bash sbp.sh
+# 指定 sing-box 版本
+SINGBOX_TAG=v1.14.2 bash sbp.sh
 
 # 跳过启动依赖检查
 SBP_SKIP_DEPS=1 bash sbp.sh
