@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**一键部署最多 20 节点的多协议代理服务 Bash 管理脚本**，基于 [sing-box](https://github.com/SagerNet/sing-box) 核心。
+**一键部署多协议代理服务的 Bash 管理脚本**，提供 10 个直连节点，可选 WARP 与额外 SOCKS 出口节点，基于 [sing-box](https://github.com/SagerNet/sing-box) 核心。
 
 ---
 
@@ -18,6 +18,7 @@
 | **WARP 出口** | 新安装默认只部署直连节点；按需启用 Cloudflare 官方客户端，已有 WARP 配置继续保留 |
 | **DNS 故障切换** | Cloudflare DoH → Google DoH → UDP 1.0.0.1，连续失败确认与恢复冷却避免探测抖动重启 |
 | **自定义路由** | 按域名 / geosite 指定出口或 block 阻断，支持同出口规则整理及 JSON 导入、导出 |
+| **SOCKS 出口节点（可选）** | 导入 SOCKS5 / SOCKS5H 链接，选择协议并继承当前系统设置，额外节点链接单独输出 |
 | **TLS 证书** | 自签证书 / 手动上传公开有效证书 / ACME 自动申请续期，三种模式一键切换 |
 | **连接稳定** | TCP keepalive · 可调 UDP timeout · WARP 出口校验 · 全参数环境变量覆盖 |
 | **彻底卸载** | 一键注销服务、关闭防火墙放行、清理二进制与残留数据，干净无痕 |
@@ -29,7 +30,7 @@
 
 - Linux VPS（推荐 Debian 11+ / Ubuntu 20.04+）
 - Root 权限
-- 至少 10 个可用端口；WARP 启用时共使用 20 个端口（脚本自动随机分配并配置防火墙）
+- 至少 10 个可用端口；WARP 启用时共使用 20 个端口，每个额外 SOCKS 出口节点再使用一个独立端口（脚本自动随机分配并配置防火墙）
 - 如需启用官方 WARP，系统须为 Cloudflare 当前支持的 Debian / Ubuntu / RHEL / Fedora 版本及 amd64 或 arm64；其他系统仍可导入已有 WireGuard profile
 
 打开管理菜单不会安装依赖。选择部署时，脚本只补齐缺失的核心工具；防火墙工具在需要放行端口时安装，`xz` / `unzip` 仅在下载到相应格式的核心压缩包时安装。
@@ -116,7 +117,7 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 
 ```text
 =============================================================
- 🚀 Sing-Box-Plus 管理脚本 v3.5.1 🚀
+ 🚀 Sing-Box-Plus 管理脚本 v3.6.0 🚀
  脚本更新地址: https://github.com/yayitinyu/sing-box-plus
 =============================================================
   服务状态: 运行中 (Active)  |  核心版本: sing-box v1.14.2
@@ -133,6 +134,7 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
     6) 域名、证书与 SNI 设置
     7) 自定义路由与分流规则
     8) 一键开启 BBR 加速
+   15) SOCKS 出口节点（可选）
 
   【核心与规则维护】
     9) 更新 sing-box 核心版本
@@ -198,6 +200,26 @@ openssl x509 -in /opt/sing-box/cert/fullchain.pem -noout -subject
 ---
 
 ## 🌐 节点说明
+
+### SOCKS 出口节点（可选）
+
+部署后选择菜单 `15) SOCKS 出口节点（可选）` → `1) 导入链接并创建节点`，粘贴 `socks5://` 或 `socks5h://` 链接，再选择十种协议之一、节点名称和独立端口（留空自动分配）。支持无认证、用户名密码、百分号编码、Base64 认证信息和 IPv6，例如：
+
+```text
+socks5://proxy.example.com:1080
+socks5h://username:password@proxy.example.com:1080#my-node
+socks5h://username:p%40ss%3Aword@[2001:db8::1]:1080
+```
+
+额外节点继承当前证书模式、证书域名、Reality SNI、协议凭证、gRPC / WebSocket 参数和连接调优设置。`socks5://` 使用本机当前 DNS 配置解析目标域名；`socks5h://` 将客户端提供的目标域名交给上游 SOCKS 解析。客户端已经发送 IP 地址时，SOCKS5H 会直接转发该 IP。额外节点的路由优先于全局分流规则，流量固定走导入的 SOCKS 出口；上游不可用时连接失败。
+
+SOCKS 节点分享链接在全部常规链接之后单独打印，并保存在 `/opt/sing-box/socks-share-links.txt`，不写入常规的 `share-links.txt`。修改证书或 SNI 后会同步刷新。也可以只输出这些链接：
+
+```bash
+sudo /root/sbp.sh --socks-links
+```
+
+`sudo /root/sbp.sh --socks-nodes` 可直接打开管理入口，支持添加多个节点、查看和删除。创建或删除会校验配置并重启当前运行中的 sing-box；失败时恢复原配置。凭证和链接文件权限为 `600`，操作备份保存在 `/opt/sing-box/backups/socks-nodes-*`。此功能默认关闭，无需修改原来的直连 / WARP 节点；UDP 转发取决于上游 SOCKS 是否支持 UDP ASSOCIATE。
 
 ### 直连节点（10 个）
 

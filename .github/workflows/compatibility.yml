@@ -58,7 +58,9 @@ jobs:
         shell: bash
         env:
           SBP_TEST_SING_BOX: ${{ steps.core.outputs.path }}
-        run: bash tests/test_custom_routing.sh compatibility
+        run: |
+          bash tests/test_custom_routing.sh compatibility
+          SBP_REAL_SING_BOX_BIN="$SBP_TEST_SING_BOX" bash tests/test_socks_nodes.sh
 
   wgcf-release:
     runs-on: ubuntu-22.04

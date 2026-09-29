@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（直连 10 + WARP 就绪时额外 10）
-#  Version: v3.5.1
+#  Version: v3.6.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -254,6 +254,8 @@ SBP_REPO=${SBP_REPO:-yayitinyu/sing-box-plus}
 SBP_BRANCH=${SBP_BRANCH:-main}
 ROUTE_JSON=${ROUTE_JSON:-$SB_DIR/routes.json}
 SHARE_LINKS_FILE=${SHARE_LINKS_FILE:-$SB_DIR/share-links.txt}
+SOCKS_NODES_JSON=${SOCKS_NODES_JSON:-$SB_DIR/socks-nodes.json}
+SOCKS_SHARE_LINKS_FILE=${SOCKS_SHARE_LINKS_FILE:-$SB_DIR/socks-share-links.txt}
 
 # 新安装优先保证直连节点；旧 env.conf 缺少此开关时沿用原先的 WARP 默认值。
 SBP_ENABLE_WARP_OVERRIDE=${ENABLE_WARP-}
@@ -305,7 +307,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.5.1"
+SCRIPT_VERSION="v3.6.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -453,8 +455,8 @@ ensure_deps() {
 }
 
 b64enc(){ base64 -w 0 2>/dev/null || base64; }
-urlenc(){ # 纯 bash urlencode（不依赖 python）
-  local s="$1" out="" c
+urlenc(){ # Encode UTF-8 bytes rather than Unicode code points.
+  local LC_ALL=C s="$1" out="" c i
   for ((i=0; i<${#s}; i++)); do
     c=${s:i:1}
     case "$c" in
@@ -556,6 +558,10 @@ warp_socks_port_conflicts_with_node(){
                   PORT_VLESSR_W PORT_VLESS_GRPCR_W PORT_TROJANR_W PORT_HY2_W PORT_VMESS_WS_W PORT_HY2_OBFS_W PORT_SS2022_W PORT_SS_W PORT_TUIC_W PORT_ANYTLS_W; do
     [[ "${!var_name:-}" == "$candidate" ]] && return 0
   done
+  if [[ -f "$SOCKS_NODES_JSON" ]] && jq -e --argjson port "$candidate" \
+      'any(.nodes[]; .port == $port)' "$SOCKS_NODES_JSON" >/dev/null; then
+    return 0
+  fi
   return 1
 }
 
@@ -608,32 +614,353 @@ load_ports(){ safe_source_env "$SB_DIR/ports.env" || return 1; }
 
 save_all_ports(){
   rand_ports_reset
-  for v in PORT_VLESSR PORT_VLESS_GRPCR PORT_TROJANR PORT_HY2 PORT_VMESS_WS PORT_HY2_OBFS PORT_SS2022 PORT_SS PORT_TUIC PORT_ANYTLS \
-           PORT_VLESSR_W PORT_VLESS_GRPCR_W PORT_TROJANR_W PORT_HY2_W PORT_VMESS_WS_W PORT_HY2_OBFS_W PORT_SS2022_W PORT_SS_W PORT_TUIC_W PORT_ANYTLS_W; do
+  local v socks_nodes socks_port new_port
+  local -a port_vars=(PORT_VLESSR PORT_VLESS_GRPCR PORT_TROJANR PORT_HY2 PORT_VMESS_WS PORT_HY2_OBFS PORT_SS2022 PORT_SS PORT_TUIC PORT_ANYTLS
+    PORT_VLESSR_W PORT_VLESS_GRPCR_W PORT_TROJANR_W PORT_HY2_W PORT_VMESS_WS_W PORT_HY2_OBFS_W PORT_SS2022_W PORT_SS_W PORT_TUIC_W PORT_ANYTLS_W)
+  for v in "${port_vars[@]}"; do
     [[ -n "${!v:-}" ]] && PORTS+=("${!v}")
   done
-  reserve_warp_socks_port
-  [[ -z "${PORT_VLESSR:-}" ]] && PORT_VLESSR=$(gen_port)
-  [[ -z "${PORT_VLESS_GRPCR:-}" ]] && PORT_VLESS_GRPCR=$(gen_port)
-  [[ -z "${PORT_TROJANR:-}" ]] && PORT_TROJANR=$(gen_port)
-  [[ -z "${PORT_HY2:-}" ]] && PORT_HY2=$(gen_port)
-  [[ -z "${PORT_VMESS_WS:-}" ]] && PORT_VMESS_WS=$(gen_port)
-  [[ -z "${PORT_HY2_OBFS:-}" ]] && PORT_HY2_OBFS=$(gen_port)
-  [[ -z "${PORT_SS2022:-}" ]] && PORT_SS2022=$(gen_port)
-  [[ -z "${PORT_SS:-}" ]] && PORT_SS=$(gen_port)
-  [[ -z "${PORT_TUIC:-}" ]] && PORT_TUIC=$(gen_port)
-  [[ -z "${PORT_ANYTLS:-}" ]] && PORT_ANYTLS=$(gen_port)
-  [[ -z "${PORT_VLESSR_W:-}" ]] && PORT_VLESSR_W=$(gen_port)
-  [[ -z "${PORT_VLESS_GRPCR_W:-}" ]] && PORT_VLESS_GRPCR_W=$(gen_port)
-  [[ -z "${PORT_TROJANR_W:-}" ]] && PORT_TROJANR_W=$(gen_port)
-  [[ -z "${PORT_HY2_W:-}" ]] && PORT_HY2_W=$(gen_port)
-  [[ -z "${PORT_VMESS_WS_W:-}" ]] && PORT_VMESS_WS_W=$(gen_port)
-  [[ -z "${PORT_HY2_OBFS_W:-}" ]] && PORT_HY2_OBFS_W=$(gen_port) || true
-  [[ -z "${PORT_SS2022_W:-}" ]] && PORT_SS2022_W=$(gen_port)
-  [[ -z "${PORT_SS_W:-}" ]] && PORT_SS_W=$(gen_port)
-  [[ -z "${PORT_TUIC_W:-}" ]] && PORT_TUIC_W=$(gen_port)
-  [[ -z "${PORT_ANYTLS_W:-}" ]] && PORT_ANYTLS_W=$(gen_port)
+  socks_nodes="$(load_socks_nodes)" || return 1
+  while IFS= read -r socks_port; do
+    [[ -z "$socks_port" ]] || PORTS+=("$socks_port")
+  done < <(jq -r '.nodes[].port' <<< "$socks_nodes" | tr -d '\r')
+  reserve_warp_socks_port || return 1
+  for v in "${port_vars[@]}"; do
+    if [[ -z "${!v:-}" ]]; then
+      new_port="$(gen_port)" || return 1
+      printf -v "$v" '%s' "$new_port"
+      # Command substitution cannot update the caller's reservation array.
+      PORTS+=("$new_port")
+    fi
+  done
   save_ports
+}
+
+# ===== Optional SOCKS egress nodes =====
+socks_uri_decode(){
+  local input="$1" output="" char byte
+  while [[ -n "$input" ]]; do
+    char="${input:0:1}"; input="${input:1}"
+    if [[ "$char" == '%' ]]; then
+      [[ "${input:0:2}" =~ ^[0-9a-fA-F]{2}$ ]] || return 1
+      byte=$((16#${input:0:2}))
+      (( byte >= 32 && byte != 127 )) || return 1
+      printf -v char '%b' "\\x${input:0:2}"
+      input="${input:2}"
+    fi
+    output+="$char"
+  done
+  printf '%s' "$output"
+}
+
+socks_node_outbound_from_link(){
+  local link="$1" tag="$2" scheme body query="" userinfo="" hostport
+  local username="" password="" decoded pair key value version=5
+  [[ "$link" != *[$'\r\n\t ']* ]] || return 1
+  scheme="${link%%://*}"; scheme="${scheme,,}"
+  [[ "$scheme" == socks5 || "$scheme" == socks5h ]] || return 1
+  body="${link#*://}"; body="${body%%\#*}"
+  if [[ "$body" == *'?'* ]]; then
+    query="${body#*\?}"; body="${body%%\?*}"
+  fi
+  body="${body%/}"
+  if [[ "$body" != *'@'* && "$body" != *':'* ]]; then
+    body="$(b64dec "$body")" || return 1
+    body="${body%/}"
+  fi
+  if [[ "$body" == *'@'* ]]; then
+    userinfo="${body%@*}"; hostport="${body##*@}"
+    if [[ "$userinfo" != *':'* ]]; then
+      decoded="$(b64dec "$userinfo" 2>/dev/null)" || decoded=""
+      [[ "$decoded" != *':'* ]] || userinfo="$decoded"
+    fi
+    username="$(socks_uri_decode "${userinfo%%:*}")" || return 1
+    if [[ "$userinfo" == *':'* ]]; then
+      password="$(socks_uri_decode "${userinfo#*:}")" || return 1
+    fi
+  else
+    hostport="$body"
+  fi
+  split_hostport "$hostport" || return 1
+  [[ -n "$SBP_PARSED_HOST" && ${#SBP_PARSED_PORT} -le 5 ]] || return 1
+  local port=$((10#$SBP_PARSED_PORT))
+  (( port >= 1 && port <= 65535 )) || return 1
+  local -a pairs=()
+  IFS='&' read -r -a pairs <<< "$query"
+  for pair in "${pairs[@]}"; do
+    key="${pair%%=*}"; value="$(socks_uri_decode "${pair#*=}")" || return 1
+    case "$key" in
+      user|username) username="$value" ;;
+      pass|password) password="$value" ;;
+      version) version="$value" ;;
+    esac
+  done
+  [[ "$version" == 5 ]] || return 1
+  jq -cn --arg tag "$tag" --arg server "$SBP_PARSED_HOST" --argjson port "$port" \
+    --arg user "$username" --arg pass "$password" '
+    {type:"socks", tag:$tag, server:$server, server_port:$port, version:"5",
+      domain_resolver:"dns-doh-primary"}
+    | if $user != "" or $pass != "" then .username=$user | .password=$pass else . end'
+}
+
+validate_socks_nodes(){
+  jq -ces '
+    def port: type == "number" and . == floor and . >= 1 and . <= 65535;
+    def text: type == "string" and (test("[\\x00-\\x1f\\x7f]") | not);
+    def host:
+      text and length > 0 and
+      (test("^[A-Za-z0-9.-]+$|^[0-9A-Fa-f:]+(%[A-Za-z0-9._-]+)?$") and . != ".");
+    def protocol: IN("vless-reality", "vless-grpcr", "trojan-reality", "hy2", "vmess-ws",
+      "hy2-obfs", "ss2022", "ss", "tuic-v5", "anytls");
+    if length != 1 then error("SOCKS 节点文件必须只包含一个 JSON 对象") else .[0] end
+    | if type != "object" or (keys != ["nodes"]) or (.nodes | type) != "array" then
+        error("SOCKS 节点文件格式无效") else . end
+    | if all(.nodes[];
+        type == "object" and (keys == ["dns_mode","id","name","outbound","port","protocol"])
+        and (.id | type == "string" and test("^sbp-socks-[a-f0-9]{16}$"))
+        and (.name | text and length > 0 and length <= 80)
+        and (.port | port) and (.protocol | protocol) and (.dns_mode | IN("local","remote"))
+        and (.outbound | type == "object")
+        and ((.outbound | keys) - ["domain_resolver","password","server","server_port","tag","type","username","version"] | length == 0)
+        and .outbound.type == "socks" and .outbound.version == "5"
+        and .outbound.tag == (.id + "-out") and .outbound.domain_resolver == "dns-doh-primary"
+        and (.outbound.server | host) and (.outbound.server_port | port)
+        and ((.outbound.username // "") | text and utf8bytelength <= 255)
+        and ((.outbound.password // "") | text and utf8bytelength <= 255))
+      and ([.nodes[].id] | length == (unique | length))
+      and ([.nodes[].port] | length == (unique | length))
+      then . else error("SOCKS 节点参数无效或端口、标识重复") end
+  ' "$1"
+}
+
+load_socks_nodes(){
+  if [[ -e "$SOCKS_NODES_JSON" ]]; then
+    validate_socks_nodes "$SOCKS_NODES_JSON"
+  else
+    printf '%s\n' '{"nodes":[]}'
+  fi
+}
+
+socks_protocol_label(){
+  case "$1" in
+    vless-reality) printf 'VLESS Reality' ;;
+    vless-grpcr) printf 'VLESS gRPC Reality' ;;
+    trojan-reality) printf 'Trojan Reality' ;;
+    hy2) printf 'Hysteria2' ;;
+    vmess-ws) printf 'VMess WS' ;;
+    hy2-obfs) printf 'Hysteria2 obfs' ;;
+    ss2022) printf 'SS2022' ;;
+    ss) printf 'Shadowsocks' ;;
+    tuic-v5) printf 'TUIC v5' ;;
+    anytls) printf 'AnyTLS' ;;
+    *) return 1 ;;
+  esac
+}
+
+socks_node_port_available(){
+  local port="$1" nodes
+  [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || return 1
+  warp_socks_port_conflicts_with_node "$port" && return 1
+  [[ "$port" != "$WARP_SOCKS_PORT" ]] || return 1
+  nodes="$(load_socks_nodes)" || return 1
+  jq -e --argjson port "$port" 'all(.nodes[]; .port != $port)' <<< "$nodes" >/dev/null || return 1
+  if [[ -f "$CONF_JSON" ]] && jq -e --argjson port "$port" \
+      'any(.inbounds[]?; .listen_port == $port)' "$CONF_JSON" >/dev/null; then return 1; fi
+  if command -v ss >/dev/null 2>&1 && [[ -n "$(ss -H -lntu "sport = :$port" 2>/dev/null)" ]]; then return 1; fi
+  [[ "$TLS_CERT_MODE" != acme || ( "$port" != 80 && "$port" != 443 ) ]]
+}
+
+socks_node_firewall_rules(){
+  local nodes protocol port
+  nodes="$(load_socks_nodes)" || return 1
+  while IFS=$'\t' read -r protocol port; do
+    [[ -n "$protocol" ]] || continue
+    case "$protocol" in
+      hy2|hy2-obfs|tuic-v5) printf '%s/udp\n' "$port" ;;
+      ss2022|ss) printf '%s/tcp\n%s/udp\n' "$port" "$port" ;;
+      *) printf '%s/tcp\n' "$port" ;;
+    esac
+  done < <(jq -r '.nodes[] | [.protocol, .port] | @tsv' <<< "$nodes" | tr -d '\r')
+}
+
+close_socks_node_firewall_rules(){
+  local previous="$1" old_rules current_rules rule backend=iptables port proto
+  [[ -f "$previous" ]] || return 0
+  old_rules="$(SOCKS_NODES_JSON="$previous" socks_node_firewall_rules)" || return 1
+  current_rules="$(socks_node_firewall_rules)" || return 1
+  local -a removed=()
+  while IFS= read -r rule; do
+    [[ -n "$rule" ]] || continue
+    if ! grep -Fxq -- "$rule" <<< "$current_rules"; then removed+=("$rule"); fi
+  done <<< "$old_rules"
+  (( ${#removed[@]} > 0 )) || return 0
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -qi -E '(^|[[:space:]])active($|[[:space:]])|活跃'; then
+    backend=ufw
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    backend=firewalld
+  else
+    command -v iptables >/dev/null 2>&1 || return 0
+  fi
+  for rule in "${removed[@]}"; do
+    case "$backend" in
+      ufw) ufw delete allow "$rule" >/dev/null || return 1 ;;
+      firewalld) firewall-cmd --permanent --remove-port="$rule" >/dev/null || return 1 ;;
+      iptables)
+        port="${rule%/*}"; proto="${rule#*/}"
+        if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+          iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT || return 1
+        fi
+        ;;
+    esac
+  done
+  case "$backend" in
+    ufw) ufw reload >/dev/null ;;
+    firewalld) firewall-cmd --reload >/dev/null ;;
+    iptables) if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save >/dev/null; fi ;;
+  esac
+}
+
+apply_socks_nodes()(
+  trap - EXIT
+  local candidate="$1" expected="$2" current backup_dir failure="" item
+  local service_active=false restart_attempted=false rollback_failed=false
+  ensure_installed_or_hint || return 1
+  validate_socks_nodes "$candidate" >/dev/null || return 1
+  if ! mkdir "$SB_DIR/.socks-nodes.lock" 2>/dev/null; then
+    warn "另一个 SOCKS 节点操作正在运行。"; return 1
+  fi
+  trap 'rmdir "$SB_DIR/.socks-nodes.lock"' EXIT
+  current="$(load_socks_nodes)" || return 1
+  [[ "$current" == "$expected" ]] || { warn "SOCKS 节点已被其他操作修改，请重试。"; return 1; }
+  mkdir -p "$SB_DIR/backups" || return 1
+  backup_dir="$(mktemp -d "$SB_DIR/backups/socks-nodes-$(date +%Y%m%d-%H%M%S)-XXXXXX")" || return 1
+  chmod 700 "$backup_dir" || return 1
+  local -a paths=("$SOCKS_NODES_JSON" "$CONF_JSON" "$SB_DIR/env.conf" "$SB_DIR/ports.env"
+    "$SB_DIR/creds.env" "$CERT_DIR/fullchain.pem" "$CERT_DIR/key.pem" "$SOCKS_SHARE_LINKS_FILE")
+  local -a names=(socks-nodes.json config.json env.conf ports.env creds.env fullchain.pem key.pem socks-share-links.txt)
+  for item in "${!paths[@]}"; do
+    backup_runtime_file "${paths[$item]}" "${names[$item]}" "$backup_dir" || return 1
+  done
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
+    service_active=true
+  fi
+  local tmp
+  tmp="$(mktemp "${SOCKS_NODES_JSON}.tmp.XXXXXX")" || return 1
+  if ! cp -- "$candidate" "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$SOCKS_NODES_JSON"; then
+    rm -f -- "$tmp"; failure="保存 SOCKS 节点失败"
+  elif ! write_config true; then
+    failure="生成或校验 SOCKS 节点配置失败"
+  elif [[ "$service_active" == true ]]; then
+    restart_attempted=true
+    restart_service_stably "$SYSTEMD_SERVICE" || failure="服务重启后未能稳定运行"
+  fi
+  if [[ -z "$failure" ]] && ! print_socks_node_links; then
+    failure="生成 SOCKS 节点分享链接失败"
+  fi
+  if [[ -n "$failure" ]]; then
+    for item in "${!paths[@]}"; do
+      restore_runtime_file "$backup_dir" "${names[$item]}" "${paths[$item]}" || rollback_failed=true
+    done
+    if [[ "$restart_attempted" == true ]]; then
+      restart_service_stably "$SYSTEMD_SERVICE" || rollback_failed=true
+    fi
+    warn "$failure，已尝试恢复原配置；备份：$backup_dir"
+    [[ "$rollback_failed" == false ]] || warn "部分恢复失败，请检查服务和备份。"
+    return 1
+  fi
+  open_firewall || warn "配置已保存，但防火墙放行失败，请检查端口。"
+  close_socks_node_firewall_rules "$backup_dir/socks-nodes.json" \
+    || warn "节点已更新，但旧端口防火墙规则清理失败。"
+  if [[ "$service_active" == true ]]; then info "SOCKS 节点已应用";
+  else info "SOCKS 节点已保存；服务当前未运行"; fi
+)
+
+add_socks_node()(
+  trap - EXIT
+  local link protocol name port id outbound current tmp dns_mode=local attempt
+  local -a protocols=(vless-reality vless-grpcr trojan-reality hy2 vmess-ws hy2-obfs ss2022 ss tuic-v5 anytls)
+  ensure_installed_or_hint || return 1
+  load_env; load_ports || return 1
+  current="$(load_socks_nodes)" || return 1
+  read -rsp 'SOCKS5 / SOCKS5H 链接: ' link || return 0
+  printf '\n'
+  id="sbp-socks-$(rand_hex8 | tr -d '\r\n')"
+  outbound="$(socks_node_outbound_from_link "$link" "$id-out")" \
+    || { warn "SOCKS 链接无效，请检查地址、端口和认证信息。"; return 1; }
+  [[ "${link%%://*}" != [sS][oO][cC][kK][sS]5[hH] ]] || dns_mode=remote
+  local index=1 choice
+  for protocol in "${protocols[@]}"; do
+    printf '%2s) %s\n' "$index" "$(socks_protocol_label "$protocol")"; index=$((index+1))
+  done
+  read -rp '协议 [1]: ' choice || return 0
+  choice="${choice:-1}"
+  [[ "$choice" =~ ^([1-9]|10)$ ]] || { warn "协议选项无效。"; return 1; }
+  protocol="${protocols[$((choice-1))]}"
+  name="${link#*\#}"
+  if [[ "$name" == "$link" || -z "$name" ]]; then name="$protocol-socks";
+  else name="$(socks_uri_decode "$name")" || { warn "节点名称编码无效。"; return 1; }; fi
+  read -rp "节点名称 [$name]: " choice || return 0
+  name="${choice:-$name}"
+  read -rp '端口 [自动]: ' port || return 0
+  if [[ -z "$port" ]]; then
+    for ((attempt=0; attempt<100; attempt++)); do
+      port=$((RANDOM % 55536 + 10000))
+      socks_node_port_available "$port" && break
+    done
+  fi
+  socks_node_port_available "$port" || { warn "端口无效或已被使用。"; return 1; }
+  tmp="$(mktemp "$SB_DIR/.socks-node.XXXXXX")" || return 1
+  trap 'rm -f -- "$tmp"' EXIT
+  jq -c --arg id "$id" --arg name "$name" --arg protocol "$protocol" --argjson port "$port" \
+    --arg dns_mode "$dns_mode" --argjson outbound "$outbound" \
+    '.nodes += [{id:$id, name:$name, protocol:$protocol, port:$port, dns_mode:$dns_mode, outbound:$outbound}]' \
+    <<< "$current" > "$tmp" || return 1
+  chmod 600 "$tmp" || return 1
+  apply_socks_nodes "$tmp" "$current"
+)
+
+list_socks_nodes(){
+  local nodes
+  nodes="$(load_socks_nodes)" || return 1
+  if [[ "$(jq '.nodes | length' <<< "$nodes")" == 0 ]]; then info "暂无 SOCKS 出口节点"; return 0; fi
+  jq -r '.nodes | to_entries[] | "\(.key + 1)) \(.value.name) | \(.value.protocol) | \(.value.port)"' <<< "$nodes"
+}
+
+remove_socks_node()(
+  trap - EXIT
+  local current choice count tmp confirm
+  current="$(load_socks_nodes)" || return 1
+  count="$(jq '.nodes | length' <<< "$current")"
+  [[ "$count" != 0 ]] || { info "暂无 SOCKS 出口节点"; return 0; }
+  list_socks_nodes || return 1
+  read -rp '删除节点编号 [0 返回]: ' choice || return 0
+  [[ "${choice:-0}" != 0 ]] || return 0
+  [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= count )) || { warn "节点编号无效。"; return 1; }
+  read -rp '删除该节点并重启运行中的服务？[y/N]: ' confirm || return 0
+  [[ "$confirm" == [yY] ]] || return 0
+  tmp="$(mktemp "$SB_DIR/.socks-node.XXXXXX")" || return 1
+  trap 'rm -f -- "$tmp"' EXIT
+  jq -c --argjson index "$((choice-1))" 'del(.nodes[$index])' <<< "$current" > "$tmp" || return 1
+  chmod 600 "$tmp" || return 1
+  apply_socks_nodes "$tmp" "$current"
+)
+
+socks_nodes_menu(){
+  ensure_installed_or_hint || return 0
+  local choice
+  while :; do
+    hr
+    printf 'SOCKS 出口节点\n1) 导入链接并创建节点\n2) 查看节点\n3) 查看分享链接\n4) 删除节点\n0) 返回\n'
+    read -rp '选择: ' choice || return 0
+    case "$choice" in
+      1) add_socks_node || true ;;
+      2) list_socks_nodes || true ;;
+      3) print_socks_node_links || true ;;
+      4) remove_socks_node || true ;;
+      0|'') return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
 }
 
 # ===== env / creds / warp =====
@@ -2925,22 +3252,30 @@ write_systemd(){
 
 # ===== 写 config.json（使用你提供的稳定配置逻辑） =====
 write_config(){
+  local preserve_warp="${1:-false}"
   ensure_dirs; load_env || true; load_creds || true; load_ports || true
   apply_runtime_overrides
   normalize_runtime_settings
-  ensure_creds; save_all_ports; prepare_tls_certificate || return 1
+  ensure_creds || return 1
+  save_all_ports || return 1
+  prepare_tls_certificate || return 1
   if [[ "$ENABLE_WARP" == "true" ]] && ! ensure_warp_backend; then
+    if [[ "$preserve_warp" == true ]]; then
+      warn "已有 WARP 不可用，保留原节点配置，请先修复 WARP。"
+      return 1
+    fi
     ENABLE_WARP=false
     warn "WARP 当前不可用，本次仅部署 10 个直连节点。"
   fi
 
   local CRT="$TLS_CERT_PATH" KEY="$TLS_KEY_PATH"
-  local ROUTING_JSON BIND4 BIND6 TMP_CONF core_ver supports_1_14=false
+  local ROUTING_JSON SOCKS_NODES BIND4 BIND6 TMP_CONF core_ver supports_1_14=false
   core_ver="$(get_singbox_local_version "$BIN_PATH" 2>/dev/null || true)"
   if [[ -n "$core_ver" ]] && ! version_lt "$core_ver" 1.14.0; then
     supports_1_14=true
   fi
   ROUTING_JSON="$(load_route_json)"
+  SOCKS_NODES="$(load_socks_nodes)" || return 1
   BIND4="$(default_ipv4_address || true)"
   BIND6="$(default_ipv6_address || true)"
   TMP_CONF="$(mktemp "$SB_DIR/config.json.tmp.XXXXXX")" || return 1
@@ -2972,6 +3307,7 @@ write_config(){
   --argjson WR1 "${WARP_RESERVED_1:-0}" --argjson WR2 "${WARP_RESERVED_2:-0}" --argjson WR3 "${WARP_RESERVED_3:-0}" \
   --arg BIND4 "$BIND4" --arg BIND6 "$BIND6" --arg CACHEPATH "$DATA_DIR/cache.db" \
   --argjson CUSTOM_ROUTES "$ROUTING_JSON" \
+  --argjson SOCKS_NODES "$SOCKS_NODES" \
   --argjson SUPPORTS_1_14 "$supports_1_14" \
   '
   def listen_tuning: {tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI, udp_timeout:$UDPT};
@@ -3097,7 +3433,11 @@ write_config(){
     { inbound: ["vless-reality-warp","vless-grpcr-warp","trojan-reality-warp","hy2-warp","vmess-ws-warp","hy2-obfs-warp","ss2022-warp","ss-warp","tuic-v5-warp","anytls-warp"], action:"route", outbound:"warp" };
 
   def route_rules:
-    custom_route_rules + (if warp_ready then [warp_inbound_rule] else [] end);
+    # Pin each extra inbound before global domain/default routing can select another exit.
+    [$SOCKS_NODES.nodes[] |
+      (if .dns_mode == "local" then {inbound:[.id], action:"resolve"} else empty end),
+      {inbound:[.id], action:"route", outbound:.outbound.tag}]
+    + custom_route_rules + (if warp_ready then [warp_inbound_rule] else [] end);
 
   def direct_outbound:
     {type:"direct", tag:"direct", tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI, domain_resolver:"dns-doh-primary"};
@@ -3168,6 +3508,16 @@ write_config(){
       + custom_outbounds),
     route: route_config
   }
+  | .inbounds as $base_inbounds
+  | .inbounds += [$SOCKS_NODES.nodes[] as $node |
+      ($base_inbounds[] | select(.tag == $node.protocol))
+      | .tag = $node.id | .listen_port = $node.port]
+  | .outbounds += [$SOCKS_NODES.nodes[].outbound
+      + {tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI}]
+  | if ([.inbounds[].listen_port] | length != (unique | length))
+      or ([.inbounds[].tag] | length != (unique | length))
+      or ([.outbounds[].tag, .endpoints[].tag] | length != (unique | length)) then
+      error("节点端口或标识与已有配置冲突") else . end
   | if $TLSMODE == "acme" and $SUPPORTS_1_14 then
       .certificate_providers = [acme_provider]
     else . end
@@ -3183,7 +3533,7 @@ write_config(){
     warn "sing-box 配置校验失败，已保留原配置"
     return 1
   fi
-  if ! mv -f "$TMP_CONF" "$CONF_JSON"; then
+  if ! chmod 600 "$TMP_CONF" || ! mv -f "$TMP_CONF" "$CONF_JSON"; then
     rm -f "$TMP_CONF"
     warn "替换 sing-box 配置失败，已保留原配置"
     return 1
@@ -3193,7 +3543,7 @@ write_config(){
 
 # ===== 防火墙 =====
 open_firewall(){
-  local rules=() warp_active=false
+  local rules=() warp_active=false socks_rules r
   load_env || true
   warp_backend_config_ready && warp_active=true
   rules+=("${PORT_VLESSR}/tcp" "${PORT_VLESS_GRPCR}/tcp" "${PORT_TROJANR}/tcp" "${PORT_VMESS_WS}/tcp")
@@ -3204,6 +3554,8 @@ open_firewall(){
     rules+=("${PORT_HY2_W}/udp" "${PORT_HY2_OBFS_W}/udp" "${PORT_TUIC_W}/udp" "${PORT_ANYTLS_W}/tcp")
     rules+=("${PORT_SS2022_W}/tcp" "${PORT_SS2022_W}/udp" "${PORT_SS_W}/tcp" "${PORT_SS_W}/udp")
   fi
+  socks_rules="$(socks_node_firewall_rules)" || return 1
+  while IFS= read -r r; do [[ -z "$r" ]] || rules+=("$r"); done <<< "$socks_rules"
   if [[ "$TLS_CERT_MODE" == acme ]]; then
     [[ "$TLS_ACME_DISABLE_HTTP_CHALLENGE" == false ]] && rules+=("80/tcp")
     [[ "$TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE" == false ]] && rules+=("443/tcp")
@@ -3226,75 +3578,118 @@ open_firewall(){
   fi
 }
 
-# ===== 分享链接（分组输出 + 提示） =====
+# ===== Share links =====
+node_share_link(){
+  local protocol="$1" port="$2" name="$3" ip="$4" tls_host tls_query fragment vmess_json
+  [[ "$ip" != *:* ]] || ip="[$ip]"
+  fragment="$(urlenc "$name")"
+  if [[ "$TLS_CERT_MODE" != self_signed && -n "$TLS_DOMAIN" ]]; then
+    tls_host="$TLS_DOMAIN"; tls_query="insecure=0&sni=$(urlenc "$TLS_DOMAIN")"
+  else
+    tls_host="$ip"; tls_query="insecure=1&sni=$(urlenc "$REALITY_SERVER")"
+  fi
+  case "$protocol" in
+    vless-reality)
+      printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=ios&pbk=%s&sid=%s&type=tcp#%s\n' \
+        "$UUID" "$ip" "$port" "$(urlenc "$REALITY_SERVER")" "$REALITY_PUB" "$REALITY_SID" "$fragment" ;;
+    vless-grpcr)
+      printf 'vless://%s@%s:%s?encryption=none&security=reality&sni=%s&fp=ios&pbk=%s&sid=%s&type=grpc&serviceName=%s#%s\n' \
+        "$UUID" "$ip" "$port" "$(urlenc "$REALITY_SERVER")" "$REALITY_PUB" "$REALITY_SID" "$(urlenc "$GRPC_SERVICE")" "$fragment" ;;
+    trojan-reality)
+      printf 'trojan://%s@%s:%s?security=reality&sni=%s&fp=ios&pbk=%s&sid=%s&type=tcp#%s\n' \
+        "$UUID" "$ip" "$port" "$(urlenc "$REALITY_SERVER")" "$REALITY_PUB" "$REALITY_SID" "$fragment" ;;
+    hy2) printf 'hy2://%s@%s:%s?%s#%s\n' "$(urlenc "$HY2_PWD")" "$tls_host" "$port" "$tls_query" "$fragment" ;;
+    vmess-ws)
+      vmess_json="$(jq -cn --arg name "$name" --arg ip "${ip#[}" --arg port "$port" --arg uuid "$UUID" --arg path "$VMESS_WS_PATH" \
+        '{v:"2",ps:$name,add:($ip | rtrimstr("]")),port:$port,id:$uuid,aid:"0",net:"ws",type:"none",host:"",path:$path,tls:""}')" || return 1
+      printf 'vmess://%s\n' "$(printf '%s' "$vmess_json" | b64enc)" ;;
+    hy2-obfs)
+      printf 'hy2://%s@%s:%s?%s&alpn=h3&obfs=salamander&obfs-password=%s#%s\n' \
+        "$(urlenc "$HY2_PWD2")" "$tls_host" "$port" "$tls_query" "$(urlenc "$HY2_OBFS_PWD")" "$fragment" ;;
+    ss2022) printf 'ss://%s@%s:%s#%s\n' "$(printf '%s' "2022-blake3-aes-256-gcm:$SS2022_KEY" | b64enc)" "$ip" "$port" "$fragment" ;;
+    ss) printf 'ss://%s@%s:%s#%s\n' "$(printf '%s' "aes-256-gcm:$SS_PWD" | b64enc)" "$ip" "$port" "$fragment" ;;
+    tuic-v5)
+      printf 'tuic://%s:%s@%s:%s?congestion_control=bbr&alpn=h3&%s#%s\n' \
+        "$TUIC_UUID" "$(urlenc "$TUIC_PWD")" "$tls_host" "$port" "$tls_query" "$fragment" ;;
+    anytls)
+      printf 'anytls://%s@%s:%s?%s&alpn=h2,http/1.1&fp=ios#%s\n' \
+        "$(urlenc "$ANYTLS_PWD")" "$tls_host" "$port" "$tls_query" "$fragment" ;;
+    *) return 1 ;;
+  esac
+}
+
+print_socks_node_links(){
+  local nodes ip tmp node protocol port name link count
+  load_env; load_creds || return 1
+  nodes="$(load_socks_nodes)" || return 1
+  count="$(jq '.nodes | length' <<< "$nodes")"
+  if [[ "$count" == 0 && ! -e "$SOCKS_SHARE_LINKS_FILE" ]]; then return 0; fi
+  mkdir -p "$(dirname "$SOCKS_SHARE_LINKS_FILE")" || return 1
+  tmp="$(mktemp "${SOCKS_SHARE_LINKS_FILE}.tmp.XXXXXX")" || return 1
+  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  ip="$(get_ip)"
+  while IFS= read -r node; do
+    protocol="$(jq -r '.protocol' <<< "$node")"; port="$(jq -r '.port' <<< "$node")"
+    name="$(jq -r '.name' <<< "$node")"
+    if ! link="$(node_share_link "$protocol" "$port" "$name" "$ip")" \
+        || ! printf '%s\n' "$link" >> "$tmp"; then rm -f -- "$tmp"; return 1; fi
+  done < <(jq -c '.nodes[]' <<< "$nodes")
+  mv -f -- "$tmp" "$SOCKS_SHARE_LINKS_FILE" || { rm -f -- "$tmp"; return 1; }
+  [[ "$count" != 0 ]] || return 0
+  hr
+  printf '【SOCKS 出口节点（%s）】\n' "$count"
+  while IFS= read -r link; do printf '  %s\n' "$link"; done < "$SOCKS_SHARE_LINKS_FILE"
+  info "SOCKS 节点链接：$SOCKS_SHARE_LINKS_FILE"
+}
+
 print_links_grouped(){
   load_env; load_creds; load_ports
   local ip; ip=$(get_ip)
-  local tls_host tls_security_query tls_tip links_tmp l
+  local tls_tip links_tmp l
   local warp_active=false link_count=10
-  local links_direct=() links_warp=()
+  local links_direct=() links_warp=() protocol port_var link_name index
+  local protocols=(vless-reality vless-grpcr trojan-reality hy2 vmess-ws hy2-obfs ss2022 ss tuic-v5 anytls)
+  local port_vars=(PORT_VLESSR PORT_VLESS_GRPCR PORT_TROJANR PORT_HY2 PORT_VMESS_WS PORT_HY2_OBFS PORT_SS2022 PORT_SS PORT_TUIC PORT_ANYTLS)
+  local link_names=(vless-reality vless-grpc-reality trojan-reality hysteria2 vmess-ws hysteria2-obfs ss2022 ss tuic-v5 anytls)
   if warp_backend_config_ready; then
     warp_active=true
     link_count=20
   fi
   if [[ "$TLS_CERT_MODE" != "self_signed" && -n "$TLS_DOMAIN" ]]; then
-    tls_host="$TLS_DOMAIN"
-    tls_security_query="insecure=0&sni=$(urlenc "$TLS_DOMAIN")"
     if tls_uses_public_certificate; then
       tls_tip="Hysteria2 / TUIC / AnyTLS 已使用公开有效证书并校验证书"
     else
       tls_tip="证书当前无法通过公开 CA 校验；导入链接仍保持安全校验，修复证书前连接会失败"
     fi
   else
-    tls_host="$ip"
-    tls_security_query="insecure=1&sni=$(urlenc "$REALITY_SERVER")"
     tls_tip="Hysteria2 / TUIC / AnyTLS 使用自签证书并已允许跳过证书验证"
   fi
-  # 直连10
-  links_direct+=("vless://${UUID}@${ip}:${PORT_VLESSR}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality")
-  links_direct+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality")
-  links_direct+=("trojan://${UUID}@${ip}:${PORT_TROJANR}?security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality")
-  links_direct+=("hy2://$(urlenc "${HY2_PWD}")@${tls_host}:${PORT_HY2}?${tls_security_query}#hysteria2")
-  local VMESS_JSON; VMESS_JSON=$(cat <<JSON
-{"v":"2","ps":"vmess-ws","add":"${ip}","port":"${PORT_VMESS_WS}","id":"${UUID}","aid":"0","net":"ws","type":"none","host":"","path":"${VMESS_WS_PATH}","tls":""}
-JSON
-  )
-  links_direct+=("vmess://$(printf "%s" "$VMESS_JSON" | b64enc)")
-  links_direct+=("hy2://$(urlenc "${HY2_PWD2}")@${tls_host}:${PORT_HY2_OBFS}?${tls_security_query}&alpn=h3&obfs=salamander&obfs-password=$(urlenc "${HY2_OBFS_PWD}")#hysteria2-obfs")
-  links_direct+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022}#ss2022")
-  links_direct+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS}#ss")
-  links_direct+=("tuic://${UUID}:$(urlenc "${UUID}")@${tls_host}:${PORT_TUIC}?congestion_control=bbr&alpn=h3&${tls_security_query}#tuic-v5")
-  links_direct+=("anytls://$(urlenc "${ANYTLS_PWD}")@${tls_host}:${PORT_ANYTLS}?${tls_security_query}&alpn=h2,http/1.1&fp=ios#anytls")
-
-  if [[ "$warp_active" == true ]]; then
-    links_warp+=("vless://${UUID}@${ip}:${PORT_VLESSR_W}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality-warp")
-    links_warp+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR_W}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality-warp")
-    links_warp+=("trojan://${UUID}@${ip}:${PORT_TROJANR_W}?security=reality&sni=${REALITY_SERVER}&fp=ios&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality-warp")
-    links_warp+=("hy2://$(urlenc "${HY2_PWD}")@${tls_host}:${PORT_HY2_W}?${tls_security_query}#hysteria2-warp")
-    local VMESS_JSON_W; VMESS_JSON_W=$(cat <<JSON
-{"v":"2","ps":"vmess-ws-warp","add":"${ip}","port":"${PORT_VMESS_WS_W}","id":"${UUID}","aid":"0","net":"ws","type":"none","host":"","path":"${VMESS_WS_PATH}","tls":""}
-JSON
-    )
-    links_warp+=("vmess://$(printf "%s" "$VMESS_JSON_W" | b64enc)")
-    links_warp+=("hy2://$(urlenc "${HY2_PWD2}")@${tls_host}:${PORT_HY2_OBFS_W}?${tls_security_query}&alpn=h3&obfs=salamander&obfs-password=$(urlenc "${HY2_OBFS_PWD}")#hysteria2-obfs-warp")
-    links_warp+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022_W}#ss2022-warp")
-    links_warp+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS_W}#ss-warp")
-    links_warp+=("tuic://${UUID}:$(urlenc "${UUID}")@${tls_host}:${PORT_TUIC_W}?congestion_control=bbr&alpn=h3&${tls_security_query}#tuic-v5-warp")
-    links_warp+=("anytls://$(urlenc "${ANYTLS_PWD}")@${tls_host}:${PORT_ANYTLS_W}?${tls_security_query}&alpn=h2,http/1.1&fp=ios#anytls-warp")
-  fi
+  for index in "${!protocols[@]}"; do
+    protocol="${protocols[$index]}"; port_var="${port_vars[$index]}"; link_name="${link_names[$index]}"
+    l="$(node_share_link "$protocol" "${!port_var}" "$link_name" "$ip")" || return 1
+    links_direct+=("$l")
+    if [[ "$warp_active" == true ]]; then
+      port_var="${port_var}_W"
+      l="$(node_share_link "$protocol" "${!port_var}" "$link_name-warp" "$ip")" || return 1
+      links_warp+=("$l")
+    fi
+  done
 
   mkdir -p "$(dirname "$SHARE_LINKS_FILE")"
   links_tmp="$(mktemp "${SHARE_LINKS_FILE}.tmp.XXXXXX")" || {
     warn "无法创建导入链接临时文件"
     return 1
   }
-  {
+  if ! {
     printf '%s\n' "${links_direct[@]}"
     if [[ "$warp_active" == true ]]; then
       printf '%s\n' "${links_warp[@]}"
     fi
-  } > "$links_tmp"
-  chmod 600 "$links_tmp"
+  } > "$links_tmp" || ! chmod 600 "$links_tmp"; then
+    rm -f -- "$links_tmp"
+    warn "无法保存导入链接文件"
+    return 1
+  fi
   if ! mv -f "$links_tmp" "$SHARE_LINKS_FILE"; then
     rm -f "$links_tmp"
     warn "无法更新导入链接文件：$SHARE_LINKS_FILE"
@@ -3316,6 +3711,7 @@ JSON
   echo -e "${C_DIM}提示：${tls_tip}；客户端如不识别 AnyTLS 链接，可手动按域名、端口、SNI 和密码添加${C_RESET}"
   hr
   info "导入链接已更新：$SHARE_LINKS_FILE"
+  print_socks_node_links
 }
 
 # ===== 自定义路由菜单 =====
@@ -4390,6 +4786,24 @@ show_service_status(){
   else
     echo -e "  ${C_YELLOW}[WARP 未就绪：相关端口未启用]${C_RESET}"
   fi
+  if [[ -f "$SOCKS_NODES_JSON" ]]; then
+    local socks_nodes socks_name socks_protocol socks_port socks_network
+    if socks_nodes="$(load_socks_nodes)"; then
+      if [[ "$(jq '.nodes | length' <<< "$socks_nodes")" != 0 ]]; then
+        printf '  [SOCKS 出口节点]\n'
+        while IFS=$'\t' read -r socks_name socks_protocol socks_port; do
+          case "$socks_protocol" in
+            hy2|hy2-obfs|tuic-v5) socks_network=udp ;;
+            ss2022|ss) socks_network=tcp/udp ;;
+            *) socks_network=tcp ;;
+          esac
+          printf '    %s (%s) : %b\n' "$socks_name" "$socks_protocol" "$(check_port_status "$socks_port" "$socks_network")"
+        done < <(jq -r '.nodes[] | [.name, .protocol, .port] | @tsv' <<< "$socks_nodes" | tr -d '\r')
+      fi
+    else
+      warn "SOCKS 节点文件无效"
+    fi
+  fi
 
   # 4. DNS 与健康检查
   echo
@@ -4487,6 +4901,7 @@ banner(){
   echo -e "    ${C_GREEN}6)${C_RESET} 域名、证书与 SNI 设置"
   echo -e "    ${C_GREEN}7)${C_RESET} 自定义路由与分流规则"
   echo -e "    ${C_GREEN}8)${C_RESET} 一键开启 BBR 加速"
+  echo -e "   ${C_GREEN}15)${C_RESET} SOCKS 出口节点（可选）"
   echo
   echo -e "  ${C_BOLD}【核心与规则维护】${C_RESET}"
   echo -e "    ${C_YELLOW}9)${C_RESET} 更新 sing-box 核心版本"
@@ -4722,6 +5137,9 @@ uninstall_all(){
   for p in "${PORT_SS2022:-}" "${PORT_SS:-}" "${PORT_SS2022_W:-}" "${PORT_SS_W:-}"; do
     [[ -n "$p" ]] && rules+=("${p}/tcp" "${p}/udp")
   done
+  local socks_rules r
+  socks_rules="$(socks_node_firewall_rules)" || socks_rules=""
+  while IFS= read -r r; do [[ -z "$r" ]] || rules+=("$r"); done <<< "$socks_rules"
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q -E "active|活跃"; then
     for r in "${rules[@]}"; do ufw delete allow "$r" >/dev/null 2>&1 || true; done
@@ -5393,6 +5811,8 @@ usage(){
   sudo bash sbp.sh --repair-warp  获取或修复 WARP 配置（成功后会重启 sing-box）
   sudo bash sbp.sh --migrate-warp-profile /root/wgcf-profile.conf
                                  导入 WireGuard profile，验证并切换低内存 WARP 出口
+  sudo bash sbp.sh --socks-nodes  管理可选 SOCKS 出口节点
+  sudo bash sbp.sh --socks-links  单独打印 SOCKS 出口节点分享链接
   sudo bash sbp.sh --uninstall   彻底卸载 Sing-Box-Plus
   bash sbp.sh --help             显示本帮助
 
@@ -5458,6 +5878,7 @@ menu(){
     12) run_diagnostics; read -rp "回车返回..." _ || true; menu ;;
     13) repair_warp; read -rp "回车返回..." _ || true; menu ;;
     14) uninstall_all ;;
+    15) socks_nodes_menu; menu ;;
     0|q|Q) exit 0 ;;
     *) echo -e "${C_YELLOW}无效选项，请重新选择${C_RESET}"; sleep 1; menu ;;
   esac
@@ -5474,6 +5895,8 @@ main(){
     --update-script) update_script_from_remote ;;
     --reissue-cert) reissue_managed_certificate ;;
     --repair-warp) repair_warp ;;
+    --socks-nodes) socks_nodes_menu ;;
+    --socks-links) ensure_installed_or_hint && print_socks_node_links ;;
     --migrate-warp-profile)
       if [[ $# -ne 2 ]]; then
         usage >&2
