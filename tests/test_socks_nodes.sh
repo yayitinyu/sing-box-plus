@@ -148,9 +148,11 @@ socks5h://test:secret@proxy.example.com:1080#%E6%A1%9C
 1
 
 13001
+n
 EOF
 assert_json "$SOCKS_NODES_JSON" '.nodes | length == 1' 'interactive creation persists one node'
 assert_json "$SOCKS_NODES_JSON" '.nodes[0].name == "桜" and .nodes[0].dns_mode == "remote" and .nodes[0].protocol == "vless-reality"' 'protocol and SOCKS5H import'
+assert_json "$SOCKS_NODES_JSON" '.nodes[0].system_ipv6 == false' 'system IPv6 is opt-in'
 assert_equal "$main_links_hash" "$(hash "$SHARE_LINKS_FILE")" 'extra nodes must not modify the normal link file'
 assert_equal 1 "$(wc -l < "$SOCKS_SHARE_LINKS_FILE" | tr -d ' ')" 'separate link file'
 grep -Fq '#%E6%A1%9C' "$SOCKS_SHARE_LINKS_FILE"
@@ -199,6 +201,48 @@ assert_equal 12 "$(wc -l < "$test_root/firewall.rules" | tr -d ' ')" 'TCP/UDP fi
 grep -Fxq '13005/tcp' "$test_root/firewall.rules"
 grep -Fxq '13004/udp' "$test_root/firewall.rules"
 
+# Existing files without the new field stay valid. Enabling IPv6 changes only one exit.
+(
+  cp "$SOCKS_NODES_JSON" "$test_root/ipv6-original-nodes.json"
+  cp "$CONF_JSON" "$test_root/ipv6-original-config.json"
+  trap 'cp "$test_root/ipv6-original-nodes.json" "$SOCKS_NODES_JSON"; cp "$test_root/ipv6-original-config.json" "$CONF_JSON"' EXIT
+  default_ipv6_address(){ printf '%s\n' '2001:db8::2'; }
+  links_hash=$(hash "$SOCKS_SHARE_LINKS_FILE")
+  configure_socks_node_ipv6 > "$test_root/ipv6-enable.log" 2>&1 <<'EOF'
+1
+2
+EOF
+  assert_json "$SOCKS_NODES_JSON" '.nodes[0].system_ipv6 == true and .nodes[0].dns_mode == "remote" and all(.nodes[1:][]; .system_ipv6 != true)' 'enable IPv6 for only the selected legacy node'
+  assert_json "$CONF_JSON" '[.route.rules[] | select(.inbound == ["'"$(jq -r '.nodes[0].id' "$SOCKS_NODES_JSON")"'"])] |
+    length == 5 and .[0].action == "resolve" and .[0].strategy == "prefer_ipv4"
+    and .[1].action == "resolve" and .[1].strategy == "ipv4_only"
+    and .[2].ip_cidr == ["0.0.0.0/0"] and .[2].outbound != "sbp-socks-ipv6"
+    and .[3].ip_cidr == ["::/0"] and .[3].outbound == "sbp-socks-ipv6"' 'resolve SOCKS5H locally and select IPv4 before IPv6'
+  assert_json "$CONF_JSON" 'any(.outbounds[]; .tag == "sbp-socks-ipv6" and .inet6_bind_address == "2001:db8::2" and .domain_resolver.strategy == "ipv6_only")' 'bind the system IPv6 route source, including tunnels'
+  assert_equal "$links_hash" "$(hash "$SOCKS_SHARE_LINKS_FILE")" 'IPv6 mode retains credentials, endpoint and port'
+  enabled_state=$(load_socks_nodes) enabled_hash=$(hash "$SOCKS_NODES_JSON") enabled_config_hash=$(hash "$CONF_JSON")
+  jq '.nodes[0].system_ipv6 = false' "$SOCKS_NODES_JSON" > "$test_root/ipv6-disable.json"
+  touch "$test_root/fail-restart-once"
+  if apply_socks_nodes "$test_root/ipv6-disable.json" "$enabled_state" > "$test_root/ipv6-rollback.log" 2>&1; then
+    echo 'FAIL: IPv6 mode change must roll back on restart failure' >&2; exit 1
+  fi
+  assert_equal "$enabled_hash" "$(hash "$SOCKS_NODES_JSON")" 'failed mode change restores the IPv6 switch'
+  assert_equal "$enabled_config_hash" "$(hash "$CONF_JSON")" 'failed mode change restores IPv6 routing'
+  configure_socks_node_ipv6 > "$test_root/ipv6-disable.log" 2>&1 <<'EOF'
+1
+1
+EOF
+  assert_json "$CONF_JSON" '.route.rules[0].action == "route" and all(.outbounds[]; .tag != "sbp-socks-ipv6")' 'disabling restores SOCKS5H DNS and removes unused IPv6 outbound'
+  current=$(load_socks_nodes) previous_hash=$(hash "$SOCKS_NODES_JSON") previous_config_hash=$(hash "$CONF_JSON")
+  default_ipv6_address(){ :; }
+  jq '.nodes[0].system_ipv6 = true' "$SOCKS_NODES_JSON" > "$test_root/ipv6-unavailable.json"
+  if apply_socks_nodes "$test_root/ipv6-unavailable.json" "$current" > "$test_root/ipv6-unavailable.log" 2>&1; then
+    echo 'FAIL: missing system IPv6 route must reject activation' >&2; exit 1
+  fi
+  assert_equal "$previous_hash" "$(hash "$SOCKS_NODES_JSON")" 'missing IPv6 route preserves node state'
+  assert_equal "$previous_config_hash" "$(hash "$CONF_JSON")" 'missing IPv6 route preserves active config'
+)
+
 # Reallocation must reserve existing extras and every newly generated base port.
 (
   cp "$SB_DIR/ports.env" "$test_root/original-ports.env"
@@ -244,7 +288,8 @@ if apply_socks_nodes "$test_root/invalid.json" "$current" > "$test_root/invalid.
 assert_equal "$state_hash" "$(hash "$SOCKS_NODES_JSON")" 'invalid candidates preserve state'
 assert_equal "$config_hash" "$(hash "$CONF_JSON")" 'invalid candidates preserve config'
 for invalid_filter in '.nodes[0].outbound.server = ""' '.nodes[0].outbound.password = ("a" * 256)' \
-    '.nodes[0].name = "bad\u000aname"' '.nodes[0].protocol = "unknown"'; do
+    '.nodes[0].name = "bad\u000aname"' '.nodes[0].protocol = "unknown"' \
+    '.nodes[0].system_ipv6 = "true"' '.nodes[0].system_ipv6 = null'; do
   jq "$invalid_filter" "$SOCKS_NODES_JSON" > "$test_root/invalid.json"
   if validate_socks_nodes "$test_root/invalid.json" >/dev/null 2>&1; then echo 'FAIL: malformed node accepted' >&2; exit 1; fi
 done
@@ -305,9 +350,12 @@ if [[ -n "${SBP_REAL_SING_BOX_BIN:-}" ]]; then
     cp "$SOCKS_NODES_JSON" "$test_root/probe-original-nodes.json"
     cp "$CONF_JSON" "$test_root/probe-original-config.json"
     trap 'cp "$test_root/probe-original-nodes.json" "$SOCKS_NODES_JSON"; cp "$test_root/probe-original-config.json" "$CONF_JSON"' EXIT
-    jq '.nodes += [(.nodes[] | select(.protocol == "ss") |
-      .id = "sbp-socks-eeeeeeeeeeeeeeee" | .outbound.tag = (.id + "-out") |
-      .port = 13999 | .dns_mode = "remote")]' "$SOCKS_NODES_JSON" > "$test_root/probe-nodes.json"
+    default_ipv6_address(){ printf '%s\n' '::1'; }
+    jq '(.nodes[] | select(.protocol == "ss")) as $node |
+      .nodes += [($node | .id = "sbp-socks-eeeeeeeeeeeeeeee" | .port = 13999 | .dns_mode = "remote"),
+        ($node | .id = "sbp-socks-dddddddddddddddd" | .port = 13998 | .system_ipv6 = true),
+        ($node | .id = "sbp-socks-cccccccccccccccc" | .port = 13997 | .dns_mode = "remote" | .system_ipv6 = true)] |
+      .nodes |= map(.outbound.tag = (.id + "-out"))' "$SOCKS_NODES_JSON" > "$test_root/probe-nodes.json"
     cp "$test_root/probe-nodes.json" "$SOCKS_NODES_JSON"
     write_config
     "$probe_python" "$repo_root/tests/socks_node_probe.py" "$BIN_PATH" "$CONF_JSON" "$test_root"
@@ -338,4 +386,4 @@ case "$(uname -s)" in
     assert_equal 600 "$(stat -c '%a' "$SOCKS_SHARE_LINKS_FILE")" 'extra links must be root-only'
     ;;
 esac
-printf 'PASS: optional SOCKS nodes, protocol inheritance, separate shares, validation and rollback\n'
+printf 'PASS: optional SOCKS nodes, system IPv6, protocol inheritance, separate shares, validation and rollback\n'

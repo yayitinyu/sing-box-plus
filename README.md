@@ -117,7 +117,7 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 
 ```text
 =============================================================
- 🚀 Sing-Box-Plus 管理脚本 v3.6.0 🚀
+ 🚀 Sing-Box-Plus 管理脚本 v3.7.0 🚀
  脚本更新地址: https://github.com/yayitinyu/sing-box-plus
 =============================================================
   服务状态: 运行中 (Active)  |  核心版本: sing-box v1.14.2
@@ -211,7 +211,9 @@ socks5h://username:password@proxy.example.com:1080#my-node
 socks5h://username:p%40ss%3Aword@[2001:db8::1]:1080
 ```
 
-额外节点继承当前证书模式、证书域名、Reality SNI、协议凭证、gRPC / WebSocket 参数和连接调优设置。`socks5://` 使用本机当前 DNS 配置解析目标域名；`socks5h://` 将客户端提供的目标域名交给上游 SOCKS 解析。客户端已经发送 IP 地址时，SOCKS5H 会直接转发该 IP。额外节点的路由优先于全局分流规则，流量固定走导入的 SOCKS 出口；上游不可用时连接失败。
+额外节点继承当前证书模式、证书域名、Reality SNI、协议凭证、gRPC / WebSocket 参数和连接调优设置。默认全部流量走导入的 SOCKS 出口；`socks5://` 使用本机当前 DNS 配置解析目标域名，`socks5h://` 将客户端提供的目标域名交给上游 SOCKS 解析。客户端已经发送 IP 地址时，SOCKS5H 会直接转发该 IP。额外节点的路由优先于全局分流规则；SOCKS 不可用时，其 IPv4 流量连接失败。
+
+导入时可选择启用 **系统 IPv6 出口（IPv4 优先）**，也可通过管理入口 `5) 配置系统 IPv6 出口` 修改已有节点。开启后，IPv4 和有 A 记录的双栈域名走 SOCKS；IPv6 地址和只有 AAAA 记录的域名走系统 IPv6。IPv6 出口使用系统当前路由选出的源地址，支持原生 IPv6 和 Route64 / HE 等隧道。IPv4 连接失败不会切换为本机出口；客户端已经发送 IPv6 地址时按 IPv6 路由。此模式下，包括 SOCKS5H 在内的目标域名均由本机当前 DNS 解析，IPv6 访问会使用本机或隧道的出口地址。系统没有 IPv6 出口路由时拒绝启用，隧道不可用时 IPv6 连接失败。原有节点默认关闭此选项，端口、凭证和分享链接保持不变。
 
 SOCKS 节点分享链接在全部常规链接之后单独打印，并保存在 `/opt/sing-box/socks-share-links.txt`，不写入常规的 `share-links.txt`。修改证书或 SNI 后会同步刷新。也可以只输出这些链接：
 
@@ -219,7 +221,7 @@ SOCKS 节点分享链接在全部常规链接之后单独打印，并保存在 `
 sudo /root/sbp.sh --socks-links
 ```
 
-`sudo /root/sbp.sh --socks-nodes` 可直接打开管理入口，支持添加多个节点、查看和删除。创建或删除会校验配置并重启当前运行中的 sing-box；失败时恢复原配置。凭证和链接文件权限为 `600`，操作备份保存在 `/opt/sing-box/backups/socks-nodes-*`。此功能默认关闭，无需修改原来的直连 / WARP 节点；UDP 转发取决于上游 SOCKS 是否支持 UDP ASSOCIATE。
+`sudo /root/sbp.sh --socks-nodes` 可直接打开管理入口，支持添加多个节点、查看、配置 IPv6 和删除。创建、修改或删除会校验配置并重启当前运行中的 sing-box；失败时恢复原配置。凭证和链接文件权限为 `600`，操作备份保存在 `/opt/sing-box/backups/socks-nodes-*`。此功能默认关闭，无需修改原来的直连 / WARP 节点；经 SOCKS 的 UDP 转发取决于上游是否支持 UDP ASSOCIATE，系统 IPv6 UDP 使用本机出口。
 
 ### 直连节点（10 个）
 

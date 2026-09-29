@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（直连 10 + WARP 就绪时额外 10）
-#  Version: v3.6.0
+#  Version: v3.7.0
 # ============================================================
 
 set -Eeuo pipefail
@@ -307,7 +307,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.6.0"
+SCRIPT_VERSION="v3.7.0"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -716,10 +716,13 @@ validate_socks_nodes(){
     | if type != "object" or (keys != ["nodes"]) or (.nodes | type) != "array" then
         error("SOCKS 节点文件格式无效") else . end
     | if all(.nodes[];
-        type == "object" and (keys == ["dns_mode","id","name","outbound","port","protocol"])
+        type == "object"
+        and ((keys - ["dns_mode","id","name","outbound","port","protocol","system_ipv6"]) | length == 0)
+        and ((["dns_mode","id","name","outbound","port","protocol"] - keys) | length == 0)
         and (.id | type == "string" and test("^sbp-socks-[a-f0-9]{16}$"))
         and (.name | text and length > 0 and length <= 80)
         and (.port | port) and (.protocol | protocol) and (.dns_mode | IN("local","remote"))
+        and (if has("system_ipv6") then (.system_ipv6 | type == "boolean") else true end)
         and (.outbound | type == "object")
         and ((.outbound | keys) - ["domain_resolver","password","server","server_port","tag","type","username","version"] | length == 0)
         and .outbound.type == "socks" and .outbound.version == "5"
@@ -877,7 +880,7 @@ apply_socks_nodes()(
 
 add_socks_node()(
   trap - EXIT
-  local link protocol name port id outbound current tmp dns_mode=local attempt
+  local link protocol name port id outbound current tmp dns_mode=local system_ipv6=false attempt
   local -a protocols=(vless-reality vless-grpcr trojan-reality hy2 vmess-ws hy2-obfs ss2022 ss tuic-v5 anytls)
   ensure_installed_or_hint || return 1
   load_env; load_ports || return 1
@@ -909,11 +912,20 @@ add_socks_node()(
     done
   fi
   socks_node_port_available "$port" || { warn "端口无效或已被使用。"; return 1; }
+  printf '系统 IPv6 使用本机出口，目标域名由本机解析。\n'
+  read -rp '启用系统 IPv6 出口（IPv4 优先）？[y/N]: ' choice || return 0
+  case "$choice" in
+    y|Y)
+      [[ -n "$(default_ipv6_address)" ]] || { warn "系统没有可用的 IPv6 出口路由。"; return 1; }
+      system_ipv6=true ;;
+    n|N|'') ;;
+    *) warn "IPv6 选项无效。"; return 1 ;;
+  esac
   tmp="$(mktemp "$SB_DIR/.socks-node.XXXXXX")" || return 1
   trap 'rm -f -- "$tmp"' EXIT
   jq -c --arg id "$id" --arg name "$name" --arg protocol "$protocol" --argjson port "$port" \
-    --arg dns_mode "$dns_mode" --argjson outbound "$outbound" \
-    '.nodes += [{id:$id, name:$name, protocol:$protocol, port:$port, dns_mode:$dns_mode, outbound:$outbound}]' \
+    --arg dns_mode "$dns_mode" --argjson system_ipv6 "$system_ipv6" --argjson outbound "$outbound" \
+    '.nodes += [{id:$id, name:$name, protocol:$protocol, port:$port, dns_mode:$dns_mode, system_ipv6:$system_ipv6, outbound:$outbound}]' \
     <<< "$current" > "$tmp" || return 1
   chmod 600 "$tmp" || return 1
   apply_socks_nodes "$tmp" "$current"
@@ -923,8 +935,43 @@ list_socks_nodes(){
   local nodes
   nodes="$(load_socks_nodes)" || return 1
   if [[ "$(jq '.nodes | length' <<< "$nodes")" == 0 ]]; then info "暂无 SOCKS 出口节点"; return 0; fi
-  jq -r '.nodes | to_entries[] | "\(.key + 1)) \(.value.name) | \(.value.protocol) | \(.value.port)"' <<< "$nodes"
+  jq -r '.nodes | to_entries[] | "\(.key + 1)) \(.value.name) | \(.value.protocol) | \(.value.port)" +
+    (if .value.system_ipv6 == true then " | 系统 IPv6" else "" end)' <<< "$nodes"
 }
+
+configure_socks_node_ipv6()(
+  trap - EXIT
+  local current choice count index enabled=false tmp
+  ensure_installed_or_hint || return 1
+  current="$(load_socks_nodes)" || return 1
+  count="$(jq '.nodes | length' <<< "$current")"
+  [[ "$count" != 0 ]] || { info "暂无 SOCKS 出口节点"; return 0; }
+  list_socks_nodes || return 1
+  read -rp '节点编号 [0 返回]: ' choice || return 0
+  [[ "${choice:-0}" != 0 ]] || return 0
+  [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= count )) || { warn "节点编号无效。"; return 1; }
+  index=$((choice-1))
+  if [[ "$(jq -r --argjson index "$index" '.nodes[$index].system_ipv6 // false' <<< "$current")" == true ]]; then
+    choice=2
+  else choice=1; fi
+  printf '1) 仅 SOCKS\n2) SOCKS IPv4 + 系统 IPv6（IPv4 优先）\n'
+  printf '系统 IPv6 使用本机出口，目标域名由本机解析。\n'
+  local selection
+  read -rp "出口模式 [$choice]: " selection || return 0
+  case "${selection:-$choice}" in
+    1) ;;
+    2)
+      [[ -n "$(default_ipv6_address)" ]] || { warn "系统没有可用的 IPv6 出口路由。"; return 1; }
+      enabled=true ;;
+    *) warn "出口模式无效。"; return 1 ;;
+  esac
+  tmp="$(mktemp "$SB_DIR/.socks-node.XXXXXX")" || return 1
+  trap 'rm -f -- "$tmp"' EXIT
+  jq -c --argjson index "$index" --argjson enabled "$enabled" \
+    '.nodes[$index].system_ipv6 = $enabled' <<< "$current" > "$tmp" || return 1
+  chmod 600 "$tmp" || return 1
+  apply_socks_nodes "$tmp" "$current"
+)
 
 remove_socks_node()(
   trap - EXIT
@@ -950,13 +997,14 @@ socks_nodes_menu(){
   local choice
   while :; do
     hr
-    printf 'SOCKS 出口节点\n1) 导入链接并创建节点\n2) 查看节点\n3) 查看分享链接\n4) 删除节点\n0) 返回\n'
+    printf 'SOCKS 出口节点\n1) 导入链接并创建节点\n2) 查看节点\n3) 查看分享链接\n4) 删除节点\n5) 配置系统 IPv6 出口\n0) 返回\n'
     read -rp '选择: ' choice || return 0
     case "$choice" in
       1) add_socks_node || true ;;
       2) list_socks_nodes || true ;;
       3) print_socks_node_links || true ;;
       4) remove_socks_node || true ;;
+      5) configure_socks_node_ipv6 || true ;;
       0|'') return 0 ;;
       *) warn "无效选项" ;;
     esac
@@ -3278,6 +3326,10 @@ write_config(){
   SOCKS_NODES="$(load_socks_nodes)" || return 1
   BIND4="$(default_ipv4_address || true)"
   BIND6="$(default_ipv6_address || true)"
+  if jq -e 'any(.nodes[]; .system_ipv6 == true)' <<< "$SOCKS_NODES" >/dev/null && [[ -z "$BIND6" ]]; then
+    warn "SOCKS 节点启用了系统 IPv6，但系统没有可用的 IPv6 出口路由。"
+    return 1
+  fi
   TMP_CONF="$(mktemp "$SB_DIR/config.json.tmp.XXXXXX")" || return 1
   if ! jq -n \
   --arg RS "$REALITY_SERVER" --argjson RSP "${REALITY_SERVER_PORT:-443}" --arg UID "$UUID" \
@@ -3435,7 +3487,14 @@ write_config(){
   def route_rules:
     # Pin each extra inbound before global domain/default routing can select another exit.
     [$SOCKS_NODES.nodes[] |
-      (if .dns_mode == "local" then {inbound:[.id], action:"resolve"} else empty end),
+      (if .system_ipv6 == true then
+        {inbound:[.id], action:"resolve", strategy:"prefer_ipv4"},
+        # CIDR rules also match resolved addresses; ip_version alone does not match resolved domains.
+        # Match IPv4 first so an AAAA record cannot steal a dual-stack domain from SOCKS.
+        {inbound:[.id], ip_cidr:["0.0.0.0/0"], action:"resolve", strategy:"ipv4_only"},
+        {inbound:[.id], ip_cidr:["0.0.0.0/0"], action:"route", outbound:.outbound.tag},
+        {inbound:[.id], ip_cidr:["::/0"], action:"route", outbound:"sbp-socks-ipv6"}
+      elif .dns_mode == "local" then {inbound:[.id], action:"resolve"} else empty end),
       {inbound:[.id], action:"route", outbound:.outbound.tag}]
     + custom_route_rules + (if warp_ready then [warp_inbound_rule] else [] end);
 
@@ -3451,6 +3510,11 @@ write_config(){
     ({type:"direct", tag:"direct-ipv6", tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI,
       domain_resolver:{server:"dns-doh-primary", strategy:"ipv6_only"}}
       + (if $BIND6 != "" then {inet6_bind_address:$BIND6, bind_address_no_port:true} else {} end));
+
+  def socks_ipv6_outbound:
+    # Keep node-specific IPv6 independent of the global custom routing targets.
+    direct_outbound + {tag:"sbp-socks-ipv6", inet6_bind_address:$BIND6,
+      domain_resolver:{server:"dns-doh-primary", strategy:"ipv6_only"}};
 
   def resolved_final_outbound:
     ($CUSTOM_ROUTES.default_outbound // "direct") as $target
@@ -3505,6 +3569,7 @@ write_config(){
       + (if warp_proxy_ready then [warp_proxy_outbound] else [] end)
       + (if custom_uses_outbound("direct-ipv4") then [direct_ipv4_outbound] else [] end)
       + (if custom_uses_outbound("direct-ipv6") then [direct_ipv6_outbound] else [] end)
+      + (if any($SOCKS_NODES.nodes[]; .system_ipv6 == true) then [socks_ipv6_outbound] else [] end)
       + custom_outbounds),
     route: route_config
   }

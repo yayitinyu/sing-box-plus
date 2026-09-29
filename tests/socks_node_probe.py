@@ -1,6 +1,7 @@
 """Exercise generated Shadowsocks -> SOCKS routes without external services."""
 
 import copy
+import ipaddress
 import json
 import socket
 import socketserver
@@ -20,6 +21,20 @@ def receive(sock, length):
             raise EOFError("Unexpected end of proxy handshake")
         result.extend(chunk)
     return bytes(result)
+
+
+def serve_http(sock, body):
+    request = bytearray()
+    while b"\r\n\r\n" not in request:
+        request.extend(receive(sock, 1))
+        if len(request) > 8192:
+            raise AssertionError("Oversized HTTP probe")
+    sock.sendall(
+        b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: "
+        + str(len(body)).encode()
+        + b"\r\n\r\n"
+        + body
+    )
 
 
 class SocksUpstream(socketserver.BaseRequestHandler):
@@ -49,19 +64,22 @@ class SocksUpstream(socketserver.BaseRequestHandler):
             raise AssertionError("Unexpected SOCKS address type")
         port = struct.unpack("!H", receive(self.request, 2))[0]
         self.server.destinations.append((address_type, address, port))
+        if port == self.server.reject_port:
+            self.request.sendall(b"\x05\x05\x00\x01\x7f\x00\x00\x01\x00\x00")
+            return
         self.request.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50")
-        request = bytearray()
-        while b"\r\n\r\n" not in request:
-            request.extend(receive(self.request, 1))
-            if len(request) > 8192:
-                raise AssertionError("Oversized HTTP probe")
-        body = b"socks-node-ok"
-        self.request.sendall(
-            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: "
-            + str(len(body)).encode()
-            + b"\r\n\r\n"
-            + body
-        )
+        serve_http(self.request, b"socks-node-ok")
+
+
+class Ipv6Http(socketserver.BaseRequestHandler):
+    def handle(self):
+        self.request.settimeout(5)
+        serve_http(self.request, b"system-ipv6-ok")
+
+
+class Ipv6Server(socketserver.ThreadingTCPServer):
+    address_family = socket.AF_INET6
+    daemon_threads = True
 
 
 class DnsResolver(socketserver.BaseRequestHandler):
@@ -78,10 +96,15 @@ class DnsResolver(socketserver.BaseRequestHandler):
         question_type = struct.unpack("!H", data[end : end + 2])[0]
         end += 4
         self.server.queries.append(name)
-        answers = 1 if question_type == 1 else 0
+        answer = b""
+        if question_type == 1 and name != "v6.example.test":
+            answer = socket.inet_aton("127.0.0.1")
+        elif question_type == 28 and name in ("v6.example.test", "dual.example.test", "refuse.example.test"):
+            answer = socket.inet_pton(socket.AF_INET6, "::1")
+        answers = int(bool(answer))
         response = data[:2] + struct.pack("!HHHHH", 0x8180, 1, answers, 0, 0) + data[12:end]
         if answers:
-            response += b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + socket.inet_aton("127.0.0.1")
+            response += b"\xc0\x0c" + struct.pack("!HHIH", question_type, 1, 60, len(answer)) + answer
         sock.sendto(response, self.client_address)
 
 
@@ -104,33 +127,47 @@ def wait_ready(process, port):
     raise TimeoutError("sing-box did not start listening")
 
 
-def request_through_socks(port, name):
+def request_through_socks(port, name, destination_port=80, expected_body=b"socks-node-ok"):
     with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
         sock.sendall(b"\x05\x01\x00")
         if receive(sock, 2) != b"\x05\x00":
             raise AssertionError("Client SOCKS handshake failed")
-        domain = name.encode()
-        sock.sendall(b"\x05\x01\x00\x03" + bytes([len(domain)]) + domain + b"\x00\x50")
-        if receive(sock, 4) != b"\x05\x00\x00\x01":
-            raise AssertionError("Client SOCKS CONNECT failed")
-        receive(sock, 6)
-        sock.sendall(b"GET / HTTP/1.1\r\nHost: " + domain + b"\r\nConnection: close\r\n\r\n")
+        try:
+            address = ipaddress.ip_address(name)
+        except ValueError:
+            domain = name.encode()
+            target = b"\x03" + bytes([len(domain)]) + domain
+        else:
+            target = bytes([1 if address.version == 4 else 4]) + address.packed
+        sock.sendall(b"\x05\x01\x00" + target + struct.pack("!H", destination_port))
+        reply = receive(sock, 4)
+        if reply[:3] != b"\x05\x00\x00":
+            raise AssertionError(f"Client SOCKS CONNECT failed for {name}: {reply.hex()}")
+        if reply[3] == 1:
+            receive(sock, 6)
+        elif reply[3] == 4:
+            receive(sock, 18)
+        elif reply[3] == 3:
+            receive(sock, receive(sock, 1)[0] + 2)
+        else:
+            raise AssertionError("Invalid SOCKS reply address type")
+        sock.sendall(b"GET / HTTP/1.1\r\nHost: " + name.encode() + b"\r\nConnection: close\r\n\r\n")
         result = bytearray()
         while True:
             chunk = sock.recv(4096)
             if not chunk:
                 break
             result.extend(chunk)
-        if not bytes(result).endswith(b"socks-node-ok"):
-            raise AssertionError("HTTP payload did not traverse the imported SOCKS upstream")
+        if not bytes(result).endswith(expected_body):
+            raise AssertionError(f"Wrong egress for {name}: expected {expected_body!r}")
 
 
 def main():
     binary, config_path, output_directory = sys.argv[1:]
     generated = json.loads(Path(config_path).read_text(encoding="utf-8"))
     nodes = [item for item in generated["inbounds"] if item["tag"].startswith("sbp-socks-") and item["type"] == "shadowsocks" and item["method"] == "aes-256-gcm"]
-    if len(nodes) != 2:
-        raise AssertionError("Expected generated local and remote DNS Shadowsocks nodes")
+    if len(nodes) != 4:
+        raise AssertionError("Expected local/remote DNS Shadowsocks nodes with system IPv6 on/off")
     output = Path(output_directory)
     upstream = socketserver.ThreadingTCPServer(("127.0.0.1", 0), SocksUpstream)
     upstream.daemon_threads = True
@@ -138,10 +175,12 @@ def main():
     resolver = socketserver.ThreadingUDPServer(("127.0.0.1", 0), DnsResolver)
     resolver.daemon_threads = True
     resolver.queries = []
+    ipv6_http = Ipv6Server(("::1", 0), Ipv6Http)
+    upstream.reject_port = ipv6_http.server_address[1]
     processes = []
     logs = []
     try:
-        for service in (upstream, resolver):
+        for service in (upstream, resolver, ipv6_http):
             threading.Thread(target=service.serve_forever, daemon=True).start()
         for index, node in enumerate(nodes):
             node = copy.deepcopy(node)
@@ -149,13 +188,19 @@ def main():
             node["listen_port"] = available_port()
             routes = [rule for rule in generated["route"]["rules"] if rule.get("inbound") == [node["tag"]]]
             local_dns = any(rule["action"] == "resolve" for rule in routes)
-            target_tag = next(rule["outbound"] for rule in routes if rule["action"] == "route")
+            system_ipv6 = any(rule.get("ip_cidr") == ["::/0"] for rule in routes)
+            target_tag = next(rule["outbound"] for rule in routes if rule["action"] == "route" and rule["outbound"] != "sbp-socks-ipv6")
             outbound = copy.deepcopy(next(item for item in generated["outbounds"] if item["tag"] == target_tag))
             outbound.update(server="127.0.0.1", server_port=upstream.server_address[1])
+            outbounds = [outbound]
+            if system_ipv6:
+                ipv6_outbound = copy.deepcopy(next(item for item in generated["outbounds"] if item["tag"] == "sbp-socks-ipv6"))
+                ipv6_outbound["inet6_bind_address"] = "::1"
+                outbounds.append(ipv6_outbound)
             server_config = {
                 "log": {"level": "error"},
                 "dns": {"servers": [{"type": "udp", "tag": "dns-doh-primary", "server": "127.0.0.1", "server_port": resolver.server_address[1]}], "final": "dns-doh-primary", "strategy": "prefer_ipv4"},
-                "inbounds": [node], "outbounds": [outbound],
+                "inbounds": [node], "outbounds": outbounds,
                 "route": {"rules": routes},
             }
             client_port = available_port()
@@ -178,9 +223,31 @@ def main():
             expected = (1, "127.0.0.1", 80) if local_dns else (3, domain, 80)
             if upstream.destinations[-1] != expected:
                 raise AssertionError(f"Wrong SOCKS destination: {upstream.destinations[-1]} != {expected}")
+            if system_ipv6:
+                request_through_socks(client_port, "dual.example.test")
+                if upstream.destinations[-1] != (1, "127.0.0.1", 80):
+                    raise AssertionError("Dual-stack domains must prefer IPv4 through SOCKS")
+                request_through_socks(client_port, "127.0.0.1")
+                if upstream.destinations[-1] != (1, "127.0.0.1", 80):
+                    raise AssertionError("Literal IPv4 must use SOCKS")
+                before_ipv6 = len(upstream.destinations)
+                for destination in ("v6.example.test", "::1"):
+                    request_through_socks(client_port, destination, ipv6_http.server_address[1], b"system-ipv6-ok")
+                if len(upstream.destinations) != before_ipv6:
+                    raise AssertionError("System IPv6 traffic must bypass the IPv4 SOCKS upstream")
+                before_failure = len(upstream.destinations)
+                try:
+                    request_through_socks(client_port, "refuse.example.test", ipv6_http.server_address[1], b"system-ipv6-ok")
+                except (AssertionError, EOFError, OSError):
+                    pass
+                else:
+                    raise AssertionError("Failed SOCKS IPv4 must not switch to the system IPv6 exit")
+                failed_attempts = upstream.destinations[before_failure:]
+                if not failed_attempts or any(item[0] != 1 for item in failed_attempts):
+                    raise AssertionError("Dual-stack SOCKS retries must stay on IPv4")
         if "local.example.test" not in resolver.queries or "remote.example.test" in resolver.queries:
             raise AssertionError("SOCKS5H leaked target DNS to the local resolver")
-        print("PASS: real Shadowsocks -> authenticated SOCKS5 traffic and local/remote target DNS")
+        print("PASS: real authenticated SOCKS5, local/remote DNS, dual-stack IPv4 preference and system IPv6")
     finally:
         for process in reversed(processes):
             process.terminate()
@@ -191,7 +258,7 @@ def main():
                 process.wait()
         for log in logs:
             log.close()
-        for service in (upstream, resolver):
+        for service in (upstream, resolver, ipv6_http):
             service.shutdown()
             service.server_close()
 
