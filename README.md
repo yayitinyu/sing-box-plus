@@ -15,7 +15,7 @@
 | **版本智能升级** | 校验官方 Release SHA-256 和现有配置，替换核心后检查服务稳定性，失败时恢复原核心 |
 | **远程规则集检查** | 检查当前配置的 SRS 规则集可用性；sing-box 按 `update_interval` 自动更新 |
 | **运行状态看板** | 实时查看主进程 PID、内存占用、当前已启用节点的端口监听、DNS 切换与证书到期倒计时 |
-| **WARP 出口** | 新安装默认使用 Cloudflare 官方 Linux 客户端的本地代理；已有 wgcf WireGuard profile 继续兼容 |
+| **WARP 出口** | 新安装默认只部署直连节点；按需启用 Cloudflare 官方客户端，已有 WARP 配置继续保留 |
 | **DNS 故障切换** | Cloudflare DoH → Google DoH → UDP 1.0.0.1，连续失败确认与恢复冷却避免探测抖动重启 |
 | **自定义路由** | 按域名 / geosite 指定出口或 block 阻断，支持同出口规则整理及 JSON 导入、导出 |
 | **TLS 证书** | 自签证书 / 手动上传公开有效证书 / ACME 自动申请续期，三种模式一键切换 |
@@ -30,7 +30,9 @@
 - Linux VPS（推荐 Debian 11+ / Ubuntu 20.04+）
 - Root 权限
 - 至少 10 个可用端口；WARP 启用时共使用 20 个端口（脚本自动随机分配并配置防火墙）
-- 官方 WARP 自动安装需要 Cloudflare 当前支持的 Debian / Ubuntu / RHEL / Fedora 版本及 amd64 或 arm64；其他系统仍可导入已有 WireGuard profile
+- 如需启用官方 WARP，系统须为 Cloudflare 当前支持的 Debian / Ubuntu / RHEL / Fedora 版本及 amd64 或 arm64；其他系统仍可导入已有 WireGuard profile
+
+打开管理菜单不会安装依赖。选择部署时，脚本只补齐缺失的核心工具；防火墙工具在需要放行端口时安装，`xz` / `unzip` 仅在下载到相应格式的核心压缩包时安装。
 
 ---
 
@@ -114,7 +116,7 @@ sudo DNS_FAILURE_THRESHOLD=4 DNS_RECOVERY_THRESHOLD=6 \
 
 ```text
 =============================================================
- 🚀 Sing-Box-Plus 管理脚本 v3.5.0 🚀
+ 🚀 Sing-Box-Plus 管理脚本 v3.5.1 🚀
  脚本更新地址: https://github.com/yayitinyu/sing-box-plus
 =============================================================
   服务状态: 运行中 (Active)  |  核心版本: sing-box v1.14.2
@@ -203,7 +205,9 @@ openssl x509 -in /opt/sing-box/cert/fullchain.pem -noout -subject
 
 ### WARP 节点（10 个，带 `-warp` 后缀）
 
-新安装只有在官方 WARP 注册、本地回环代理和 Cloudflare trace 的 `warp=on/plus` 校验全部通过后，才会启用并输出 WARP 节点。默认由 `warp-cli` 以 `127.0.0.1:40000` 本地代理方式提供 `warp` 出口，不会接管服务器默认路由；升级时若已有完整的 wgcf WireGuard profile，则继续原样使用，`--repair-warp` 会再执行实际出口校验。
+新安装默认只部署 10 个直连节点，不安装官方 WARP 客户端。需要额外 10 个 WARP 节点时，使用菜单 `13) 获取 / 修复 WARP 出口` 或运行 `sudo bash /root/sbp.sh --repair-warp`。启用时必须通过官方 WARP 注册、本地回环代理和 Cloudflare trace 的 `warp=on/plus` 校验，才会输出 WARP 节点。官方客户端使用 `127.0.0.1:40000` 本地代理，不接管服务器默认路由；升级时已有的 WARP 开关和 WireGuard profile 会保留。
+
+官方客户端会安装额外软件包并常驻运行 `warp-svc`。资源紧张的机器可以保持默认直连配置；启用 WARP 时请先确认磁盘和内存余量。
 
 从 v3.4.0 起，小内存服务器可改用 sing-box 内建 WireGuard 出口，省去常驻的 `warp-svc`。请使用**未在其他设备上连接**的独立 `wgcf-profile.conf`，以免同一身份互相抢占连接。将文件安全传到服务器并更新至包含该命令的管理脚本后运行：
 
@@ -211,7 +215,7 @@ openssl x509 -in /opt/sing-box/cert/fullchain.pem -noout -subject
 sudo bash /root/sbp.sh --migrate-warp-profile /root/wgcf-profile.conf
 ```
 
-命令会备份原配置、校验新 profile 和 WARP 出口、更新 sing-box 服务依赖，并在 sing-box 稳定运行后停止由本脚本安装的 `warp-svc`。失败时恢复原配置和服务依赖；官方客户端及其注册信息会保留，方便回退。`wgcf-account.toml` 不需要上传。未提供独立 profile 时，官方本地代理仍是默认后端。
+命令会备份原配置、校验新 profile 和 WARP 出口、更新 sing-box 服务依赖，并在 sing-box 稳定运行后停止由本脚本安装的 `warp-svc`。失败时恢复原配置和服务依赖；官方客户端及其注册信息会保留，方便回退。`wgcf-account.toml` 不需要上传。启用 WARP 且未提供独立 profile 时，官方本地代理是默认后端。
 
 - 解锁 Netflix、Disney+、ChatGPT 等受地域限制的服务
 - 规避服务器 IP 被目标网站封锁
@@ -312,7 +316,7 @@ geosite:netflix, suffix:openai.com, domain:example.com, keyword:google, regex:.*
 # 指定 sing-box 版本
 SINGBOX_TAG=v1.14.2 bash sbp.sh
 
-# 跳过启动依赖检查
+# 跳过部署时的依赖检查
 SBP_SKIP_DEPS=1 bash sbp.sh
 
 # 强制二进制模式（跳过包管理器）
@@ -323,14 +327,14 @@ UDP_TIMEOUT=15m TCP_KEEP_ALIVE=30s TCP_KEEP_ALIVE_INTERVAL=30s \
 WARP_KEEPALIVE_INTERVAL=25 DNS_HEALTH_INTERVAL=2m \
 DNS_FAILURE_THRESHOLD=3 DNS_RECOVERY_THRESHOLD=5 DNS_SWITCH_COOLDOWN=600 bash sbp.sh
 
-# 新安装默认 auto；也可明确使用官方本地代理端口
-WARP_BACKEND=proxy WARP_SOCKS_PORT=40000 bash sbp.sh
+# 新安装如需 WARP，可明确启用官方本地代理
+ENABLE_WARP=true WARP_BACKEND=proxy WARP_SOCKS_PORT=40000 bash sbp.sh
 ```
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `SINGBOX_TAG` | `latest` | sing-box 发行版本号 |
-| `SBP_SKIP_DEPS` | `0` | 设为 `1` 跳过启动时依赖检查 |
+| `SBP_SKIP_DEPS` | `0` | 设为 `1` 跳过部署时依赖检查 |
 | `SBP_BIN_ONLY` | `0` | 设为 `1` 强制走二进制下载 |
 | `SBP_SOFT` | `0` | 设为 `1` 宽松模式（依赖安装失败时继续） |
 | `SBP_REPO` | `yayitinyu/sing-box-plus` | `--update-script` 拉取脚本的 GitHub 仓库 |
@@ -339,7 +343,8 @@ WARP_BACKEND=proxy WARP_SOCKS_PORT=40000 bash sbp.sh
 | `TCP_KEEP_ALIVE` | `30s` | TCP 保活时间 |
 | `TCP_KEEP_ALIVE_INTERVAL` | `30s` | TCP 保活探测间隔 |
 | `UDP_TIMEOUT` | `10m` | UDP NAT 过期时间 |
-| `WARP_BACKEND` | `auto` | 优先复用已有 profile，否则使用官方客户端；显式设为 `wireguard` 时，新账号注册仍可能受到 wgcf 限流 |
+| `ENABLE_WARP` | 新安装 `false` | 新安装默认关闭；已有安装沿用保存的开关，可显式设为 `true` 或 `false` |
+| `WARP_BACKEND` | `auto` | 启用 WARP 后优先复用已有 profile，否则使用官方客户端；显式设为 `wireguard` 时，新账号注册仍可能受到 wgcf 限流 |
 | `WARP_SOCKS_HOST` | `127.0.0.1` | 官方客户端本地代理地址，仅允许回环地址 |
 | `WARP_SOCKS_PORT` | `40000` | 官方客户端本地代理端口 |
 | `WARP_KEEPALIVE_INTERVAL` | `25` | 兼容 WireGuard 后端的保活间隔（秒） |
@@ -386,7 +391,7 @@ WARP_BACKEND=proxy WARP_SOCKS_PORT=40000 bash sbp.sh
 <details>
 <summary><b>WARP 注册失败？</b></summary>
 
-旧版使用 `wgcf register` 创建新账号，Cloudflare 可能对共享 NAT、机房 IPv4 或 IPv6 前缀返回 `429 Too Many Requests`。当前默认实现已改为 Cloudflare 官方 Linux 客户端：自动安装 `cloudflare-warp`、使用 `warp-cli registration new` 注册、切换到仅回环监听的本地代理模式，并在发布 WARP 节点前验证 Cloudflare trace。默认 `auto` 模式不会再调用 wgcf 新账号注册。
+旧版使用 `wgcf register` 创建新账号，Cloudflare 可能对共享 NAT、机房 IPv4 或 IPv6 前缀返回 `429 Too Many Requests`。现在新安装默认关闭 WARP；显式启用后，`auto` 模式会使用 Cloudflare 官方 Linux 客户端：安装 `cloudflare-warp`、使用 `warp-cli registration new` 注册、切换到仅回环监听的本地代理模式，并在发布 WARP 节点前验证 Cloudflare trace。`auto` 模式不会调用 wgcf 新账号注册。
 
 更新脚本后可从菜单选择 `13) 获取 / 修复 WARP 出口`，或运行：
 
@@ -420,7 +425,7 @@ curl --proxy socks5h://127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace
 ## 🙏 致谢
 
 - [sing-box](https://github.com/SagerNet/sing-box) — 核心代理引擎
-- [Cloudflare WARP](https://developers.cloudflare.com/warp-client/get-started/linux/) — 新安装默认使用的官方 Linux 客户端
+- [Cloudflare WARP](https://developers.cloudflare.com/warp-client/get-started/linux/) — 可按需启用的官方 Linux 客户端
 - [wgcf](https://github.com/ViRb3/wgcf) — 已有 WireGuard profile 的兼容工具
 
 ---

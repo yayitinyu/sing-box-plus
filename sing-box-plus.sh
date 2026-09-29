@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（直连 10 + WARP 就绪时额外 10）
-#  Version: v3.5.0
+#  Version: v3.5.1
 # ============================================================
 
 set -Eeuo pipefail
@@ -10,7 +10,7 @@ set -Eeuo pipefail
 # ===== [BEGIN] SBP 引导模块 v2.2.0+（包管理器优先 + 二进制回退） =====
 # 模式与哨兵
 : "${SBP_SOFT:=0}"                               # 1=宽松模式（失败尽量继续），默认 0=严格
-: "${SBP_SKIP_DEPS:=0}"                          # 1=启动跳过依赖检查（只在菜单 1) 再装）
+: "${SBP_SKIP_DEPS:=0}"                          # 1=部署时跳过依赖检查
 : "${SBP_FORCE_DEPS:=0}"                         # 1=强制重新安装依赖
 : "${SBP_BIN_ONLY:=0}"                           # 1=强制走二进制模式，不用包管理器
 : "${SBP_ROOT:=/var/lib/sing-box-plus}"
@@ -56,7 +56,7 @@ ensure_jq_static() {
 
 # 工具：核心命令自检
 sbp_core_ok() {
-  local need=(curl jq tar unzip openssl)
+  local need=(curl jq tar openssl sha256sum)
   local b; for b in "${need[@]}"; do command -v "$b" >/dev/null 2>&1 || return 1; done
   return 0
 }
@@ -122,41 +122,42 @@ sbp_pm_refresh() {
 sbp_pm_install() {
   case "$PM" in
     apt)
-      local p; apt-get update -y >/dev/null 2>&1 || true
-      for p in "$@"; do apt-get install -y --no-install-recommends "$p" || true; done
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
       ;;
     dnf)
-      local p; for p in "$@"; do dnf install -y "$p" || true; done
+      dnf install -y "$@"
       ;;
     yum)
       yum install -y epel-release || true
-      local p; for p in "$@"; do yum install -y "$p" || true; done
+      yum install -y "$@"
       ;;
     pacman)
-      pacman -Sy --noconfirm || [ "$SBP_SOFT" = 1 ]
-      local p; for p in "$@"; do pacman -S --noconfirm --needed "$p" || true; done
+      pacman -S --noconfirm --needed "$@"
       ;;
     zypper)
-      zypper -n ref || true
-      local p; for p in "$@"; do zypper --non-interactive install "$p" || true; done
+      zypper --non-interactive install "$@"
       ;;
   esac
 }
 
-# 用包管理器装一轮依赖
+# 仅安装部署所缺的核心命令；防火墙和归档工具在用到时再处理。
 sbp_install_prereqs_pm() {
+  local tool package
+  local missing=()
+  for tool in curl jq tar openssl sha256sum; do
+    if [[ "$SBP_FORCE_DEPS" == 1 ]] || ! command -v "$tool" >/dev/null 2>&1; then
+      case "$tool" in
+        sha256sum) package=coreutils ;;
+        *) package="$tool" ;;
+      esac
+      missing+=("$package")
+    fi
+  done
+  ((${#missing[@]} > 0)) || return 0
+
   sbp_detect_pm || return 1
-  sbp_pm_refresh
-
-  case "$PM" in
-    apt)    CORE=(curl jq tar unzip openssl); EXTRA=(ca-certificates xz-utils uuid-runtime iproute2 iptables ufw) ;;
-    dnf|yum)CORE=(curl jq tar unzip openssl); EXTRA=(ca-certificates xz util-linux iproute iptables iptables-nft firewalld) ;;
-    pacman) CORE=(curl jq tar unzip openssl); EXTRA=(ca-certificates xz util-linux iproute2 iptables) ;;
-    zypper) CORE=(curl jq tar unzip openssl); EXTRA=(ca-certificates xz util-linux iproute2 iptables firewalld) ;;
-    *) return 1 ;;
-  esac
-
-  sbp_pm_install "${CORE[@]}" "${EXTRA[@]}"
+  sbp_pm_refresh || return 1
+  sbp_pm_install "${missing[@]}" || warn "部分核心依赖安装失败，正在复核可用命令"
 
   # jq 兜底：安装失败时下载静态 jq
   if ! command -v jq >/dev/null 2>&1; then
@@ -200,7 +201,7 @@ sbp_bootstrap() {
   [ "$EUID" -eq 0 ] || [ "${SBP_SKIP_ROOT:-0}" = 1 ] || [ -n "${TEST_ROOT:-}" ] || { echo "请以 root 运行（或 sudo）"; exit 1; }
 
   if [ "$SBP_SKIP_DEPS" = 1 ]; then
-    echo "[INFO] 已跳过启动时依赖检查（SBP_SKIP_DEPS=1）"
+    echo "[INFO] 已跳过部署时依赖检查（SBP_SKIP_DEPS=1）"
     return 0
   fi
 
@@ -254,8 +255,11 @@ SBP_BRANCH=${SBP_BRANCH:-main}
 ROUTE_JSON=${ROUTE_JSON:-$SB_DIR/routes.json}
 SHARE_LINKS_FILE=${SHARE_LINKS_FILE:-$SB_DIR/share-links.txt}
 
-# 功能开关（保持稳定默认）
-ENABLE_WARP=${ENABLE_WARP:-true}
+# 新安装优先保证直连节点；旧 env.conf 缺少此开关时沿用原先的 WARP 默认值。
+SBP_ENABLE_WARP_OVERRIDE=${ENABLE_WARP-}
+if [[ -z "${ENABLE_WARP+x}" ]]; then
+  if [[ -f "$SB_DIR/env.conf" ]]; then ENABLE_WARP=true; else ENABLE_WARP=false; fi
+fi
 WARP_BACKEND=${WARP_BACKEND:-auto}
 WARP_SOCKS_HOST=${WARP_SOCKS_HOST:-127.0.0.1}
 WARP_SOCKS_PORT=${WARP_SOCKS_PORT:-40000}
@@ -301,7 +305,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.5.0"
+SCRIPT_VERSION="v3.5.1"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -428,8 +432,10 @@ ensure_deps() {
   ((${#miss[@]}==0)) && return 0
 
   if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y "${miss[@]}" || apt-get install -y --no-install-recommends "${miss[@]}"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${miss[@]}"; then
+      apt-get update -y >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${miss[@]}"
+    fi
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y "${miss[@]}"
   elif command -v yum >/dev/null 2>&1; then
@@ -675,7 +681,10 @@ EOF
   printf 'TLS_ACME_DISABLE_HTTP_CHALLENGE=%q\n' "$TLS_ACME_DISABLE_HTTP_CHALLENGE" >> "$SB_DIR/env.conf"
   printf 'TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE=%q\n' "$TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE" >> "$SB_DIR/env.conf"
 }
-load_env(){ safe_source_env "$SB_DIR/env.conf" || true; }
+load_env(){
+  safe_source_env "$SB_DIR/env.conf" || true
+  [[ -z "$SBP_ENABLE_WARP_OVERRIDE" ]] || ENABLE_WARP=$SBP_ENABLE_WARP_OVERRIDE
+}
 
 save_creds(){
   local tmp
@@ -2380,12 +2389,7 @@ version_lt() {
 
 # ===== 依赖与安装 =====
 install_deps(){
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y ca-certificates curl wget jq tar iproute2 openssl coreutils uuid-runtime >/dev/null 2>&1 || true
-  else
-    ensure_deps curl jq tar openssl || true
-  fi
+  sbp_bootstrap
 }
 
 # ===== 安装 / 智能升级 sing-box =====
@@ -2399,9 +2403,6 @@ install_singbox() (
     ensure_deps curl || return 1
   fi
   command -v sha256sum >/dev/null 2>&1 || ensure_deps coreutils || return 1
-  command -v xz >/dev/null 2>&1 || ensure_deps xz-utils >/dev/null 2>&1 || true
-  command -v unzip >/dev/null 2>&1 || ensure_deps unzip >/dev/null 2>&1 || true
-
   remote_ver="$(get_singbox_remote_version 2>/dev/null || true)"
 
   if local_ver="$(get_singbox_local_version "$BIN_PATH")"; then
@@ -2503,8 +2504,16 @@ install_singbox() (
   if [[ "$asset_name" == *.tar.gz ]]; then
     tar -xzf "$pkg" -C "$tmp" || return 1
   elif [[ "$asset_name" == *.tar.xz ]]; then
+    if ! command -v xz >/dev/null 2>&1; then
+      if command -v apt-get >/dev/null 2>&1; then
+        ensure_deps xz-utils || return 1
+      else
+        ensure_deps xz || return 1
+      fi
+    fi
     tar -xJf "$pkg" -C "$tmp" || return 1
   elif [[ "$asset_name" == *.zip ]]; then
+    command -v unzip >/dev/null 2>&1 || ensure_deps unzip || return 1
     unzip -q "$pkg" -d "$tmp" || return 1
   else
     warn "未知 sing-box 发行包格式：$asset_name"
@@ -3205,6 +3214,9 @@ open_firewall(){
     systemctl enable --now firewalld >/dev/null 2>&1 || true
     for r in "${rules[@]}"; do firewall-cmd --permanent --add-port="$r" >/dev/null 2>&1 || true; done; firewall-cmd --reload >/dev/null 2>&1 || true
   else
+    if ! command -v iptables >/dev/null 2>&1; then
+      ensure_deps iptables || { warn "未能安装 iptables，无法自动放行节点端口"; return 1; }
+    fi
     local p proto
     for r in "${rules[@]}"; do p="${r%/*}"; proto="${r#*/}";
       if [[ "$proto" == tcp ]]; then iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT; fi

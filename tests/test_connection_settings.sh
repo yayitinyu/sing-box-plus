@@ -120,6 +120,12 @@ WARP_RESERVED_3=0
 save_warp
 save_env
 
+print_links_grouped > "$test_root/direct-only-links.log"
+assert_equal 10 "$(wc -l < "$SHARE_LINKS_FILE" | tr -d ' ')" \
+  "new installations must publish only direct links until WARP is enabled"
+
+ENABLE_WARP=true
+save_env
 print_links_grouped > "$test_root/self-signed-links.log"
 assert_equal 20 "$(wc -l < "$SHARE_LINKS_FILE" | tr -d ' ')" \
   "the persisted import file must contain all links"
