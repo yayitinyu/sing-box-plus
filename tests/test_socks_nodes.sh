@@ -160,7 +160,7 @@ if socks_node_port_available 11001 || socks_node_port_available 13001 || socks_n
   echo 'FAIL: existing node and WARP proxy ports must be reserved' >&2; exit 1
 fi
 
-# Build one extra node for every protocol; global rules must not steal their egress.
+# Explicit routing rules override each extra node's fallback egress.
 current=$(load_socks_nodes)
 printf '%s\n' "$current" > "$test_root/candidate.json"
 index=1
@@ -174,12 +174,15 @@ for protocol in vless-grpcr trojan-reality hy2 vmess-ws hy2-obfs ss2022 ss tuic-
   mv "$test_root/next.json" "$test_root/candidate.json"
   index=$((index+1))
 done
-printf '%s\n' '{"rules":[{"domain_suffix":["example.com"],"outbound":"direct"}],"rule_set":[],"outbounds":[],"default_outbound":"direct"}' > "$ROUTE_JSON"
+printf '%s\n' '{"rules":[{"domain_suffix":["example.com"],"outbound":"direct"},{"domain":["blocked.example.test"],"action":"reject"}],"rule_set":[],"outbounds":[],"default_outbound":"direct"}' > "$ROUTE_JSON"
 apply_socks_nodes "$test_root/candidate.json" "$current" > "$test_root/all-protocols.log" 2>&1 \
   || { cat "$test_root/all-protocols.log" >&2; exit 1; }
 assert_json "$CONF_JSON" '(.inbounds | length) == 20 and (.outbounds | length) == 11' 'all extra protocols and outbounds'
-assert_json "$CONF_JSON" '.route.rules[0].action == "route" and .route.rules[0].inbound[0] == (.inbounds[10].tag)' 'remote DNS node must route first'
-assert_json "$CONF_JSON" '.route.rules[1].action == "resolve" and .route.rules[2].action == "route" and .route.rules[-1].outbound == "direct"' 'local DNS resolves before routing and before global rules'
+assert_json "$CONF_JSON" '.route.rules[0].domain_suffix == ["example.com"] and .route.rules[0].outbound == "direct"
+  and .route.rules[1].action == "reject"' 'custom routing and blocking must precede SOCKS fallback rules'
+assert_json "$CONF_JSON" '.route.rules[2].action == "route" and .route.rules[2].inbound[0] == (.inbounds[10].tag)' 'unmatched remote DNS traffic keeps its SOCKS exit'
+assert_json "$CONF_JSON" '.route.rules[3].action == "resolve" and .route.rules[4].action == "route"
+  and .route.rules[-1].outbound == .outbounds[-1].tag' 'unmatched local DNS traffic resolves before its node-specific fallback'
 jq -en --slurpfile config "$CONF_JSON" --slurpfile nodes "$SOCKS_NODES_JSON" '
   all($nodes[0].nodes[]; . as $node |
     ($config[0].inbounds[] | select(.tag == $node.id)) as $extra |
@@ -232,7 +235,8 @@ EOF
 1
 1
 EOF
-  assert_json "$CONF_JSON" '.route.rules[0].action == "route" and all(.outbounds[]; .tag != "sbp-socks-ipv6")' 'disabling restores SOCKS5H DNS and removes unused IPv6 outbound'
+  assert_json "$CONF_JSON" '([.route.rules[] | select(.inbound == ["'"$(jq -r '.nodes[0].id' "$SOCKS_NODES_JSON")"'"])] |
+    length == 1 and .[0].action == "route") and all(.outbounds[]; .tag != "sbp-socks-ipv6")' 'disabling restores SOCKS5H DNS and removes unused IPv6 outbound'
   current=$(load_socks_nodes) previous_hash=$(hash "$SOCKS_NODES_JSON") previous_config_hash=$(hash "$CONF_JSON")
   default_ipv6_address(){ :; }
   jq '.nodes[0].system_ipv6 = true' "$SOCKS_NODES_JSON" > "$test_root/ipv6-unavailable.json"
@@ -349,7 +353,8 @@ if [[ -n "${SBP_REAL_SING_BOX_BIN:-}" ]]; then
   (
     cp "$SOCKS_NODES_JSON" "$test_root/probe-original-nodes.json"
     cp "$CONF_JSON" "$test_root/probe-original-config.json"
-    trap 'cp "$test_root/probe-original-nodes.json" "$SOCKS_NODES_JSON"; cp "$test_root/probe-original-config.json" "$CONF_JSON"' EXIT
+    cp "$ROUTE_JSON" "$test_root/probe-original-routes.json"
+    trap 'cp "$test_root/probe-original-nodes.json" "$SOCKS_NODES_JSON"; cp "$test_root/probe-original-config.json" "$CONF_JSON"; cp "$test_root/probe-original-routes.json" "$ROUTE_JSON"' EXIT
     default_ipv6_address(){ printf '%s\n' '::1'; }
     jq '(.nodes[] | select(.protocol == "ss")) as $node |
       .nodes += [($node | .id = "sbp-socks-eeeeeeeeeeeeeeee" | .port = 13999 | .dns_mode = "remote"),
@@ -357,6 +362,22 @@ if [[ -n "${SBP_REAL_SING_BOX_BIN:-}" ]]; then
         ($node | .id = "sbp-socks-cccccccccccccccc" | .port = 13997 | .dns_mode = "remote" | .system_ipv6 = true)] |
       .nodes |= map(.outbound.tag = (.id + "-out"))' "$SOCKS_NODES_JSON" > "$test_root/probe-nodes.json"
     cp "$test_root/probe-nodes.json" "$SOCKS_NODES_JSON"
+    cat > "$ROUTE_JSON" <<'EOF'
+{
+  "rules": [
+    {"domain": ["direct.example.test"], "outbound": "direct"},
+    {"type": "logical", "mode": "or", "rules": [
+      {"domain": ["override.example.test"]},
+      {"domain_suffix": ["override-v6.example.test"]}
+    ], "outbound": "custom-probe"},
+    {"domain": ["blocked.example.test"], "action": "reject"}
+  ],
+  "rule_set": [],
+  "outbounds": [{"type": "socks", "tag": "custom-probe", "server": "127.0.0.1", "server_port": 1081,
+    "version": "5", "username": "test", "password": "secret"}],
+  "default_outbound": "direct"
+}
+EOF
     write_config
     "$probe_python" "$repo_root/tests/socks_node_probe.py" "$BIN_PATH" "$CONF_JSON" "$test_root"
   )

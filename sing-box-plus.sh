@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Sing-Box-Plus 管理脚本（直连 10 + WARP 就绪时额外 10）
-#  Version: v3.7.0
+#  Version: v3.7.1
 # ============================================================
 
 set -Eeuo pipefail
@@ -307,7 +307,7 @@ DNS_SWITCH_COOLDOWN=${DNS_SWITCH_COOLDOWN:-600}
 
 # 常量
 SCRIPT_NAME="Sing-Box-Plus 管理脚本"
-SCRIPT_VERSION="v3.7.0"
+SCRIPT_VERSION="v3.7.1"
 REALITY_SERVER=${REALITY_SERVER:-www.lovelive-anime.jp}
 REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
@@ -3485,8 +3485,9 @@ write_config(){
     { inbound: ["vless-reality-warp","vless-grpcr-warp","trojan-reality-warp","hy2-warp","vmess-ws-warp","hy2-obfs-warp","ss2022-warp","ss-warp","tuic-v5-warp","anytls-warp"], action:"route", outbound:"warp" };
 
   def route_rules:
-    # Pin each extra inbound before global domain/default routing can select another exit.
-    [$SOCKS_NODES.nodes[] |
+    # Explicit domain/block rules take precedence over the fallback exits of extra nodes.
+    custom_route_rules
+    + [$SOCKS_NODES.nodes[] |
       (if .system_ipv6 == true then
         {inbound:[.id], action:"resolve", strategy:"prefer_ipv4"},
         # CIDR rules also match resolved addresses; ip_version alone does not match resolved domains.
@@ -3496,7 +3497,7 @@ write_config(){
         {inbound:[.id], ip_cidr:["::/0"], action:"route", outbound:"sbp-socks-ipv6"}
       elif .dns_mode == "local" then {inbound:[.id], action:"resolve"} else empty end),
       {inbound:[.id], action:"route", outbound:.outbound.tag}]
-    + custom_route_rules + (if warp_ready then [warp_inbound_rule] else [] end);
+    + (if warp_ready then [warp_inbound_rule] else [] end);
 
   def direct_outbound:
     {type:"direct", tag:"direct", tcp_keep_alive:$TCPKA, tcp_keep_alive_interval:$TCPKAI, domain_resolver:"dns-doh-primary"};

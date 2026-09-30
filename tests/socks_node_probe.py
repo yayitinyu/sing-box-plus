@@ -68,7 +68,13 @@ class SocksUpstream(socketserver.BaseRequestHandler):
             self.request.sendall(b"\x05\x05\x00\x01\x7f\x00\x00\x01\x00\x00")
             return
         self.request.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50")
-        serve_http(self.request, b"socks-node-ok")
+        serve_http(self.request, self.server.response_body)
+
+
+class DirectHttp(socketserver.BaseRequestHandler):
+    def handle(self):
+        self.request.settimeout(5)
+        serve_http(self.request, b"direct-route-ok")
 
 
 class Ipv6Http(socketserver.BaseRequestHandler):
@@ -97,9 +103,9 @@ class DnsResolver(socketserver.BaseRequestHandler):
         end += 4
         self.server.queries.append(name)
         answer = b""
-        if question_type == 1 and name != "v6.example.test":
+        if question_type == 1 and name not in ("v6.example.test", "override-v6.example.test"):
             answer = socket.inet_aton("127.0.0.1")
-        elif question_type == 28 and name in ("v6.example.test", "dual.example.test", "refuse.example.test"):
+        elif question_type == 28 and name in ("v6.example.test", "override-v6.example.test", "dual.example.test", "refuse.example.test"):
             answer = socket.inet_pton(socket.AF_INET6, "::1")
         answers = int(bool(answer))
         response = data[:2] + struct.pack("!HHHHH", 0x8180, 1, answers, 0, 0) + data[12:end]
@@ -172,6 +178,14 @@ def main():
     upstream = socketserver.ThreadingTCPServer(("127.0.0.1", 0), SocksUpstream)
     upstream.daemon_threads = True
     upstream.destinations = []
+    upstream.response_body = b"socks-node-ok"
+    custom_upstream = socketserver.ThreadingTCPServer(("127.0.0.1", 0), SocksUpstream)
+    custom_upstream.daemon_threads = True
+    custom_upstream.destinations = []
+    custom_upstream.response_body = b"custom-route-ok"
+    custom_upstream.reject_port = 0
+    direct_http = socketserver.ThreadingTCPServer(("127.0.0.1", 0), DirectHttp)
+    direct_http.daemon_threads = True
     resolver = socketserver.ThreadingUDPServer(("127.0.0.1", 0), DnsResolver)
     resolver.daemon_threads = True
     resolver.queries = []
@@ -180,19 +194,23 @@ def main():
     processes = []
     logs = []
     try:
-        for service in (upstream, resolver, ipv6_http):
+        for service in (upstream, custom_upstream, direct_http, resolver, ipv6_http):
             threading.Thread(target=service.serve_forever, daemon=True).start()
         for index, node in enumerate(nodes):
             node = copy.deepcopy(node)
             node["listen"] = "127.0.0.1"
             node["listen_port"] = available_port()
-            routes = [rule for rule in generated["route"]["rules"] if rule.get("inbound") == [node["tag"]]]
-            local_dns = any(rule["action"] == "resolve" for rule in routes)
-            system_ipv6 = any(rule.get("ip_cidr") == ["::/0"] for rule in routes)
-            target_tag = next(rule["outbound"] for rule in routes if rule["action"] == "route" and rule["outbound"] != "sbp-socks-ipv6")
+            routes = [rule for rule in generated["route"]["rules"] if rule.get("inbound") in (None, [node["tag"]])]
+            node_routes = [rule for rule in routes if rule.get("inbound") == [node["tag"]]]
+            local_dns = any(rule["action"] == "resolve" for rule in node_routes)
+            system_ipv6 = any(rule.get("ip_cidr") == ["::/0"] for rule in node_routes)
+            target_tag = next(rule["outbound"] for rule in node_routes if rule["action"] == "route" and rule["outbound"] != "sbp-socks-ipv6")
             outbound = copy.deepcopy(next(item for item in generated["outbounds"] if item["tag"] == target_tag))
             outbound.update(server="127.0.0.1", server_port=upstream.server_address[1])
-            outbounds = [outbound]
+            custom_outbound = copy.deepcopy(next(item for item in generated["outbounds"] if item["tag"] == "custom-probe"))
+            custom_outbound["server_port"] = custom_upstream.server_address[1]
+            direct_outbound = copy.deepcopy(next(item for item in generated["outbounds"] if item["tag"] == "direct"))
+            outbounds = [outbound, custom_outbound, direct_outbound]
             if system_ipv6:
                 ipv6_outbound = copy.deepcopy(next(item for item in generated["outbounds"] if item["tag"] == "sbp-socks-ipv6"))
                 ipv6_outbound["inet6_bind_address"] = "::1"
@@ -218,6 +236,26 @@ def main():
                 process = subprocess.Popen([binary, "run", "-c", str(path)], stdout=log, stderr=subprocess.STDOUT)
                 processes.append(process)
                 wait_ready(process, port)
+            before_direct = (len(upstream.destinations), len(custom_upstream.destinations))
+            request_through_socks(client_port, "direct.example.test", direct_http.server_address[1], b"direct-route-ok")
+            if before_direct != (len(upstream.destinations), len(custom_upstream.destinations)):
+                raise AssertionError("Explicit direct routing must bypass SOCKS exits")
+            for destination in ("override.example.test", "override-v6.example.test"):
+                before_override = len(upstream.destinations)
+                request_through_socks(client_port, destination, expected_body=b"custom-route-ok")
+                if len(upstream.destinations) != before_override:
+                    raise AssertionError("Explicit custom routing must bypass the node's default SOCKS exit")
+                if custom_upstream.destinations[-1] != (3, destination, 80):
+                    raise AssertionError("Custom routing must match domains before fallback DNS/IPv6 routing")
+            before_block = (len(upstream.destinations), len(custom_upstream.destinations))
+            try:
+                request_through_socks(client_port, "blocked.example.test")
+            except (AssertionError, EOFError, OSError):
+                pass
+            else:
+                raise AssertionError("Global blocking must apply to optional SOCKS nodes")
+            if before_block != (len(upstream.destinations), len(custom_upstream.destinations)):
+                raise AssertionError("Blocked traffic must never reach a SOCKS upstream")
             domain = "local.example.test" if local_dns else "remote.example.test"
             request_through_socks(client_port, domain)
             expected = (1, "127.0.0.1", 80) if local_dns else (3, domain, 80)
@@ -247,7 +285,7 @@ def main():
                     raise AssertionError("Dual-stack SOCKS retries must stay on IPv4")
         if "local.example.test" not in resolver.queries or "remote.example.test" in resolver.queries:
             raise AssertionError("SOCKS5H leaked target DNS to the local resolver")
-        print("PASS: real authenticated SOCKS5, local/remote DNS, dual-stack IPv4 preference and system IPv6")
+        print("PASS: real SOCKS5, custom/direct routing and blocking, local/remote DNS, IPv4 preference and system IPv6")
     finally:
         for process in reversed(processes):
             process.terminate()
@@ -258,7 +296,7 @@ def main():
                 process.wait()
         for log in logs:
             log.close()
-        for service in (upstream, resolver, ipv6_http):
+        for service in (upstream, custom_upstream, direct_http, resolver, ipv6_http):
             service.shutdown()
             service.server_close()
 
