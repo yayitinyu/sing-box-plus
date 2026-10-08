@@ -541,6 +541,35 @@ is_uuid(){ [[ "$1" =~ ^[0-9a-fA-F-]{36}$ ]]; }
 
 ensure_dirs(){ mkdir -p "$SB_DIR" "$DATA_DIR" "$CERT_DIR" "$WGCF_DIR"; }
 
+ensure_installed_or_hint(){
+  if [[ ! -f "$CONF_JSON" ]]; then
+    warn "尚未安装，请先选择 1) 安装/部署"
+    return 1
+  fi
+  return 0
+}
+
+
+# ===== 运行时文件备份与恢复 =====
+backup_runtime_file(){
+  local source_path=$1 backup_name=$2 backup_dir=$3
+  if [[ -e "$source_path" || -L "$source_path" ]]; then
+    cp -a -- "$source_path" "$backup_dir/$backup_name" || return 1
+  else
+    : > "$backup_dir/${backup_name}.missing" || return 1
+  fi
+}
+
+restore_runtime_file(){
+  local backup_dir=$1 backup_name=$2 target_path=$3
+  if [[ -e "$backup_dir/$backup_name" || -L "$backup_dir/$backup_name" ]]; then
+    mkdir -p "$(dirname "$target_path")" || return 1
+    cp -a -- "$backup_dir/$backup_name" "$target_path" || return 1
+  elif [[ -f "$backup_dir/${backup_name}.missing" ]]; then
+    rm -f -- "$target_path" || return 1
+  fi
+}
+
 # ===== 端口（20 个互不重复） =====
 PORTS=()
 gen_port() {
@@ -634,381 +663,6 @@ save_all_ports(){
     fi
   done
   save_ports
-}
-
-# ===== Optional SOCKS egress nodes =====
-socks_uri_decode(){
-  local input="$1" output="" char byte
-  while [[ -n "$input" ]]; do
-    char="${input:0:1}"; input="${input:1}"
-    if [[ "$char" == '%' ]]; then
-      [[ "${input:0:2}" =~ ^[0-9a-fA-F]{2}$ ]] || return 1
-      byte=$((16#${input:0:2}))
-      (( byte >= 32 && byte != 127 )) || return 1
-      printf -v char '%b' "\\x${input:0:2}"
-      input="${input:2}"
-    fi
-    output+="$char"
-  done
-  printf '%s' "$output"
-}
-
-socks_node_outbound_from_link(){
-  local link="$1" tag="$2" scheme body query="" userinfo="" hostport
-  local username="" password="" decoded pair key value version=5
-  [[ "$link" != *[$'\r\n\t ']* ]] || return 1
-  scheme="${link%%://*}"; scheme="${scheme,,}"
-  [[ "$scheme" == socks5 || "$scheme" == socks5h ]] || return 1
-  body="${link#*://}"; body="${body%%\#*}"
-  if [[ "$body" == *'?'* ]]; then
-    query="${body#*\?}"; body="${body%%\?*}"
-  fi
-  body="${body%/}"
-  if [[ "$body" != *'@'* && "$body" != *':'* ]]; then
-    body="$(b64dec "$body")" || return 1
-    body="${body%/}"
-  fi
-  if [[ "$body" == *'@'* ]]; then
-    userinfo="${body%@*}"; hostport="${body##*@}"
-    if [[ "$userinfo" != *':'* ]]; then
-      decoded="$(b64dec "$userinfo" 2>/dev/null)" || decoded=""
-      [[ "$decoded" != *':'* ]] || userinfo="$decoded"
-    fi
-    username="$(socks_uri_decode "${userinfo%%:*}")" || return 1
-    if [[ "$userinfo" == *':'* ]]; then
-      password="$(socks_uri_decode "${userinfo#*:}")" || return 1
-    fi
-  else
-    hostport="$body"
-  fi
-  split_hostport "$hostport" || return 1
-  [[ -n "$SBP_PARSED_HOST" && ${#SBP_PARSED_PORT} -le 5 ]] || return 1
-  local port=$((10#$SBP_PARSED_PORT))
-  (( port >= 1 && port <= 65535 )) || return 1
-  local -a pairs=()
-  IFS='&' read -r -a pairs <<< "$query"
-  for pair in "${pairs[@]}"; do
-    key="${pair%%=*}"; value="$(socks_uri_decode "${pair#*=}")" || return 1
-    case "$key" in
-      user|username) username="$value" ;;
-      pass|password) password="$value" ;;
-      version) version="$value" ;;
-    esac
-  done
-  [[ "$version" == 5 ]] || return 1
-  jq -cn --arg tag "$tag" --arg server "$SBP_PARSED_HOST" --argjson port "$port" \
-    --arg user "$username" --arg pass "$password" '
-    {type:"socks", tag:$tag, server:$server, server_port:$port, version:"5",
-      domain_resolver:"dns-doh-primary"}
-    | if $user != "" or $pass != "" then .username=$user | .password=$pass else . end'
-}
-
-validate_socks_nodes(){
-  jq -ces '
-    def port: type == "number" and . == floor and . >= 1 and . <= 65535;
-    def text: type == "string" and (test("[\\x00-\\x1f\\x7f]") | not);
-    def host:
-      text and length > 0 and
-      (test("^[A-Za-z0-9.-]+$|^[0-9A-Fa-f:]+(%[A-Za-z0-9._-]+)?$") and . != ".");
-    def protocol: IN("vless-reality", "vless-grpcr", "trojan-reality", "hy2", "vmess-ws",
-      "hy2-obfs", "ss2022", "ss", "tuic-v5", "anytls");
-    if length != 1 then error("SOCKS 节点文件必须只包含一个 JSON 对象") else .[0] end
-    | if type != "object" or (keys != ["nodes"]) or (.nodes | type) != "array" then
-        error("SOCKS 节点文件格式无效") else . end
-    | if all(.nodes[];
-        type == "object"
-        and ((keys - ["dns_mode","id","name","outbound","port","protocol","system_ipv6"]) | length == 0)
-        and ((["dns_mode","id","name","outbound","port","protocol"] - keys) | length == 0)
-        and (.id | type == "string" and test("^sbp-socks-[a-f0-9]{16}$"))
-        and (.name | text and length > 0 and length <= 80)
-        and (.port | port) and (.protocol | protocol) and (.dns_mode | IN("local","remote"))
-        and (if has("system_ipv6") then (.system_ipv6 | type == "boolean") else true end)
-        and (.outbound | type == "object")
-        and ((.outbound | keys) - ["domain_resolver","password","server","server_port","tag","type","username","version"] | length == 0)
-        and .outbound.type == "socks" and .outbound.version == "5"
-        and .outbound.tag == (.id + "-out") and .outbound.domain_resolver == "dns-doh-primary"
-        and (.outbound.server | host) and (.outbound.server_port | port)
-        and ((.outbound.username // "") | text and utf8bytelength <= 255)
-        and ((.outbound.password // "") | text and utf8bytelength <= 255))
-      and ([.nodes[].id] | length == (unique | length))
-      and ([.nodes[].port] | length == (unique | length))
-      then . else error("SOCKS 节点参数无效或端口、标识重复") end
-  ' "$1"
-}
-
-load_socks_nodes(){
-  if [[ -e "$SOCKS_NODES_JSON" ]]; then
-    validate_socks_nodes "$SOCKS_NODES_JSON"
-  else
-    printf '%s\n' '{"nodes":[]}'
-  fi
-}
-
-socks_protocol_label(){
-  case "$1" in
-    vless-reality) printf 'VLESS Reality' ;;
-    vless-grpcr) printf 'VLESS gRPC Reality' ;;
-    trojan-reality) printf 'Trojan Reality' ;;
-    hy2) printf 'Hysteria2' ;;
-    vmess-ws) printf 'VMess WS' ;;
-    hy2-obfs) printf 'Hysteria2 obfs' ;;
-    ss2022) printf 'SS2022' ;;
-    ss) printf 'Shadowsocks' ;;
-    tuic-v5) printf 'TUIC v5' ;;
-    anytls) printf 'AnyTLS' ;;
-    *) return 1 ;;
-  esac
-}
-
-socks_node_port_available(){
-  local port="$1" nodes
-  [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || return 1
-  warp_socks_port_conflicts_with_node "$port" && return 1
-  [[ "$port" != "$WARP_SOCKS_PORT" ]] || return 1
-  nodes="$(load_socks_nodes)" || return 1
-  jq -e --argjson port "$port" 'all(.nodes[]; .port != $port)' <<< "$nodes" >/dev/null || return 1
-  if [[ -f "$CONF_JSON" ]] && jq -e --argjson port "$port" \
-      'any(.inbounds[]?; .listen_port == $port)' "$CONF_JSON" >/dev/null; then return 1; fi
-  if command -v ss >/dev/null 2>&1 && [[ -n "$(ss -H -lntu "sport = :$port" 2>/dev/null)" ]]; then return 1; fi
-  [[ "$TLS_CERT_MODE" != acme || ( "$port" != 80 && "$port" != 443 ) ]]
-}
-
-socks_node_firewall_rules(){
-  local nodes protocol port
-  nodes="$(load_socks_nodes)" || return 1
-  while IFS=$'\t' read -r protocol port; do
-    [[ -n "$protocol" ]] || continue
-    case "$protocol" in
-      hy2|hy2-obfs|tuic-v5) printf '%s/udp\n' "$port" ;;
-      ss2022|ss) printf '%s/tcp\n%s/udp\n' "$port" "$port" ;;
-      *) printf '%s/tcp\n' "$port" ;;
-    esac
-  done < <(jq -r '.nodes[] | [.protocol, .port] | @tsv' <<< "$nodes" | tr -d '\r')
-}
-
-close_socks_node_firewall_rules(){
-  local previous="$1" old_rules current_rules rule backend=iptables port proto
-  [[ -f "$previous" ]] || return 0
-  old_rules="$(SOCKS_NODES_JSON="$previous" socks_node_firewall_rules)" || return 1
-  current_rules="$(socks_node_firewall_rules)" || return 1
-  local -a removed=()
-  while IFS= read -r rule; do
-    [[ -n "$rule" ]] || continue
-    if ! grep -Fxq -- "$rule" <<< "$current_rules"; then removed+=("$rule"); fi
-  done <<< "$old_rules"
-  (( ${#removed[@]} > 0 )) || return 0
-  if command -v ufw >/dev/null 2>&1 && ufw status | grep -qi -E '(^|[[:space:]])active($|[[:space:]])|活跃'; then
-    backend=ufw
-  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    backend=firewalld
-  else
-    command -v iptables >/dev/null 2>&1 || return 0
-  fi
-  for rule in "${removed[@]}"; do
-    case "$backend" in
-      ufw) ufw delete allow "$rule" >/dev/null || return 1 ;;
-      firewalld) firewall-cmd --permanent --remove-port="$rule" >/dev/null || return 1 ;;
-      iptables)
-        port="${rule%/*}"; proto="${rule#*/}"
-        if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
-          iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT || return 1
-        fi
-        ;;
-    esac
-  done
-  case "$backend" in
-    ufw) ufw reload >/dev/null ;;
-    firewalld) firewall-cmd --reload >/dev/null ;;
-    iptables) if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save >/dev/null; fi ;;
-  esac
-}
-
-apply_socks_nodes()(
-  trap - EXIT
-  local candidate="$1" expected="$2" current backup_dir failure="" item
-  local service_active=false restart_attempted=false rollback_failed=false
-  ensure_installed_or_hint || return 1
-  validate_socks_nodes "$candidate" >/dev/null || return 1
-  if ! mkdir "$SB_DIR/.socks-nodes.lock" 2>/dev/null; then
-    warn "另一个 SOCKS 节点操作正在运行。"; return 1
-  fi
-  trap 'rmdir "$SB_DIR/.socks-nodes.lock"' EXIT
-  current="$(load_socks_nodes)" || return 1
-  [[ "$current" == "$expected" ]] || { warn "SOCKS 节点已被其他操作修改，请重试。"; return 1; }
-  mkdir -p "$SB_DIR/backups" || return 1
-  backup_dir="$(mktemp -d "$SB_DIR/backups/socks-nodes-$(date +%Y%m%d-%H%M%S)-XXXXXX")" || return 1
-  chmod 700 "$backup_dir" || return 1
-  local -a paths=("$SOCKS_NODES_JSON" "$CONF_JSON" "$SB_DIR/env.conf" "$SB_DIR/ports.env"
-    "$SB_DIR/creds.env" "$CERT_DIR/fullchain.pem" "$CERT_DIR/key.pem" "$SOCKS_SHARE_LINKS_FILE")
-  local -a names=(socks-nodes.json config.json env.conf ports.env creds.env fullchain.pem key.pem socks-share-links.txt)
-  for item in "${!paths[@]}"; do
-    backup_runtime_file "${paths[$item]}" "${names[$item]}" "$backup_dir" || return 1
-  done
-  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
-    service_active=true
-  fi
-  local tmp
-  tmp="$(mktemp "${SOCKS_NODES_JSON}.tmp.XXXXXX")" || return 1
-  if ! cp -- "$candidate" "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$SOCKS_NODES_JSON"; then
-    rm -f -- "$tmp"; failure="保存 SOCKS 节点失败"
-  elif ! write_config true; then
-    failure="生成或校验 SOCKS 节点配置失败"
-  elif [[ "$service_active" == true ]]; then
-    restart_attempted=true
-    restart_service_stably "$SYSTEMD_SERVICE" || failure="服务重启后未能稳定运行"
-  fi
-  if [[ -z "$failure" ]] && ! print_socks_node_links; then
-    failure="生成 SOCKS 节点分享链接失败"
-  fi
-  if [[ -n "$failure" ]]; then
-    for item in "${!paths[@]}"; do
-      restore_runtime_file "$backup_dir" "${names[$item]}" "${paths[$item]}" || rollback_failed=true
-    done
-    if [[ "$restart_attempted" == true ]]; then
-      restart_service_stably "$SYSTEMD_SERVICE" || rollback_failed=true
-    fi
-    warn "$failure，已尝试恢复原配置；备份：$backup_dir"
-    [[ "$rollback_failed" == false ]] || warn "部分恢复失败，请检查服务和备份。"
-    return 1
-  fi
-  open_firewall || warn "配置已保存，但防火墙放行失败，请检查端口。"
-  close_socks_node_firewall_rules "$backup_dir/socks-nodes.json" \
-    || warn "节点已更新，但旧端口防火墙规则清理失败。"
-  if [[ "$service_active" == true ]]; then info "SOCKS 节点已应用";
-  else info "SOCKS 节点已保存；服务当前未运行"; fi
-)
-
-add_socks_node()(
-  trap - EXIT
-  local link protocol name port id outbound current tmp dns_mode=local system_ipv6=false attempt
-  local -a protocols=(vless-reality vless-grpcr trojan-reality hy2 vmess-ws hy2-obfs ss2022 ss tuic-v5 anytls)
-  ensure_installed_or_hint || return 1
-  load_env; load_ports || return 1
-  current="$(load_socks_nodes)" || return 1
-  read -rsp 'SOCKS5 / SOCKS5H 链接: ' link || return 0
-  printf '\n'
-  id="sbp-socks-$(rand_hex8 | tr -d '\r\n')"
-  outbound="$(socks_node_outbound_from_link "$link" "$id-out")" \
-    || { warn "SOCKS 链接无效，请检查地址、端口和认证信息。"; return 1; }
-  [[ "${link%%://*}" != [sS][oO][cC][kK][sS]5[hH] ]] || dns_mode=remote
-  local index=1 choice
-  for protocol in "${protocols[@]}"; do
-    printf '%2s) %s\n' "$index" "$(socks_protocol_label "$protocol")"; index=$((index+1))
-  done
-  read -rp '协议 [1]: ' choice || return 0
-  choice="${choice:-1}"
-  [[ "$choice" =~ ^([1-9]|10)$ ]] || { warn "协议选项无效。"; return 1; }
-  protocol="${protocols[$((choice-1))]}"
-  name="${link#*\#}"
-  if [[ "$name" == "$link" || -z "$name" ]]; then name="$protocol-socks";
-  else name="$(socks_uri_decode "$name")" || { warn "节点名称编码无效。"; return 1; }; fi
-  read -rp "节点名称 [$name]: " choice || return 0
-  name="${choice:-$name}"
-  read -rp '端口 [自动]: ' port || return 0
-  if [[ -z "$port" ]]; then
-    for ((attempt=0; attempt<100; attempt++)); do
-      port=$((RANDOM % 55536 + 10000))
-      socks_node_port_available "$port" && break
-    done
-  fi
-  socks_node_port_available "$port" || { warn "端口无效或已被使用。"; return 1; }
-  printf '系统 IPv6 使用本机出口，目标域名由本机解析。\n'
-  read -rp '启用系统 IPv6 出口（IPv4 优先）？[y/N]: ' choice || return 0
-  case "$choice" in
-    y|Y)
-      [[ -n "$(default_ipv6_address)" ]] || { warn "系统没有可用的 IPv6 出口路由。"; return 1; }
-      system_ipv6=true ;;
-    n|N|'') ;;
-    *) warn "IPv6 选项无效。"; return 1 ;;
-  esac
-  tmp="$(mktemp "$SB_DIR/.socks-node.XXXXXX")" || return 1
-  trap 'rm -f -- "$tmp"' EXIT
-  jq -c --arg id "$id" --arg name "$name" --arg protocol "$protocol" --argjson port "$port" \
-    --arg dns_mode "$dns_mode" --argjson system_ipv6 "$system_ipv6" --argjson outbound "$outbound" \
-    '.nodes += [{id:$id, name:$name, protocol:$protocol, port:$port, dns_mode:$dns_mode, system_ipv6:$system_ipv6, outbound:$outbound}]' \
-    <<< "$current" > "$tmp" || return 1
-  chmod 600 "$tmp" || return 1
-  apply_socks_nodes "$tmp" "$current"
-)
-
-list_socks_nodes(){
-  local nodes
-  nodes="$(load_socks_nodes)" || return 1
-  if [[ "$(jq '.nodes | length' <<< "$nodes")" == 0 ]]; then info "暂无 SOCKS 出口节点"; return 0; fi
-  jq -r '.nodes | to_entries[] | "\(.key + 1)) \(.value.name) | \(.value.protocol) | \(.value.port)" +
-    (if .value.system_ipv6 == true then " | 系统 IPv6" else "" end)' <<< "$nodes"
-}
-
-configure_socks_node_ipv6()(
-  trap - EXIT
-  local current choice count index enabled=false tmp
-  ensure_installed_or_hint || return 1
-  current="$(load_socks_nodes)" || return 1
-  count="$(jq '.nodes | length' <<< "$current")"
-  [[ "$count" != 0 ]] || { info "暂无 SOCKS 出口节点"; return 0; }
-  list_socks_nodes || return 1
-  read -rp '节点编号 [0 返回]: ' choice || return 0
-  [[ "${choice:-0}" != 0 ]] || return 0
-  [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= count )) || { warn "节点编号无效。"; return 1; }
-  index=$((choice-1))
-  if [[ "$(jq -r --argjson index "$index" '.nodes[$index].system_ipv6 // false' <<< "$current")" == true ]]; then
-    choice=2
-  else choice=1; fi
-  printf '1) 仅 SOCKS\n2) SOCKS IPv4 + 系统 IPv6（IPv4 优先）\n'
-  printf '系统 IPv6 使用本机出口，目标域名由本机解析。\n'
-  local selection
-  read -rp "出口模式 [$choice]: " selection || return 0
-  case "${selection:-$choice}" in
-    1) ;;
-    2)
-      [[ -n "$(default_ipv6_address)" ]] || { warn "系统没有可用的 IPv6 出口路由。"; return 1; }
-      enabled=true ;;
-    *) warn "出口模式无效。"; return 1 ;;
-  esac
-  tmp="$(mktemp "$SB_DIR/.socks-node.XXXXXX")" || return 1
-  trap 'rm -f -- "$tmp"' EXIT
-  jq -c --argjson index "$index" --argjson enabled "$enabled" \
-    '.nodes[$index].system_ipv6 = $enabled' <<< "$current" > "$tmp" || return 1
-  chmod 600 "$tmp" || return 1
-  apply_socks_nodes "$tmp" "$current"
-)
-
-remove_socks_node()(
-  trap - EXIT
-  local current choice count tmp confirm
-  current="$(load_socks_nodes)" || return 1
-  count="$(jq '.nodes | length' <<< "$current")"
-  [[ "$count" != 0 ]] || { info "暂无 SOCKS 出口节点"; return 0; }
-  list_socks_nodes || return 1
-  read -rp '删除节点编号 [0 返回]: ' choice || return 0
-  [[ "${choice:-0}" != 0 ]] || return 0
-  [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= count )) || { warn "节点编号无效。"; return 1; }
-  read -rp '删除该节点并重启运行中的服务？[y/N]: ' confirm || return 0
-  [[ "$confirm" == [yY] ]] || return 0
-  tmp="$(mktemp "$SB_DIR/.socks-node.XXXXXX")" || return 1
-  trap 'rm -f -- "$tmp"' EXIT
-  jq -c --argjson index "$((choice-1))" 'del(.nodes[$index])' <<< "$current" > "$tmp" || return 1
-  chmod 600 "$tmp" || return 1
-  apply_socks_nodes "$tmp" "$current"
-)
-
-socks_nodes_menu(){
-  ensure_installed_or_hint || return 0
-  local choice
-  while :; do
-    hr
-    printf 'SOCKS 出口节点\n1) 导入链接并创建节点\n2) 查看节点\n3) 查看分享链接\n4) 删除节点\n5) 配置系统 IPv6 出口\n0) 返回\n'
-    read -rp '选择: ' choice || return 0
-    case "$choice" in
-      1) add_socks_node || true ;;
-      2) list_socks_nodes || true ;;
-      3) print_socks_node_links || true ;;
-      4) remove_socks_node || true ;;
-      5) configure_socks_node_ipv6 || true ;;
-      0|'') return 0 ;;
-      *) warn "无效选项" ;;
-    esac
-  done
 }
 
 # ===== env / creds / warp =====
@@ -1108,6 +762,346 @@ save_warp(){
   mv -f -- "$tmp" "$SB_DIR/warp.env" || { rm -f -- "$tmp"; return 1; }
 }
 load_warp(){ safe_source_env "$SB_DIR/warp.env" || return 1; }
+
+# 生成 8 字节十六进制（16 个 hex 字符）
+rand_hex8(){
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 8 | tr -d "\n"
+  else
+    # 兜底：没有 openssl 时用 hexdump
+    hexdump -v -n 8 -e '1/1 "%02x"' /dev/urandom
+  fi
+}
+rand_b64_32(){ openssl rand -base64 32 | tr -d "\n"; }
+
+gen_uuid(){
+  local u=""
+  if [[ -x "$BIN_PATH" ]]; then u=$("$BIN_PATH" generate uuid 2>/dev/null | head -n1); fi
+  if [[ -z "$u" ]] && command -v uuidgen >/dev/null 2>&1; then u=$(uuidgen | head -n1); fi
+  if [[ -z "$u" ]]; then u=$(cat /proc/sys/kernel/random/uuid | head -n1); fi
+  printf '%s' "$u" | tr -d '\r\n'
+}
+gen_reality(){ "$BIN_PATH" generate reality-keypair; }
+
+valid_tls_domain(){
+  local domain="${1%.}"
+  (( ${#domain} <= 253 )) || return 1
+  [[ "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]
+}
+
+tls_ca_bundle(){
+  local bundle
+  for bundle in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+    [[ -s "$bundle" ]] && { printf '%s' "$bundle"; return 0; }
+  done
+  return 1
+}
+
+# openssl x509 -checkhost 无论主机名是否匹配都以 0 退出，判定结果只写到 stdout，
+# 因此必须解析输出而不能依赖退出码。
+cert_matches_host(){
+  local crt=$1 host=$2 out
+  [[ -s "$crt" && -n "$host" ]] || return 1
+  out="$(openssl x509 -in "$crt" -noout -checkhost "$host" 2>/dev/null)" || return 1
+  [[ "$out" == *"does match certificate"* && "$out" != *"NOT match"* ]]
+}
+
+validate_manual_certificate(){
+  local quiet="${1:-false}" cert_pub key_pub bundle
+  local fail_prefix="手动证书校验失败："
+
+  if ! valid_tls_domain "$TLS_DOMAIN"; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}域名格式无效"
+    return 1
+  fi
+  if [[ "$TLS_CERT_PATH" != /* || ! -r "$TLS_CERT_PATH" || ! -s "$TLS_CERT_PATH" ]]; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}证书路径必须是可读的绝对路径：$TLS_CERT_PATH"
+    return 1
+  fi
+  if [[ "$TLS_KEY_PATH" != /* || ! -r "$TLS_KEY_PATH" || ! -s "$TLS_KEY_PATH" ]]; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}私钥路径必须是可读的绝对路径：$TLS_KEY_PATH"
+    return 1
+  fi
+  if ! openssl x509 -in "$TLS_CERT_PATH" -noout >/dev/null 2>&1; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}证书不是有效的 PEM X.509 文件"
+    return 1
+  fi
+  if ! openssl pkey -in "$TLS_KEY_PATH" -noout >/dev/null 2>&1; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}私钥不是可直接读取的 PEM 文件（不支持带密码私钥）"
+    return 1
+  fi
+  if ! openssl x509 -in "$TLS_CERT_PATH" -noout -checkend 0 >/dev/null 2>&1; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}证书已经过期或尚未生效"
+    return 1
+  fi
+  if ! cert_matches_host "$TLS_CERT_PATH" "$TLS_DOMAIN"; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}证书不包含域名 $TLS_DOMAIN"
+    return 1
+  fi
+
+  cert_pub="$(openssl x509 -in "$TLS_CERT_PATH" -pubkey -noout 2>/dev/null \
+    | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null)"
+  key_pub="$(openssl pkey -in "$TLS_KEY_PATH" -pubout -outform DER 2>/dev/null \
+    | openssl dgst -sha256 2>/dev/null)"
+  if [[ -z "$cert_pub" || "$cert_pub" != "$key_pub" ]]; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}证书与私钥不匹配"
+    return 1
+  fi
+
+  bundle="$(tls_ca_bundle || true)"
+  if [[ -z "$bundle" ]] || ! openssl verify -purpose sslserver -CAfile "$bundle" \
+      -untrusted "$TLS_CERT_PATH" "$TLS_CERT_PATH" >/dev/null 2>&1; then
+    [[ "$quiet" == true ]] || warn "${fail_prefix}无法验证到系统信任的公开 CA，请提供包含中间证书的 fullchain"
+    return 1
+  fi
+  return 0
+}
+
+tcp_port_is_listening(){
+  local port="$1"
+  ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${port}$"
+}
+
+tls_domain_points_to_server(){
+  local domain="$1" public_ip
+  public_ip="$(get_ip)"
+  [[ "$public_ip" != "127.0.0.1" ]] || return 1
+  getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | grep -Fqx "$public_ip"
+}
+
+configure_tls_certificate(){
+  local choice default_choice domain cert_path key_path email
+  ensure_dirs
+  load_env || true
+  case "$TLS_CERT_MODE" in
+    manual) default_choice=2 ;;
+    acme) default_choice=3 ;;
+    *) default_choice=1 ;;
+  esac
+
+  echo
+  echo -e "${C_CYAN}${C_BOLD}TLS 证书配置${C_RESET}（用于 Hysteria2 / TUIC / AnyTLS）"
+  echo "  1) 自签证书（默认；导入链接仍强制证书校验）"
+  echo "  2) 使用已上传的公开有效证书"
+  echo "  3) 使用 ACME 自动申请和续期"
+  read -rp "选择 [${default_choice}]: " choice || return 1
+  choice="${choice:-$default_choice}"
+
+  case "$choice" in
+    1)
+      TLS_CERT_MODE=self_signed
+      TLS_DOMAIN=""
+      TLS_CERT_PATH="$CERT_DIR/fullchain.pem"
+      TLS_KEY_PATH="$CERT_DIR/key.pem"
+      TLS_ACME_EMAIL=""
+      ;;
+    2)
+      read -rp "证书域名（例如 vpn.example.com）: " domain || return 1
+      domain="${domain%.}"; domain="${domain,,}"
+      read -erp "fullchain.pem 绝对路径: " cert_path || return 1
+      read -erp "私钥绝对路径: " key_path || return 1
+      TLS_CERT_MODE=manual
+      TLS_DOMAIN="$domain"
+      TLS_CERT_PATH="$cert_path"
+      TLS_KEY_PATH="$key_path"
+      validate_manual_certificate || return 1
+      if ! tls_domain_points_to_server "$domain"; then
+        warn "未检测到 $domain 的 IPv4 A 记录指向本机公网 IPv4，生成的域名节点可能无法连接。"
+        read -rp "确认 DNS 已正确配置并继续？[y/N]: " choice || return 1
+        [[ "$choice" =~ ^[yY]$ ]] || return 1
+      fi
+      ;;
+    3)
+      read -rp "申请证书的域名（需已解析到本机，且关闭 CDN 代理）: " domain || return 1
+      domain="${domain%.}"; domain="${domain,,}"
+      valid_tls_domain "$domain" || { warn "域名格式无效：$domain"; return 1; }
+      read -rp "ACME 联系邮箱（可留空）: " email || return 1
+      if [[ -n "$email" && ! "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+        warn "邮箱格式无效"
+        return 1
+      fi
+      if ! tls_domain_points_to_server "$domain"; then
+        warn "未检测到 $domain 的 IPv4 A 记录指向本机公网 IPv4，ACME 申请或节点连接可能失败。"
+        read -rp "确认 DNS 已正确配置并继续？[y/N]: " choice || return 1
+        [[ "$choice" =~ ^[yY]$ ]] || return 1
+      fi
+
+      # 优先只使用 HTTP-01；80 被占用时再回退到 TLS-ALPN-01，避免挑战端口冲突。
+      if ! tcp_port_is_listening 80; then
+        TLS_ACME_DISABLE_HTTP_CHALLENGE=false
+        TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE=true
+      elif ! tcp_port_is_listening 443; then
+        TLS_ACME_DISABLE_HTTP_CHALLENGE=true
+        TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE=false
+      else
+        warn "80 和 443 TCP 端口均被占用，内置 ACME 无法启动验证监听器"
+        return 1
+      fi
+      TLS_CERT_MODE=acme
+      TLS_DOMAIN="$domain"
+      TLS_CERT_PATH=""
+      TLS_KEY_PATH=""
+      TLS_ACME_EMAIL="$email"
+      TLS_ACME_PROVIDER=letsencrypt
+      TLS_ACME_DATA_DIR="$CERT_DIR/acme"
+      ;;
+    *)
+      warn "无效的证书模式"
+      return 1
+      ;;
+  esac
+
+  return 0
+}
+
+mk_cert(){
+  local crt="$TLS_CERT_PATH" key="$TLS_KEY_PATH" tmp_dir cert_pub key_pub
+  local cert_name="$REALITY_SERVER"
+
+  if [[ -s "$crt" && -s "$key" ]] \
+      && cert_matches_host "$crt" "$cert_name" \
+      && openssl pkey -in "$key" -noout >/dev/null 2>&1; then
+    cert_pub="$(openssl x509 -in "$crt" -pubkey -noout 2>/dev/null \
+      | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null)"
+    key_pub="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null \
+      | openssl dgst -sha256 2>/dev/null)"
+    if [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]; then
+      chmod 600 "$key" 2>/dev/null || true
+      return 0
+    fi
+  fi
+
+  tmp_dir="$(mktemp -d "$CERT_DIR/.self-signed.XXXXXX")" || return 1
+  if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 -nodes \
+      -keyout "$tmp_dir/key.pem" -out "$tmp_dir/fullchain.pem" -subj "/CN=$cert_name" \
+      -addext "subjectAltName=DNS:$cert_name" >/dev/null 2>&1 \
+      || ! cert_matches_host "$tmp_dir/fullchain.pem" "$cert_name" \
+      || ! openssl pkey -in "$tmp_dir/key.pem" -noout >/dev/null 2>&1; then
+    rm -rf "$tmp_dir"
+    warn "生成自签证书失败"
+    return 1
+  fi
+
+  chmod 600 "$tmp_dir/key.pem"
+  chmod 644 "$tmp_dir/fullchain.pem"
+  if ! mv -f "$tmp_dir/key.pem" "$key" || ! mv -f "$tmp_dir/fullchain.pem" "$crt"; then
+    rm -rf "$tmp_dir"
+    warn "写入自签证书失败：$crt / $key"
+    return 1
+  fi
+  rmdir "$tmp_dir" 2>/dev/null || true
+}
+
+prepare_tls_certificate(){
+  case "$TLS_CERT_MODE" in
+    self_signed)
+      TLS_CERT_PATH="$CERT_DIR/fullchain.pem"
+      TLS_KEY_PATH="$CERT_DIR/key.pem"
+      mk_cert
+      ;;
+    manual)
+      validate_manual_certificate || return 1
+      ;;
+    acme)
+      valid_tls_domain "$TLS_DOMAIN" || { warn "ACME 域名无效：$TLS_DOMAIN"; return 1; }
+      mkdir -p "$TLS_ACME_DATA_DIR"
+      chmod 700 "$TLS_ACME_DATA_DIR" 2>/dev/null || true
+      ;;
+    *)
+      warn "未知 TLS 证书模式：$TLS_CERT_MODE"
+      return 1
+      ;;
+  esac
+}
+
+# 仅自签模式的证书由脚本托管；手动 / ACME 证书由用户或 CA 签发，重签无意义
+managed_cert_sni_mismatch(){
+  [[ "${TLS_CERT_MODE:-self_signed}" == "self_signed" ]] || return 1
+  [[ -n "${REALITY_SERVER:-}" ]] || return 1
+  local crt="${CERT_DIR}/fullchain.pem"
+  # 尚未部署过证书时不算不匹配，避免全新机器上误报
+  [[ -s "$crt" ]] || return 1
+  ! cert_matches_host "$crt" "$REALITY_SERVER"
+}
+
+warn_if_cert_sni_mismatch(){
+  managed_cert_sni_mismatch || return 0
+  warn "托管自签证书与当前 Reality SNI (${REALITY_SERVER}) 不匹配，证书仍是旧域名。"
+  warn "运行 sudo ${SBP_SCRIPT_PATH} --reissue-cert 重新签发（会重启 sing-box）。"
+}
+
+reissue_managed_certificate(){
+  [[ "$EUID" -eq 0 || "${SBP_SKIP_ROOT:-0}" -eq 1 || -n "${TEST_ROOT:-}" ]] \
+    || die "重新签发证书需要 root 权限，请使用 sudo 运行"
+  load_env || true
+  apply_runtime_overrides
+  normalize_runtime_settings
+
+  if [[ "${TLS_CERT_MODE:-self_signed}" != "self_signed" ]]; then
+    info "当前证书模式为 $(tls_mode_label)，证书不由脚本签发，无需重签。"
+    return 0
+  fi
+
+  local backup rc=0
+  backup="$(mktemp -d)" || die "无法创建证书备份目录"
+  mkdir -p "$CERT_DIR"
+  cp -a "$CERT_DIR/." "$backup/" 2>/dev/null || true
+
+  local failure=""
+  if ! prepare_tls_certificate; then
+    failure="重新签发自签证书失败"
+  elif ! cert_matches_host "$TLS_CERT_PATH" "$REALITY_SERVER"; then
+    failure="新证书仍不匹配 SNI ${REALITY_SERVER}"
+  elif [[ -x "$BIN_PATH" && -s "$CONF_JSON" ]] && ! "$BIN_PATH" check -c "$CONF_JSON"; then
+    failure="配置检查失败"
+  fi
+  if [[ -n "$failure" ]]; then
+    cp -a "$backup/." "$CERT_DIR/" 2>/dev/null || true
+    rm -rf "$backup"
+    die "${failure}，已恢复原证书"
+  fi
+
+  info "自签证书已重新签发：CN=${REALITY_SERVER}"
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
+    if systemctl restart "$SYSTEMD_SERVICE"; then
+      info "sing-box 已重启，新证书生效。"
+    else
+      warn "证书已更新，但服务重启失败，请手动检查。"
+      rc=1
+    fi
+  else
+    info "sing-box 未在运行，证书已更新，下次启动时生效。"
+  fi
+  rm -rf "$backup"
+  return "$rc"
+}
+
+tls_uses_public_certificate(){
+  case "$TLS_CERT_MODE" in
+    acme) valid_tls_domain "$TLS_DOMAIN" ;;
+    manual) validate_manual_certificate true ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_creds(){
+  [[ -z "${UUID:-}" ]] && UUID=$(gen_uuid)
+  is_uuid "$UUID" || UUID=$(gen_uuid)
+  [[ -z "${HY2_PWD:-}" ]] && HY2_PWD=$(rand_b64_32)
+  if [[ -z "${REALITY_PRIV:-}" || -z "${REALITY_PUB:-}" || -z "${REALITY_SID:-}" ]]; then
+    readarray -t RKP < <(gen_reality)
+    REALITY_PRIV=$(printf "%s\n" "${RKP[@]}" | awk '/PrivateKey/{print $2}')
+    REALITY_PUB=$(printf "%s\n" "${RKP[@]}" | awk '/PublicKey/{print $2}')
+    REALITY_SID=$(rand_hex8)
+  fi
+  [[ -z "${HY2_PWD2:-}" ]] && HY2_PWD2=$(rand_b64_32)
+  [[ -z "${HY2_OBFS_PWD:-}" ]] && HY2_OBFS_PWD=$(openssl rand -base64 16 | tr -d "\n")
+  [[ -z "${SS2022_KEY:-}" ]] && SS2022_KEY=$(rand_b64_32)
+  [[ -z "${SS_PWD:-}" ]] && SS_PWD=$(openssl rand -base64 24 | tr -d "=\n" | tr "+/" "-_")
+  TUIC_UUID="$UUID"; TUIC_PWD="$UUID"
+  [[ -z "${ANYTLS_PWD:-}" ]] && ANYTLS_PWD=$(rand_b64_32)
+  save_creds
+}
 
 # ===== 自定义路由 =====
 empty_route_json(){ printf '%s\n' '{"rules":[],"rule_set":[],"outbounds":[],"default_outbound":"direct"}'; }
@@ -1771,906 +1765,6 @@ share_link_to_outbound(){
   esac
 }
 
-# 生成 8 字节十六进制（16 个 hex 字符）
-rand_hex8(){
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 8 | tr -d "\n"
-  else
-    # 兜底：没有 openssl 时用 hexdump
-    hexdump -v -n 8 -e '1/1 "%02x"' /dev/urandom
-  fi
-}
-rand_b64_32(){ openssl rand -base64 32 | tr -d "\n"; }
-
-gen_uuid(){
-  local u=""
-  if [[ -x "$BIN_PATH" ]]; then u=$("$BIN_PATH" generate uuid 2>/dev/null | head -n1); fi
-  if [[ -z "$u" ]] && command -v uuidgen >/dev/null 2>&1; then u=$(uuidgen | head -n1); fi
-  if [[ -z "$u" ]]; then u=$(cat /proc/sys/kernel/random/uuid | head -n1); fi
-  printf '%s' "$u" | tr -d '\r\n'
-}
-gen_reality(){ "$BIN_PATH" generate reality-keypair; }
-
-valid_tls_domain(){
-  local domain="${1%.}"
-  (( ${#domain} <= 253 )) || return 1
-  [[ "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]
-}
-
-tls_ca_bundle(){
-  local bundle
-  for bundle in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
-    [[ -s "$bundle" ]] && { printf '%s' "$bundle"; return 0; }
-  done
-  return 1
-}
-
-# openssl x509 -checkhost 无论主机名是否匹配都以 0 退出，判定结果只写到 stdout，
-# 因此必须解析输出而不能依赖退出码。
-cert_matches_host(){
-  local crt=$1 host=$2 out
-  [[ -s "$crt" && -n "$host" ]] || return 1
-  out="$(openssl x509 -in "$crt" -noout -checkhost "$host" 2>/dev/null)" || return 1
-  [[ "$out" == *"does match certificate"* && "$out" != *"NOT match"* ]]
-}
-
-validate_manual_certificate(){
-  local quiet="${1:-false}" cert_pub key_pub bundle
-  local fail_prefix="手动证书校验失败："
-
-  if ! valid_tls_domain "$TLS_DOMAIN"; then
-    [[ "$quiet" == true ]] || warn "${fail_prefix}域名格式无效"
-    return 1
-  fi
-  if [[ "$TLS_CERT_PATH" != /* || ! -r "$TLS_CERT_PATH" || ! -s "$TLS_CERT_PATH" ]]; then
-    [[ "$quiet" == true ]] || warn "${fail_prefix}证书路径必须是可读的绝对路径：$TLS_CERT_PATH"
-    return 1
-  fi
-  if [[ "$TLS_KEY_PATH" != /* || ! -r "$TLS_KEY_PATH" || ! -s "$TLS_KEY_PATH" ]]; then
-    [[ "$quiet" == true ]] || warn "${fail_prefix}私钥路径必须是可读的绝对路径：$TLS_KEY_PATH"
-    return 1
-  fi
-  if ! openssl x509 -in "$TLS_CERT_PATH" -noout >/dev/null 2>&1; then
-    [[ "$quiet" == true ]] || warn "${fail_prefix}证书不是有效的 PEM X.509 文件"
-    return 1
-  fi
-  if ! openssl pkey -in "$TLS_KEY_PATH" -noout >/dev/null 2>&1; then
-    [[ "$quiet" == true ]] || warn "${fail_prefix}私钥不是可直接读取的 PEM 文件（不支持带密码私钥）"
-    return 1
-  fi
-  if ! openssl x509 -in "$TLS_CERT_PATH" -noout -checkend 0 >/dev/null 2>&1; then
-    [[ "$quiet" == true ]] || warn "${fail_prefix}证书已经过期或尚未生效"
-    return 1
-  fi
-  if ! cert_matches_host "$TLS_CERT_PATH" "$TLS_DOMAIN"; then
-    [[ "$quiet" == true ]] || warn "${fail_prefix}证书不包含域名 $TLS_DOMAIN"
-    return 1
-  fi
-
-  cert_pub="$(openssl x509 -in "$TLS_CERT_PATH" -pubkey -noout 2>/dev/null \
-    | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null)"
-  key_pub="$(openssl pkey -in "$TLS_KEY_PATH" -pubout -outform DER 2>/dev/null \
-    | openssl dgst -sha256 2>/dev/null)"
-  if [[ -z "$cert_pub" || "$cert_pub" != "$key_pub" ]]; then
-    [[ "$quiet" == true ]] || warn "${fail_prefix}证书与私钥不匹配"
-    return 1
-  fi
-
-  bundle="$(tls_ca_bundle || true)"
-  if [[ -z "$bundle" ]] || ! openssl verify -purpose sslserver -CAfile "$bundle" \
-      -untrusted "$TLS_CERT_PATH" "$TLS_CERT_PATH" >/dev/null 2>&1; then
-    [[ "$quiet" == true ]] || warn "${fail_prefix}无法验证到系统信任的公开 CA，请提供包含中间证书的 fullchain"
-    return 1
-  fi
-  return 0
-}
-
-tcp_port_is_listening(){
-  local port="$1"
-  ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq ":${port}$"
-}
-
-tls_domain_points_to_server(){
-  local domain="$1" public_ip
-  public_ip="$(get_ip)"
-  [[ "$public_ip" != "127.0.0.1" ]] || return 1
-  getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | grep -Fqx "$public_ip"
-}
-
-configure_tls_certificate(){
-  local choice default_choice domain cert_path key_path email
-  ensure_dirs
-  load_env || true
-  case "$TLS_CERT_MODE" in
-    manual) default_choice=2 ;;
-    acme) default_choice=3 ;;
-    *) default_choice=1 ;;
-  esac
-
-  echo
-  echo -e "${C_CYAN}${C_BOLD}TLS 证书配置${C_RESET}（用于 Hysteria2 / TUIC / AnyTLS）"
-  echo "  1) 自签证书（默认；导入链接仍强制证书校验）"
-  echo "  2) 使用已上传的公开有效证书"
-  echo "  3) 使用 ACME 自动申请和续期"
-  read -rp "选择 [${default_choice}]: " choice || return 1
-  choice="${choice:-$default_choice}"
-
-  case "$choice" in
-    1)
-      TLS_CERT_MODE=self_signed
-      TLS_DOMAIN=""
-      TLS_CERT_PATH="$CERT_DIR/fullchain.pem"
-      TLS_KEY_PATH="$CERT_DIR/key.pem"
-      TLS_ACME_EMAIL=""
-      ;;
-    2)
-      read -rp "证书域名（例如 vpn.example.com）: " domain || return 1
-      domain="${domain%.}"; domain="${domain,,}"
-      read -erp "fullchain.pem 绝对路径: " cert_path || return 1
-      read -erp "私钥绝对路径: " key_path || return 1
-      TLS_CERT_MODE=manual
-      TLS_DOMAIN="$domain"
-      TLS_CERT_PATH="$cert_path"
-      TLS_KEY_PATH="$key_path"
-      validate_manual_certificate || return 1
-      if ! tls_domain_points_to_server "$domain"; then
-        warn "未检测到 $domain 的 IPv4 A 记录指向本机公网 IPv4，生成的域名节点可能无法连接。"
-        read -rp "确认 DNS 已正确配置并继续？[y/N]: " choice || return 1
-        [[ "$choice" =~ ^[yY]$ ]] || return 1
-      fi
-      ;;
-    3)
-      read -rp "申请证书的域名（需已解析到本机，且关闭 CDN 代理）: " domain || return 1
-      domain="${domain%.}"; domain="${domain,,}"
-      valid_tls_domain "$domain" || { warn "域名格式无效：$domain"; return 1; }
-      read -rp "ACME 联系邮箱（可留空）: " email || return 1
-      if [[ -n "$email" && ! "$email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
-        warn "邮箱格式无效"
-        return 1
-      fi
-      if ! tls_domain_points_to_server "$domain"; then
-        warn "未检测到 $domain 的 IPv4 A 记录指向本机公网 IPv4，ACME 申请或节点连接可能失败。"
-        read -rp "确认 DNS 已正确配置并继续？[y/N]: " choice || return 1
-        [[ "$choice" =~ ^[yY]$ ]] || return 1
-      fi
-
-      # 优先只使用 HTTP-01；80 被占用时再回退到 TLS-ALPN-01，避免挑战端口冲突。
-      if ! tcp_port_is_listening 80; then
-        TLS_ACME_DISABLE_HTTP_CHALLENGE=false
-        TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE=true
-      elif ! tcp_port_is_listening 443; then
-        TLS_ACME_DISABLE_HTTP_CHALLENGE=true
-        TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE=false
-      else
-        warn "80 和 443 TCP 端口均被占用，内置 ACME 无法启动验证监听器"
-        return 1
-      fi
-      TLS_CERT_MODE=acme
-      TLS_DOMAIN="$domain"
-      TLS_CERT_PATH=""
-      TLS_KEY_PATH=""
-      TLS_ACME_EMAIL="$email"
-      TLS_ACME_PROVIDER=letsencrypt
-      TLS_ACME_DATA_DIR="$CERT_DIR/acme"
-      ;;
-    *)
-      warn "无效的证书模式"
-      return 1
-      ;;
-  esac
-
-  return 0
-}
-
-mk_cert(){
-  local crt="$TLS_CERT_PATH" key="$TLS_KEY_PATH" tmp_dir cert_pub key_pub
-  local cert_name="$REALITY_SERVER"
-
-  if [[ -s "$crt" && -s "$key" ]] \
-      && cert_matches_host "$crt" "$cert_name" \
-      && openssl pkey -in "$key" -noout >/dev/null 2>&1; then
-    cert_pub="$(openssl x509 -in "$crt" -pubkey -noout 2>/dev/null \
-      | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null)"
-    key_pub="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null \
-      | openssl dgst -sha256 2>/dev/null)"
-    if [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]; then
-      chmod 600 "$key" 2>/dev/null || true
-      return 0
-    fi
-  fi
-
-  tmp_dir="$(mktemp -d "$CERT_DIR/.self-signed.XXXXXX")" || return 1
-  if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 -nodes \
-      -keyout "$tmp_dir/key.pem" -out "$tmp_dir/fullchain.pem" -subj "/CN=$cert_name" \
-      -addext "subjectAltName=DNS:$cert_name" >/dev/null 2>&1 \
-      || ! cert_matches_host "$tmp_dir/fullchain.pem" "$cert_name" \
-      || ! openssl pkey -in "$tmp_dir/key.pem" -noout >/dev/null 2>&1; then
-    rm -rf "$tmp_dir"
-    warn "生成自签证书失败"
-    return 1
-  fi
-
-  chmod 600 "$tmp_dir/key.pem"
-  chmod 644 "$tmp_dir/fullchain.pem"
-  if ! mv -f "$tmp_dir/key.pem" "$key" || ! mv -f "$tmp_dir/fullchain.pem" "$crt"; then
-    rm -rf "$tmp_dir"
-    warn "写入自签证书失败：$crt / $key"
-    return 1
-  fi
-  rmdir "$tmp_dir" 2>/dev/null || true
-}
-
-prepare_tls_certificate(){
-  case "$TLS_CERT_MODE" in
-    self_signed)
-      TLS_CERT_PATH="$CERT_DIR/fullchain.pem"
-      TLS_KEY_PATH="$CERT_DIR/key.pem"
-      mk_cert
-      ;;
-    manual)
-      validate_manual_certificate || return 1
-      ;;
-    acme)
-      valid_tls_domain "$TLS_DOMAIN" || { warn "ACME 域名无效：$TLS_DOMAIN"; return 1; }
-      mkdir -p "$TLS_ACME_DATA_DIR"
-      chmod 700 "$TLS_ACME_DATA_DIR" 2>/dev/null || true
-      ;;
-    *)
-      warn "未知 TLS 证书模式：$TLS_CERT_MODE"
-      return 1
-      ;;
-  esac
-}
-
-# 仅自签模式的证书由脚本托管；手动 / ACME 证书由用户或 CA 签发，重签无意义
-managed_cert_sni_mismatch(){
-  [[ "${TLS_CERT_MODE:-self_signed}" == "self_signed" ]] || return 1
-  [[ -n "${REALITY_SERVER:-}" ]] || return 1
-  local crt="${CERT_DIR}/fullchain.pem"
-  # 尚未部署过证书时不算不匹配，避免全新机器上误报
-  [[ -s "$crt" ]] || return 1
-  ! cert_matches_host "$crt" "$REALITY_SERVER"
-}
-
-warn_if_cert_sni_mismatch(){
-  managed_cert_sni_mismatch || return 0
-  warn "托管自签证书与当前 Reality SNI (${REALITY_SERVER}) 不匹配，证书仍是旧域名。"
-  warn "运行 sudo ${SBP_SCRIPT_PATH} --reissue-cert 重新签发（会重启 sing-box）。"
-}
-
-reissue_managed_certificate(){
-  [[ "$EUID" -eq 0 || "${SBP_SKIP_ROOT:-0}" -eq 1 || -n "${TEST_ROOT:-}" ]] \
-    || die "重新签发证书需要 root 权限，请使用 sudo 运行"
-  load_env || true
-  apply_runtime_overrides
-  normalize_runtime_settings
-
-  if [[ "${TLS_CERT_MODE:-self_signed}" != "self_signed" ]]; then
-    info "当前证书模式为 $(tls_mode_label)，证书不由脚本签发，无需重签。"
-    return 0
-  fi
-
-  local backup rc=0
-  backup="$(mktemp -d)" || die "无法创建证书备份目录"
-  mkdir -p "$CERT_DIR"
-  cp -a "$CERT_DIR/." "$backup/" 2>/dev/null || true
-
-  local failure=""
-  if ! prepare_tls_certificate; then
-    failure="重新签发自签证书失败"
-  elif ! cert_matches_host "$TLS_CERT_PATH" "$REALITY_SERVER"; then
-    failure="新证书仍不匹配 SNI ${REALITY_SERVER}"
-  elif [[ -x "$BIN_PATH" && -s "$CONF_JSON" ]] && ! "$BIN_PATH" check -c "$CONF_JSON"; then
-    failure="配置检查失败"
-  fi
-  if [[ -n "$failure" ]]; then
-    cp -a "$backup/." "$CERT_DIR/" 2>/dev/null || true
-    rm -rf "$backup"
-    die "${failure}，已恢复原证书"
-  fi
-
-  info "自签证书已重新签发：CN=${REALITY_SERVER}"
-  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
-    if systemctl restart "$SYSTEMD_SERVICE"; then
-      info "sing-box 已重启，新证书生效。"
-    else
-      warn "证书已更新，但服务重启失败，请手动检查。"
-      rc=1
-    fi
-  else
-    info "sing-box 未在运行，证书已更新，下次启动时生效。"
-  fi
-  rm -rf "$backup"
-  return "$rc"
-}
-
-tls_uses_public_certificate(){
-  case "$TLS_CERT_MODE" in
-    acme) valid_tls_domain "$TLS_DOMAIN" ;;
-    manual) validate_manual_certificate true ;;
-    *) return 1 ;;
-  esac
-}
-
-ensure_creds(){
-  [[ -z "${UUID:-}" ]] && UUID=$(gen_uuid)
-  is_uuid "$UUID" || UUID=$(gen_uuid)
-  [[ -z "${HY2_PWD:-}" ]] && HY2_PWD=$(rand_b64_32)
-  if [[ -z "${REALITY_PRIV:-}" || -z "${REALITY_PUB:-}" || -z "${REALITY_SID:-}" ]]; then
-    readarray -t RKP < <(gen_reality)
-    REALITY_PRIV=$(printf "%s\n" "${RKP[@]}" | awk '/PrivateKey/{print $2}')
-    REALITY_PUB=$(printf "%s\n" "${RKP[@]}" | awk '/PublicKey/{print $2}')
-    REALITY_SID=$(rand_hex8)
-  fi
-  [[ -z "${HY2_PWD2:-}" ]] && HY2_PWD2=$(rand_b64_32)
-  [[ -z "${HY2_OBFS_PWD:-}" ]] && HY2_OBFS_PWD=$(openssl rand -base64 16 | tr -d "\n")
-  [[ -z "${SS2022_KEY:-}" ]] && SS2022_KEY=$(rand_b64_32)
-  [[ -z "${SS_PWD:-}" ]] && SS_PWD=$(openssl rand -base64 24 | tr -d "=\n" | tr "+/" "-_")
-  TUIC_UUID="$UUID"; TUIC_PWD="$UUID"
-  [[ -z "${ANYTLS_PWD:-}" ]] && ANYTLS_PWD=$(rand_b64_32)
-  save_creds
-}
-
-# ===== WARP（官方客户端，本地 SOCKS5 代理） =====
-WARP_CLI_MANAGED_MARKER=${WARP_CLI_MANAGED_MARKER:-$SB_DIR/.warp-cli-installed-by-sbp}
-WARP_OS_RELEASE=${WARP_OS_RELEASE:-/etc/os-release}
-WARP_APT_KEYRING=${WARP_APT_KEYRING:-/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg}
-WARP_APT_SOURCE_LIST=${WARP_APT_SOURCE_LIST:-/etc/apt/sources.list.d/cloudflare-client.list}
-WARP_YUM_REPO=${WARP_YUM_REPO:-/etc/yum.repos.d/cloudflare-warp.repo}
-
-valid_warp_proxy_settings(){
-  [[ "${WARP_SOCKS_HOST:-}" == "127.0.0.1" || "${WARP_SOCKS_HOST:-}" == "::1" ]] || return 1
-  [[ "${WARP_SOCKS_PORT:-}" =~ ^[0-9]+$ ]] || return 1
-  (( ${#WARP_SOCKS_PORT} <= 5 )) || return 1
-  (( 10#$WARP_SOCKS_PORT >= 1 && 10#$WARP_SOCKS_PORT <= 65535 ))
-}
-
-warp_proxy_config_ready(){
-  [[ "${ENABLE_WARP:-false}" == "true" && "${WARP_BACKEND:-auto}" == "proxy" ]] || return 1
-  valid_warp_proxy_settings
-}
-
-warp_proxy_url(){
-  if [[ "${WARP_SOCKS_HOST:-127.0.0.1}" == "::1" ]]; then
-    printf 'socks5h://[::1]:%s' "$WARP_SOCKS_PORT"
-  else
-    printf 'socks5h://127.0.0.1:%s' "$WARP_SOCKS_PORT"
-  fi
-}
-
-warp_proxy_listener_ready(){
-  local listeners=""
-  if command -v ss >/dev/null 2>&1; then
-    listeners="$(ss -H -ltn "sport = :${WARP_SOCKS_PORT}" 2>/dev/null || true)"
-  elif command -v netstat >/dev/null 2>&1; then
-    listeners="$(netstat -lnt 2>/dev/null || true)"
-  else
-    return 1
-  fi
-
-  if [[ "$WARP_SOCKS_HOST" == "::1" ]]; then
-    printf '%s\n' "$listeners" | grep -Eq "(^|[[:space:]])(\\[::1\\]|::1):${WARP_SOCKS_PORT}([[:space:]]|$)"
-  else
-    printf '%s\n' "$listeners" | grep -Eq "(^|[[:space:]])127\\.0\\.0\\.1:${WARP_SOCKS_PORT}([[:space:]]|$)"
-  fi
-}
-
-install_warp_cli(){
-  command -v warp-cli >/dev/null 2>&1 && return 0
-
-  local arch codename key_tmp repo_manager=""
-  arch="$(arch_map)"
-  case "$arch" in
-    amd64|arm64) ;;
-    *)
-      warn "官方 Cloudflare WARP Linux 客户端不支持当前架构：$arch"
-      return 1
-      ;;
-  esac
-
-  ensure_dirs
-  if command -v apt-get >/dev/null 2>&1; then
-    info "正在从 Cloudflare 官方软件源安装 cloudflare-warp"
-    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates curl gnupg >/dev/null 2>&1 || return 1
-    codename="$(awk -F= '$1=="VERSION_CODENAME" {gsub(/\"/, "", $2); print $2; exit}' "$WARP_OS_RELEASE" 2>/dev/null)"
-    [[ -n "$codename" ]] || { warn "无法识别系统代号，不能配置 Cloudflare 官方软件源"; return 1; }
-    install -d -m 0755 "$(dirname "$WARP_APT_KEYRING")" "$(dirname "$WARP_APT_SOURCE_LIST")" || return 1
-    key_tmp="$(mktemp)" || return 1
-    if ! curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_tmp" \
-        || ! gpg --batch --yes --dearmor \
-          --output "$WARP_APT_KEYRING" "$key_tmp"; then
-      rm -f -- "$key_tmp"
-      warn "Cloudflare WARP 软件源密钥安装失败"
-      return 1
-    fi
-    rm -f -- "$key_tmp"
-    # repair_warp 使用 umask 077 保护备份；apt 的 _apt 用户仍需读取仓库密钥和源文件。
-    chmod 0644 "$WARP_APT_KEYRING" || return 1
-    printf 'deb [signed-by=%s] https://pkg.cloudflareclient.com/ %s main\n' \
-      "$WARP_APT_KEYRING" "$codename" > "$WARP_APT_SOURCE_LIST"
-    chmod 0644 "$WARP_APT_SOURCE_LIST" || return 1
-    if ! DEBIAN_FRONTEND=noninteractive apt-get update -y \
-        || ! DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflare-warp; then
-      warn "cloudflare-warp 安装失败；当前发行版可能不在 Cloudflare 支持列表中"
-      return 1
-    fi
-    repo_manager=apt
-  elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
-    command -v dnf >/dev/null 2>&1 && repo_manager=dnf || repo_manager=yum
-    info "正在从 Cloudflare 官方软件源安装 cloudflare-warp"
-    "$repo_manager" install -y epel-release >/dev/null 2>&1 || true
-    install -d -m 0755 "$(dirname "$WARP_YUM_REPO")" || return 1
-    curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
-      -o "$WARP_YUM_REPO" || return 1
-    chmod 0644 "$WARP_YUM_REPO" || return 1
-    "$repo_manager" install -y cloudflare-warp || return 1
-  else
-    warn "当前包管理器不受官方 WARP 客户端支持；可导入已有 WireGuard profile"
-    return 1
-  fi
-
-  if ! command -v warp-cli >/dev/null 2>&1; then
-    hash -r
-  fi
-  if ! command -v warp-cli >/dev/null 2>&1; then
-    warn "cloudflare-warp 已执行安装，但未找到 warp-cli"
-    return 1
-  fi
-  printf 'package_manager=%s\n' "$repo_manager" > "$WARP_CLI_MANAGED_MARKER"
-  chmod 0600 "$WARP_CLI_MANAGED_MARKER" 2>/dev/null || true
-}
-
-record_warp_cli_failure(){
-  local phase="$1" log_file="$2" saved_log="$WGCF_DIR/warp-cli-last-error.log"
-  mkdir -p "$WGCF_DIR" || true
-  install -m 0600 "$log_file" "$saved_log" 2>/dev/null || true
-  warn "官方 WARP 客户端${phase}失败，未启用 WARP 节点。"
-  [[ -s "$saved_log" ]] && warn "完整错误日志：$saved_log"
-}
-
-run_warp_cli_logged(){
-  local phase="$1" log_file="$2"
-  shift 2
-  if warp-cli --accept-tos "$@" > "$log_file" 2>&1; then
-    return 0
-  fi
-  record_warp_cli_failure "$phase" "$log_file"
-  return 1
-}
-
-warp_cli_registration_ready(){
-  warp-cli --accept-tos registration show >/dev/null 2>&1
-}
-
-ensure_warp_proxy(){
-  [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
-  normalize_runtime_settings
-  valid_warp_proxy_settings || return 1
-  install_warp_cli || return 1
-
-  local log_file="$WGCF_DIR/warp-cli.log" trace="" warp_state="" attempt
-  mkdir -p "$WGCF_DIR" || return 1
-  chmod 0700 "$WGCF_DIR" 2>/dev/null || true
-
-  if ! command -v systemctl >/dev/null 2>&1; then
-    printf '%s\n' 'systemd is required by the official Cloudflare WARP Linux client' > "$log_file"
-    record_warp_cli_failure "服务启动" "$log_file"
-    return 1
-  fi
-  if ! systemctl enable --now warp-svc.service > "$log_file" 2>&1; then
-    record_warp_cli_failure "服务启动" "$log_file"
-    return 1
-  fi
-
-  if ! warp_cli_registration_ready; then
-    info "正在通过官方客户端注册 Cloudflare WARP"
-    run_warp_cli_logged "注册" "$log_file" registration new || return 1
-    if ! warp_cli_registration_ready; then
-      printf '%s\n' 'warp-cli registration new returned success but registration is still missing' > "$log_file"
-      record_warp_cli_failure "注册校验" "$log_file"
-      return 1
-    fi
-  fi
-
-  # 新版 proxy 模式要求 MASQUE；旧版不支持该子命令时仍以最终连通性结果为准。
-  warp-cli --accept-tos tunnel protocol set MASQUE > "$log_file" 2>&1 || true
-  run_warp_cli_logged "代理模式设置" "$log_file" mode proxy || return 1
-  run_warp_cli_logged "代理端口设置" "$log_file" proxy port "$WARP_SOCKS_PORT" || return 1
-  run_warp_cli_logged "连接" "$log_file" connect || return 1
-
-  for attempt in $(seq 1 20); do
-    warp_proxy_listener_ready && break
-    [[ "$attempt" -lt 20 ]] && sleep 0.5
-  done
-  if ! warp_proxy_listener_ready; then
-    printf 'warp-cli did not open the expected loopback listener %s:%s\n' \
-      "$WARP_SOCKS_HOST" "$WARP_SOCKS_PORT" > "$log_file"
-    record_warp_cli_failure "本地代理检查" "$log_file"
-    return 1
-  fi
-
-  for attempt in $(seq 1 8); do
-    trace="$(curl -fsS --max-time 8 --noproxy '' --proxy "$(warp_proxy_url)" \
-      https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
-    warp_state="$(printf '%s\n' "$trace" | awk -F= '$1=="warp" {print $2; exit}')"
-    [[ "$warp_state" =~ ^(on|plus)$ ]] && break
-    [[ "$attempt" -lt 8 ]] && sleep 1
-  done
-  if [[ ! "$warp_state" =~ ^(on|plus)$ ]]; then
-    printf '%s\n' 'Cloudflare trace did not report warp=on or warp=plus through the local proxy' > "$log_file"
-    record_warp_cli_failure "出口校验" "$log_file"
-    return 1
-  fi
-
-  WARP_BACKEND=proxy
-  rm -f -- "$WGCF_DIR/warp-cli-last-error.log" "$log_file"
-  info "官方 WARP 本地代理已就绪：${WARP_SOCKS_HOST}:${WARP_SOCKS_PORT}"
-}
-
-# ===== WARP（wgcf WireGuard，兼容已有 profile） =====
-WGCF_BIN=${WGCF_BIN:-/usr/local/bin/wgcf}
-install_wgcf() (
-  local goarch release_json asset_fields release_tag asset_name url digest expected_hash current_hash
-  local tmp="" staged_bin="" backup_bin=""
-  ensure_deps curl jq || return 1
-  command -v sha256sum >/dev/null 2>&1 || ensure_deps coreutils || return 1
-  case "$(arch_map)" in
-    amd64|arm64|armv7|386) goarch="$(arch_map)" ;;
-    *) warn "wgcf 不支持当前架构"; return 1 ;;
-  esac
-  if ! release_json="$(curl -fsSL --connect-timeout 5 -m 15 \
-      https://api.github.com/repos/ViRb3/wgcf/releases/latest)"; then
-    warn "获取 wgcf Release 失败，已保留当前二进制"
-    return 1
-  fi
-  if ! asset_fields="$(printf '%s' "$release_json" | jq -er --arg arch "$goarch" '
-    . as $release
-    | ([.assets[] | select(.name == ("wgcf_" + ($release.tag_name | ltrimstr("v")) + "_linux_" + $arch))] | first) as $asset
-    | select($asset != null)
-    | [$release.tag_name, $asset.name, $asset.browser_download_url, $asset.digest] | @tsv
-  ')"; then
-    warn "wgcf Release 中没有当前架构的发行包"
-    return 1
-  fi
-  IFS=$'\t' read -r release_tag asset_name url digest <<< "$asset_fields"
-  if [[ -z "$url" || ! "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
-    warn "wgcf Release SHA-256 元数据无效"
-    return 1
-  fi
-  expected_hash="${digest#sha256:}"
-  if [[ -x "$WGCF_BIN" ]]; then
-    current_hash="$(sha256sum "$WGCF_BIN" | awk '{print $1}')" || return 1
-    if [[ "${current_hash,,}" == "${expected_hash,,}" ]]; then
-      info "wgcf 已是当前 Release：${release_tag}"
-      return 0
-    fi
-  fi
-
-  tmp="$(mktemp -d)" || return 1
-  trap '[[ -z "$tmp" ]] || rm -rf -- "$tmp"; [[ -z "$staged_bin" ]] || rm -f -- "$staged_bin"' EXIT
-  if ! curl -fsSL --connect-timeout 10 -m 60 "$url" -o "$tmp/wgcf"; then
-    warn "下载 wgcf 失败，已保留当前二进制"
-    return 1
-  fi
-  current_hash="$(sha256sum "$tmp/wgcf" | awk '{print $1}')" || return 1
-  if [[ "${current_hash,,}" != "${expected_hash,,}" ]]; then
-    warn "wgcf 下载文件 SHA-256 不匹配，已保留当前二进制"
-    return 1
-  fi
-  chmod 0755 "$tmp/wgcf" || return 1
-  if ! (cd "$tmp" && "$tmp/wgcf" --help >/dev/null 2>&1); then
-    warn "下载的 wgcf 无法正常执行，已保留当前二进制"
-    return 1
-  fi
-
-  mkdir -p "$(dirname "$WGCF_BIN")" || return 1
-  staged_bin="$(mktemp "${WGCF_BIN}.new.XXXXXX")" || return 1
-  install -m 0755 "$tmp/wgcf" "$staged_bin" || return 1
-  if [[ -f "$WGCF_BIN" ]]; then
-    backup_bin="$(mktemp "${WGCF_BIN}.previous.XXXXXX")" || return 1
-    if ! cp -p -- "$WGCF_BIN" "$backup_bin"; then
-      rm -f -- "$backup_bin"
-      return 1
-    fi
-  fi
-  if ! mv -f -- "$staged_bin" "$WGCF_BIN"; then
-    [[ -z "$backup_bin" ]] || rm -f -- "$backup_bin"
-    warn "替换 wgcf 失败，已保留当前二进制"
-    return 1
-  fi
-  staged_bin=""
-  if ! (cd "$tmp" && "$WGCF_BIN" --help >/dev/null 2>&1); then
-    if [[ -n "$backup_bin" ]]; then
-      mv -f -- "$backup_bin" "$WGCF_BIN" || warn "wgcf 回滚失败，备份保留在 $backup_bin"
-    else
-      rm -f -- "$WGCF_BIN" || true
-    fi
-    warn "新 wgcf 执行失败，已尝试恢复原二进制"
-    return 1
-  fi
-  [[ -z "$backup_bin" ]] || rm -f -- "$backup_bin"
-  info "wgcf 已更新至 ${release_tag}"
-)
-
-# —— Base64 清理 + 补齐：去掉引号/空白，长度 %4==2 补“==”，%4==3 补“=” ——
-pad_b64(){
-  local s="${1:-}"
-  # 去引号/空格/回车
-  s="$(printf '%s' "$s" | tr -d '\r\n\" ')"
-  # 去掉已有尾随 =，按需重加
-  s="${s%%=*}"
-  local rem=$(( ${#s} % 4 ))
-  if   (( rem == 2 )); then s="${s}=="
-  elif (( rem == 3 )); then s="${s}="
-  fi
-  printf '%s' "$s"
-}
-
-
-# ===== WARP（wgcf）配置生成/修复 =====
-valid_warp_key(){
-  local key
-  key="$(pad_b64 "${1:-}")"
-  [[ "$key" =~ ^[A-Za-z0-9+/]{43}=$ ]]
-}
-
-warp_profile_ready(){
-  local value
-  [[ "${ENABLE_WARP:-false}" == "true" ]] || return 1
-  valid_warp_key "${WARP_PRIVATE_KEY:-}" || return 1
-  valid_warp_key "${WARP_PEER_PUBLIC_KEY:-}" || return 1
-  [[ -n "${WARP_ENDPOINT_HOST:-}" && "${WARP_ENDPOINT_HOST:-}" != *[[:space:]]* ]] || return 1
-  [[ "${WARP_ENDPOINT_PORT:-}" =~ ^[0-9]+$ ]] || return 1
-  (( WARP_ENDPOINT_PORT >= 1 && WARP_ENDPOINT_PORT <= 65535 )) || return 1
-  [[ -n "${WARP_ADDRESS_V4:-}" || -n "${WARP_ADDRESS_V6:-}" ]] || return 1
-  for value in "${WARP_RESERVED_1:-0}" "${WARP_RESERVED_2:-0}" "${WARP_RESERVED_3:-0}"; do
-    [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 0 && value <= 255 )) || return 1
-  done
-}
-
-wgcf_account_ready(){
-  local account_file="$1" key
-  [[ -s "$account_file" ]] || return 1
-  for key in device_id access_token private_key; do
-    grep -Eq "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*['\"][^'\"]+['\"]" "$account_file" || return 1
-  done
-}
-
-save_private_file(){
-  local source_file="$1" target_file="$2" tmp
-  tmp="$(mktemp "${target_file}.tmp.XXXXXX")" || return 1
-  if ! cp -- "$source_file" "$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$target_file"; then
-    rm -f -- "$tmp"
-    return 1
-  fi
-}
-
-record_wgcf_failure(){
-  local phase="$1" log_file="$2" saved_log="$WGCF_DIR/wgcf-last-error.log"
-  mkdir -p "$WGCF_DIR" || true
-  install -m 0600 "$log_file" "$saved_log" 2>/dev/null || true
-  if grep -Fqi '429 Too Many Requests' "$log_file"; then
-    warn "Cloudflare WARP 注册接口返回 HTTP 429；已停止自动重试，避免出口继续触发限流。"
-    warn "可稍后运行 sudo bash ${SBP_SCRIPT_PATH} --repair-warp，或从其他网络生成 wgcf-account.toml 后放入 $WGCF_DIR 再修复。"
-  else
-    warn "wgcf ${phase}失败，未继续读取或发布无效 WARP 配置。"
-  fi
-  [[ -s "$saved_log" ]] && warn "完整错误日志：$saved_log"
-}
-
-run_wgcf_logged(){
-  local phase="$1" log_file="$2"
-  shift 2
-  if "$WGCF_BIN" "$@" > "$log_file" 2>&1; then
-    return 0
-  fi
-  record_wgcf_failure "$phase" "$log_file"
-  return 1
-}
-
-parse_warp_profile(){
-  local prof="$1" ep ad rs addr
-  local -a addresses=() line_addresses=()
-  [[ -s "$prof" ]] || return 1
-
-  WARP_PRIVATE_KEY="$(pad_b64 "$(awk -F'= *' '/^PrivateKey/{gsub(/\r/,"");print $2; exit}' "$prof")")"
-  WARP_PEER_PUBLIC_KEY="$(pad_b64 "$(awk -F'= *' '/^PublicKey/{gsub(/\r/,"");print $2; exit}' "$prof")")"
-
-  ep="$(awk -F'= *' '/^Endpoint/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '\" ')"
-  split_hostport "$ep" || return 1
-  WARP_ENDPOINT_HOST="$SBP_PARSED_HOST"
-  WARP_ENDPOINT_PORT="$SBP_PARSED_PORT"
-
-  WARP_ADDRESS_V4=""
-  WARP_ADDRESS_V6=""
-  while IFS= read -r ad; do
-    IFS=',' read -r -a line_addresses <<< "$ad"
-    addresses+=("${line_addresses[@]}")
-  done < <(awk -F'= *' '/^Address/{gsub(/\r/,"");print $2}' "$prof" | tr -d '\"')
-  for addr in "${addresses[@]}"; do
-    addr="${addr//[[:space:]]/}"
-    if [[ "$addr" == *:* ]]; then
-      WARP_ADDRESS_V6="$addr"
-    elif [[ "$addr" == *.* ]]; then
-      WARP_ADDRESS_V4="$addr"
-    fi
-  done
-
-  WARP_RESERVED_1=0
-  WARP_RESERVED_2=0
-  WARP_RESERVED_3=0
-  rs="$(awk -F'= *' '/^Reserved/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '[]\" ')"
-  if [[ -n "$rs" ]]; then
-    IFS=',' read -r WARP_RESERVED_1 WARP_RESERVED_2 WARP_RESERVED_3 _ <<< "$rs"
-    : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
-  fi
-
-  warp_profile_ready
-}
-
-reuse_warp_profile(){
-  local wd="$WGCF_DIR" profile_file="$WGCF_DIR/wgcf-profile.conf"
-
-  # 先尝试读取旧 env，并做一次规范化补齐。
-  if load_warp 2>/dev/null; then
-    WARP_PRIVATE_KEY="$(pad_b64 "${WARP_PRIVATE_KEY:-}")"
-    WARP_PEER_PUBLIC_KEY="$(pad_b64 "${WARP_PEER_PUBLIC_KEY:-}")"
-    # 允许之前没写 reserved，给默认 0
-    : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
-    # 如果关键字段都在，就直接用旧的（已经补齐），无需重建
-    if warp_profile_ready; then
-      save_warp || return 1
-      return 0
-    fi
-  fi
-
-  mkdir -p "$wd" 2>/dev/null || return 1
-  chmod 0700 "$wd" 2>/dev/null || true
-
-  # wgcf profile 本身已包含 sing-box 所需的全部 WireGuard 参数。
-  # 优先复用人工导入或上次已生成的有效 profile，避免再次访问注册 API。
-  if parse_warp_profile "$profile_file" 2>/dev/null; then
-    chmod 0600 "$profile_file" 2>/dev/null || true
-    save_warp || return 1
-    rm -f -- "$wd/wgcf-last-error.log"
-    info "已复用现有 WARP profile，无需重新注册"
-    return 0
-  fi
-  return 1
-}
-
-ensure_warp_profile(){
-  [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
-
-  local wd="$WGCF_DIR" tmp_dir log_file account_file account_source profile_file
-  local new_account=false register_ok=false timestamp backup_file
-
-  reuse_warp_profile && return 0
-
-  mkdir -p "$wd" || return 1
-  chmod 0700 "$wd" 2>/dev/null || true
-
-  # 走到这里说明旧 env 不完整；开始用 wgcf 重建
-  install_wgcf || { warn "wgcf 安装失败，WARP 节点不会启用"; return 1; }
-
-  tmp_dir="$(mktemp -d "$wd/.prepare.XXXXXX")" || return 1
-  chmod 0700 "$tmp_dir" 2>/dev/null || true
-  log_file="$tmp_dir/wgcf.log"
-  account_file="$wd/wgcf-account.toml"
-  account_source="$account_file"
-
-  if ! wgcf_account_ready "$account_file"; then
-    account_source="$tmp_dir/wgcf-account.toml"
-    if run_wgcf_logged "注册" "$log_file" register --accept-tos --config "$account_source"; then
-      register_ok=true
-    fi
-    if ! wgcf_account_ready "$account_source"; then
-      rm -rf -- "$tmp_dir"
-      return 1
-    fi
-    if [[ "$register_ok" != true ]]; then
-      warn "wgcf 注册命令返回失败，但账号文件完整；继续验证生成结果。"
-    fi
-    new_account=true
-  fi
-
-  profile_file="$tmp_dir/wgcf-profile.conf"
-  if ! run_wgcf_logged "生成配置" "$log_file" generate --config "$account_source" --profile "$profile_file"; then
-    rm -rf -- "$tmp_dir"
-    return 1
-  fi
-  if ! parse_warp_profile "$profile_file"; then
-    printf '%s\n' 'wgcf generated an incomplete or invalid WireGuard profile' > "$log_file"
-    record_wgcf_failure "配置校验" "$log_file"
-    rm -rf -- "$tmp_dir"
-    return 1
-  fi
-
-  if [[ "$new_account" == true ]]; then
-    if [[ -e "$account_file" ]]; then
-      timestamp="$(date +%Y%m%d-%H%M%S)"
-      backup_file="${account_file}.invalid-${timestamp}"
-      cp -a -- "$account_file" "$backup_file" || { rm -rf -- "$tmp_dir"; return 1; }
-      chmod 0600 "$backup_file" 2>/dev/null || true
-    fi
-    save_private_file "$account_source" "$account_file" || { rm -rf -- "$tmp_dir"; return 1; }
-  else
-    chmod 0600 "$account_file" 2>/dev/null || true
-  fi
-  save_private_file "$profile_file" "$wd/wgcf-profile.conf" || { rm -rf -- "$tmp_dir"; return 1; }
-  save_warp || { rm -rf -- "$tmp_dir"; return 1; }
-  rm -f -- "$wd/wgcf-last-error.log"
-  rm -rf -- "$tmp_dir"
-  info "WARP 配置已生成并通过完整性检查"
-}
-
-warp_backend_config_ready(){
-  case "${WARP_BACKEND:-auto}" in
-    proxy)
-      warp_proxy_config_ready
-      ;;
-    wireguard)
-      load_warp 2>/dev/null || true
-      warp_profile_ready
-      ;;
-    auto)
-      # 旧版 env.conf 没有 WARP_BACKEND；有效 profile 必须继续无缝可用。
-      load_warp 2>/dev/null || true
-      warp_profile_ready
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-warp_backend_label(){
-  case "${WARP_BACKEND:-auto}" in
-    proxy) printf 'official-proxy' ;;
-    wireguard) printf 'wgcf-wireguard' ;;
-    auto) printf 'auto' ;;
-    *) printf 'disabled' ;;
-  esac
-}
-
-ensure_warp_backend(){
-  [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
-  normalize_runtime_settings
-
-  case "$WARP_BACKEND" in
-    proxy)
-      ensure_warp_proxy
-      ;;
-    wireguard)
-      ensure_warp_profile && WARP_BACKEND=wireguard
-      ;;
-    auto)
-      # 升级时优先保留已有 WireGuard profile，避免改变现有 UDP 能力和出口状态。
-      if reuse_warp_profile; then
-        WARP_BACKEND=wireguard
-        return 0
-      fi
-      # 已导入的账号可离线生成 profile；这里不会创建新 wgcf 账号。
-      if wgcf_account_ready "$WGCF_DIR/wgcf-account.toml"; then
-        if ensure_warp_profile; then
-          WARP_BACKEND=wireguard
-          return 0
-        fi
-        warn "已有 wgcf 账号无法生成有效 profile，将尝试官方 WARP 客户端"
-      fi
-      if ensure_warp_proxy; then
-        WARP_BACKEND=proxy
-        return 0
-      fi
-      warn "官方 WARP 客户端不可用；默认模式不会再调用易触发 HTTP 429 的 wgcf 新账号注册。"
-      warn "可修复官方客户端后重试，或导入已有 wgcf-profile.conf。"
-      return 1
-      ;;
-  esac
-}
-
 # ===== 版本探测与比对 =====
 get_singbox_local_version() {
   local bin="${1:-$BIN_PATH}"
@@ -3298,6 +2392,898 @@ write_systemd(){
   systemctl enable --now "${DNS_HEALTH_TIMER}" >/dev/null 2>&1 || true
 }
 
+# ===== WARP（官方客户端，本地 SOCKS5 代理） =====
+WARP_CLI_MANAGED_MARKER=${WARP_CLI_MANAGED_MARKER:-$SB_DIR/.warp-cli-installed-by-sbp}
+WARP_OS_RELEASE=${WARP_OS_RELEASE:-/etc/os-release}
+WARP_APT_KEYRING=${WARP_APT_KEYRING:-/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg}
+WARP_APT_SOURCE_LIST=${WARP_APT_SOURCE_LIST:-/etc/apt/sources.list.d/cloudflare-client.list}
+WARP_YUM_REPO=${WARP_YUM_REPO:-/etc/yum.repos.d/cloudflare-warp.repo}
+
+valid_warp_proxy_settings(){
+  [[ "${WARP_SOCKS_HOST:-}" == "127.0.0.1" || "${WARP_SOCKS_HOST:-}" == "::1" ]] || return 1
+  [[ "${WARP_SOCKS_PORT:-}" =~ ^[0-9]+$ ]] || return 1
+  (( ${#WARP_SOCKS_PORT} <= 5 )) || return 1
+  (( 10#$WARP_SOCKS_PORT >= 1 && 10#$WARP_SOCKS_PORT <= 65535 ))
+}
+
+warp_proxy_config_ready(){
+  [[ "${ENABLE_WARP:-false}" == "true" && "${WARP_BACKEND:-auto}" == "proxy" ]] || return 1
+  valid_warp_proxy_settings
+}
+
+warp_proxy_url(){
+  if [[ "${WARP_SOCKS_HOST:-127.0.0.1}" == "::1" ]]; then
+    printf 'socks5h://[::1]:%s' "$WARP_SOCKS_PORT"
+  else
+    printf 'socks5h://127.0.0.1:%s' "$WARP_SOCKS_PORT"
+  fi
+}
+
+warp_proxy_listener_ready(){
+  local listeners=""
+  if command -v ss >/dev/null 2>&1; then
+    listeners="$(ss -H -ltn "sport = :${WARP_SOCKS_PORT}" 2>/dev/null || true)"
+  elif command -v netstat >/dev/null 2>&1; then
+    listeners="$(netstat -lnt 2>/dev/null || true)"
+  else
+    return 1
+  fi
+
+  if [[ "$WARP_SOCKS_HOST" == "::1" ]]; then
+    printf '%s\n' "$listeners" | grep -Eq "(^|[[:space:]])(\\[::1\\]|::1):${WARP_SOCKS_PORT}([[:space:]]|$)"
+  else
+    printf '%s\n' "$listeners" | grep -Eq "(^|[[:space:]])127\\.0\\.0\\.1:${WARP_SOCKS_PORT}([[:space:]]|$)"
+  fi
+}
+
+install_warp_cli(){
+  command -v warp-cli >/dev/null 2>&1 && return 0
+
+  local arch codename key_tmp repo_manager=""
+  arch="$(arch_map)"
+  case "$arch" in
+    amd64|arm64) ;;
+    *)
+      warn "官方 Cloudflare WARP Linux 客户端不支持当前架构：$arch"
+      return 1
+      ;;
+  esac
+
+  ensure_dirs
+  if command -v apt-get >/dev/null 2>&1; then
+    info "正在从 Cloudflare 官方软件源安装 cloudflare-warp"
+    DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates curl gnupg >/dev/null 2>&1 || return 1
+    codename="$(awk -F= '$1=="VERSION_CODENAME" {gsub(/\"/, "", $2); print $2; exit}' "$WARP_OS_RELEASE" 2>/dev/null)"
+    [[ -n "$codename" ]] || { warn "无法识别系统代号，不能配置 Cloudflare 官方软件源"; return 1; }
+    install -d -m 0755 "$(dirname "$WARP_APT_KEYRING")" "$(dirname "$WARP_APT_SOURCE_LIST")" || return 1
+    key_tmp="$(mktemp)" || return 1
+    if ! curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg -o "$key_tmp" \
+        || ! gpg --batch --yes --dearmor \
+          --output "$WARP_APT_KEYRING" "$key_tmp"; then
+      rm -f -- "$key_tmp"
+      warn "Cloudflare WARP 软件源密钥安装失败"
+      return 1
+    fi
+    rm -f -- "$key_tmp"
+    # repair_warp 使用 umask 077 保护备份；apt 的 _apt 用户仍需读取仓库密钥和源文件。
+    chmod 0644 "$WARP_APT_KEYRING" || return 1
+    printf 'deb [signed-by=%s] https://pkg.cloudflareclient.com/ %s main\n' \
+      "$WARP_APT_KEYRING" "$codename" > "$WARP_APT_SOURCE_LIST"
+    chmod 0644 "$WARP_APT_SOURCE_LIST" || return 1
+    if ! DEBIAN_FRONTEND=noninteractive apt-get update -y \
+        || ! DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflare-warp; then
+      warn "cloudflare-warp 安装失败；当前发行版可能不在 Cloudflare 支持列表中"
+      return 1
+    fi
+    repo_manager=apt
+  elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+    command -v dnf >/dev/null 2>&1 && repo_manager=dnf || repo_manager=yum
+    info "正在从 Cloudflare 官方软件源安装 cloudflare-warp"
+    "$repo_manager" install -y epel-release >/dev/null 2>&1 || true
+    install -d -m 0755 "$(dirname "$WARP_YUM_REPO")" || return 1
+    curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
+      -o "$WARP_YUM_REPO" || return 1
+    chmod 0644 "$WARP_YUM_REPO" || return 1
+    "$repo_manager" install -y cloudflare-warp || return 1
+  else
+    warn "当前包管理器不受官方 WARP 客户端支持；可导入已有 WireGuard profile"
+    return 1
+  fi
+
+  if ! command -v warp-cli >/dev/null 2>&1; then
+    hash -r
+  fi
+  if ! command -v warp-cli >/dev/null 2>&1; then
+    warn "cloudflare-warp 已执行安装，但未找到 warp-cli"
+    return 1
+  fi
+  printf 'package_manager=%s\n' "$repo_manager" > "$WARP_CLI_MANAGED_MARKER"
+  chmod 0600 "$WARP_CLI_MANAGED_MARKER" 2>/dev/null || true
+}
+
+record_warp_cli_failure(){
+  local phase="$1" log_file="$2" saved_log="$WGCF_DIR/warp-cli-last-error.log"
+  mkdir -p "$WGCF_DIR" || true
+  install -m 0600 "$log_file" "$saved_log" 2>/dev/null || true
+  warn "官方 WARP 客户端${phase}失败，未启用 WARP 节点。"
+  [[ -s "$saved_log" ]] && warn "完整错误日志：$saved_log"
+}
+
+run_warp_cli_logged(){
+  local phase="$1" log_file="$2"
+  shift 2
+  if warp-cli --accept-tos "$@" > "$log_file" 2>&1; then
+    return 0
+  fi
+  record_warp_cli_failure "$phase" "$log_file"
+  return 1
+}
+
+warp_cli_registration_ready(){
+  warp-cli --accept-tos registration show >/dev/null 2>&1
+}
+
+ensure_warp_proxy(){
+  [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
+  normalize_runtime_settings
+  valid_warp_proxy_settings || return 1
+  install_warp_cli || return 1
+
+  local log_file="$WGCF_DIR/warp-cli.log" trace="" warp_state="" attempt
+  mkdir -p "$WGCF_DIR" || return 1
+  chmod 0700 "$WGCF_DIR" 2>/dev/null || true
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    printf '%s\n' 'systemd is required by the official Cloudflare WARP Linux client' > "$log_file"
+    record_warp_cli_failure "服务启动" "$log_file"
+    return 1
+  fi
+  if ! systemctl enable --now warp-svc.service > "$log_file" 2>&1; then
+    record_warp_cli_failure "服务启动" "$log_file"
+    return 1
+  fi
+
+  if ! warp_cli_registration_ready; then
+    info "正在通过官方客户端注册 Cloudflare WARP"
+    run_warp_cli_logged "注册" "$log_file" registration new || return 1
+    if ! warp_cli_registration_ready; then
+      printf '%s\n' 'warp-cli registration new returned success but registration is still missing' > "$log_file"
+      record_warp_cli_failure "注册校验" "$log_file"
+      return 1
+    fi
+  fi
+
+  # 新版 proxy 模式要求 MASQUE；旧版不支持该子命令时仍以最终连通性结果为准。
+  warp-cli --accept-tos tunnel protocol set MASQUE > "$log_file" 2>&1 || true
+  run_warp_cli_logged "代理模式设置" "$log_file" mode proxy || return 1
+  run_warp_cli_logged "代理端口设置" "$log_file" proxy port "$WARP_SOCKS_PORT" || return 1
+  run_warp_cli_logged "连接" "$log_file" connect || return 1
+
+  for attempt in $(seq 1 20); do
+    warp_proxy_listener_ready && break
+    [[ "$attempt" -lt 20 ]] && sleep 0.5
+  done
+  if ! warp_proxy_listener_ready; then
+    printf 'warp-cli did not open the expected loopback listener %s:%s\n' \
+      "$WARP_SOCKS_HOST" "$WARP_SOCKS_PORT" > "$log_file"
+    record_warp_cli_failure "本地代理检查" "$log_file"
+    return 1
+  fi
+
+  for attempt in $(seq 1 8); do
+    trace="$(curl -fsS --max-time 8 --noproxy '' --proxy "$(warp_proxy_url)" \
+      https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+    warp_state="$(printf '%s\n' "$trace" | awk -F= '$1=="warp" {print $2; exit}')"
+    [[ "$warp_state" =~ ^(on|plus)$ ]] && break
+    [[ "$attempt" -lt 8 ]] && sleep 1
+  done
+  if [[ ! "$warp_state" =~ ^(on|plus)$ ]]; then
+    printf '%s\n' 'Cloudflare trace did not report warp=on or warp=plus through the local proxy' > "$log_file"
+    record_warp_cli_failure "出口校验" "$log_file"
+    return 1
+  fi
+
+  WARP_BACKEND=proxy
+  rm -f -- "$WGCF_DIR/warp-cli-last-error.log" "$log_file"
+  info "官方 WARP 本地代理已就绪：${WARP_SOCKS_HOST}:${WARP_SOCKS_PORT}"
+}
+
+# ===== WARP（wgcf WireGuard，兼容已有 profile） =====
+WGCF_BIN=${WGCF_BIN:-/usr/local/bin/wgcf}
+install_wgcf() (
+  local goarch release_json asset_fields release_tag asset_name url digest expected_hash current_hash
+  local tmp="" staged_bin="" backup_bin=""
+  ensure_deps curl jq || return 1
+  command -v sha256sum >/dev/null 2>&1 || ensure_deps coreutils || return 1
+  case "$(arch_map)" in
+    amd64|arm64|armv7|386) goarch="$(arch_map)" ;;
+    *) warn "wgcf 不支持当前架构"; return 1 ;;
+  esac
+  if ! release_json="$(curl -fsSL --connect-timeout 5 -m 15 \
+      https://api.github.com/repos/ViRb3/wgcf/releases/latest)"; then
+    warn "获取 wgcf Release 失败，已保留当前二进制"
+    return 1
+  fi
+  if ! asset_fields="$(printf '%s' "$release_json" | jq -er --arg arch "$goarch" '
+    . as $release
+    | ([.assets[] | select(.name == ("wgcf_" + ($release.tag_name | ltrimstr("v")) + "_linux_" + $arch))] | first) as $asset
+    | select($asset != null)
+    | [$release.tag_name, $asset.name, $asset.browser_download_url, $asset.digest] | @tsv
+  ')"; then
+    warn "wgcf Release 中没有当前架构的发行包"
+    return 1
+  fi
+  IFS=$'\t' read -r release_tag asset_name url digest <<< "$asset_fields"
+  if [[ -z "$url" || ! "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+    warn "wgcf Release SHA-256 元数据无效"
+    return 1
+  fi
+  expected_hash="${digest#sha256:}"
+  if [[ -x "$WGCF_BIN" ]]; then
+    current_hash="$(sha256sum "$WGCF_BIN" | awk '{print $1}')" || return 1
+    if [[ "${current_hash,,}" == "${expected_hash,,}" ]]; then
+      info "wgcf 已是当前 Release：${release_tag}"
+      return 0
+    fi
+  fi
+
+  tmp="$(mktemp -d)" || return 1
+  trap '[[ -z "$tmp" ]] || rm -rf -- "$tmp"; [[ -z "$staged_bin" ]] || rm -f -- "$staged_bin"' EXIT
+  if ! curl -fsSL --connect-timeout 10 -m 60 "$url" -o "$tmp/wgcf"; then
+    warn "下载 wgcf 失败，已保留当前二进制"
+    return 1
+  fi
+  current_hash="$(sha256sum "$tmp/wgcf" | awk '{print $1}')" || return 1
+  if [[ "${current_hash,,}" != "${expected_hash,,}" ]]; then
+    warn "wgcf 下载文件 SHA-256 不匹配，已保留当前二进制"
+    return 1
+  fi
+  chmod 0755 "$tmp/wgcf" || return 1
+  if ! (cd "$tmp" && "$tmp/wgcf" --help >/dev/null 2>&1); then
+    warn "下载的 wgcf 无法正常执行，已保留当前二进制"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$WGCF_BIN")" || return 1
+  staged_bin="$(mktemp "${WGCF_BIN}.new.XXXXXX")" || return 1
+  install -m 0755 "$tmp/wgcf" "$staged_bin" || return 1
+  if [[ -f "$WGCF_BIN" ]]; then
+    backup_bin="$(mktemp "${WGCF_BIN}.previous.XXXXXX")" || return 1
+    if ! cp -p -- "$WGCF_BIN" "$backup_bin"; then
+      rm -f -- "$backup_bin"
+      return 1
+    fi
+  fi
+  if ! mv -f -- "$staged_bin" "$WGCF_BIN"; then
+    [[ -z "$backup_bin" ]] || rm -f -- "$backup_bin"
+    warn "替换 wgcf 失败，已保留当前二进制"
+    return 1
+  fi
+  staged_bin=""
+  if ! (cd "$tmp" && "$WGCF_BIN" --help >/dev/null 2>&1); then
+    if [[ -n "$backup_bin" ]]; then
+      mv -f -- "$backup_bin" "$WGCF_BIN" || warn "wgcf 回滚失败，备份保留在 $backup_bin"
+    else
+      rm -f -- "$WGCF_BIN" || true
+    fi
+    warn "新 wgcf 执行失败，已尝试恢复原二进制"
+    return 1
+  fi
+  [[ -z "$backup_bin" ]] || rm -f -- "$backup_bin"
+  info "wgcf 已更新至 ${release_tag}"
+)
+
+# —— Base64 清理 + 补齐：去掉引号/空白，长度 %4==2 补“==”，%4==3 补“=” ——
+pad_b64(){
+  local s="${1:-}"
+  # 去引号/空格/回车
+  s="$(printf '%s' "$s" | tr -d '\r\n\" ')"
+  # 去掉已有尾随 =，按需重加
+  s="${s%%=*}"
+  local rem=$(( ${#s} % 4 ))
+  if   (( rem == 2 )); then s="${s}=="
+  elif (( rem == 3 )); then s="${s}="
+  fi
+  printf '%s' "$s"
+}
+
+
+# ===== WARP（wgcf）配置生成/修复 =====
+valid_warp_key(){
+  local key
+  key="$(pad_b64 "${1:-}")"
+  [[ "$key" =~ ^[A-Za-z0-9+/]{43}=$ ]]
+}
+
+warp_profile_ready(){
+  local value
+  [[ "${ENABLE_WARP:-false}" == "true" ]] || return 1
+  valid_warp_key "${WARP_PRIVATE_KEY:-}" || return 1
+  valid_warp_key "${WARP_PEER_PUBLIC_KEY:-}" || return 1
+  [[ -n "${WARP_ENDPOINT_HOST:-}" && "${WARP_ENDPOINT_HOST:-}" != *[[:space:]]* ]] || return 1
+  [[ "${WARP_ENDPOINT_PORT:-}" =~ ^[0-9]+$ ]] || return 1
+  (( WARP_ENDPOINT_PORT >= 1 && WARP_ENDPOINT_PORT <= 65535 )) || return 1
+  [[ -n "${WARP_ADDRESS_V4:-}" || -n "${WARP_ADDRESS_V6:-}" ]] || return 1
+  for value in "${WARP_RESERVED_1:-0}" "${WARP_RESERVED_2:-0}" "${WARP_RESERVED_3:-0}"; do
+    [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 0 && value <= 255 )) || return 1
+  done
+}
+
+wgcf_account_ready(){
+  local account_file="$1" key
+  [[ -s "$account_file" ]] || return 1
+  for key in device_id access_token private_key; do
+    grep -Eq "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*['\"][^'\"]+['\"]" "$account_file" || return 1
+  done
+}
+
+save_private_file(){
+  local source_file="$1" target_file="$2" tmp
+  tmp="$(mktemp "${target_file}.tmp.XXXXXX")" || return 1
+  if ! cp -- "$source_file" "$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$target_file"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+record_wgcf_failure(){
+  local phase="$1" log_file="$2" saved_log="$WGCF_DIR/wgcf-last-error.log"
+  mkdir -p "$WGCF_DIR" || true
+  install -m 0600 "$log_file" "$saved_log" 2>/dev/null || true
+  if grep -Fqi '429 Too Many Requests' "$log_file"; then
+    warn "Cloudflare WARP 注册接口返回 HTTP 429；已停止自动重试，避免出口继续触发限流。"
+    warn "可稍后运行 sudo bash ${SBP_SCRIPT_PATH} --repair-warp，或从其他网络生成 wgcf-account.toml 后放入 $WGCF_DIR 再修复。"
+  else
+    warn "wgcf ${phase}失败，未继续读取或发布无效 WARP 配置。"
+  fi
+  [[ -s "$saved_log" ]] && warn "完整错误日志：$saved_log"
+}
+
+run_wgcf_logged(){
+  local phase="$1" log_file="$2"
+  shift 2
+  if "$WGCF_BIN" "$@" > "$log_file" 2>&1; then
+    return 0
+  fi
+  record_wgcf_failure "$phase" "$log_file"
+  return 1
+}
+
+parse_warp_profile(){
+  local prof="$1" ep ad rs addr
+  local -a addresses=() line_addresses=()
+  [[ -s "$prof" ]] || return 1
+
+  WARP_PRIVATE_KEY="$(pad_b64 "$(awk -F'= *' '/^PrivateKey/{gsub(/\r/,"");print $2; exit}' "$prof")")"
+  WARP_PEER_PUBLIC_KEY="$(pad_b64 "$(awk -F'= *' '/^PublicKey/{gsub(/\r/,"");print $2; exit}' "$prof")")"
+
+  ep="$(awk -F'= *' '/^Endpoint/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '\" ')"
+  split_hostport "$ep" || return 1
+  WARP_ENDPOINT_HOST="$SBP_PARSED_HOST"
+  WARP_ENDPOINT_PORT="$SBP_PARSED_PORT"
+
+  WARP_ADDRESS_V4=""
+  WARP_ADDRESS_V6=""
+  while IFS= read -r ad; do
+    IFS=',' read -r -a line_addresses <<< "$ad"
+    addresses+=("${line_addresses[@]}")
+  done < <(awk -F'= *' '/^Address/{gsub(/\r/,"");print $2}' "$prof" | tr -d '\"')
+  for addr in "${addresses[@]}"; do
+    addr="${addr//[[:space:]]/}"
+    if [[ "$addr" == *:* ]]; then
+      WARP_ADDRESS_V6="$addr"
+    elif [[ "$addr" == *.* ]]; then
+      WARP_ADDRESS_V4="$addr"
+    fi
+  done
+
+  WARP_RESERVED_1=0
+  WARP_RESERVED_2=0
+  WARP_RESERVED_3=0
+  rs="$(awk -F'= *' '/^Reserved/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '[]\" ')"
+  if [[ -n "$rs" ]]; then
+    IFS=',' read -r WARP_RESERVED_1 WARP_RESERVED_2 WARP_RESERVED_3 _ <<< "$rs"
+    : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
+  fi
+
+  warp_profile_ready
+}
+
+reuse_warp_profile(){
+  local wd="$WGCF_DIR" profile_file="$WGCF_DIR/wgcf-profile.conf"
+
+  # 先尝试读取旧 env，并做一次规范化补齐。
+  if load_warp 2>/dev/null; then
+    WARP_PRIVATE_KEY="$(pad_b64 "${WARP_PRIVATE_KEY:-}")"
+    WARP_PEER_PUBLIC_KEY="$(pad_b64 "${WARP_PEER_PUBLIC_KEY:-}")"
+    # 允许之前没写 reserved，给默认 0
+    : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
+    # 如果关键字段都在，就直接用旧的（已经补齐），无需重建
+    if warp_profile_ready; then
+      save_warp || return 1
+      return 0
+    fi
+  fi
+
+  mkdir -p "$wd" 2>/dev/null || return 1
+  chmod 0700 "$wd" 2>/dev/null || true
+
+  # wgcf profile 本身已包含 sing-box 所需的全部 WireGuard 参数。
+  # 优先复用人工导入或上次已生成的有效 profile，避免再次访问注册 API。
+  if parse_warp_profile "$profile_file" 2>/dev/null; then
+    chmod 0600 "$profile_file" 2>/dev/null || true
+    save_warp || return 1
+    rm -f -- "$wd/wgcf-last-error.log"
+    info "已复用现有 WARP profile，无需重新注册"
+    return 0
+  fi
+  return 1
+}
+
+ensure_warp_profile(){
+  [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
+
+  local wd="$WGCF_DIR" tmp_dir log_file account_file account_source profile_file
+  local new_account=false register_ok=false timestamp backup_file
+
+  reuse_warp_profile && return 0
+
+  mkdir -p "$wd" || return 1
+  chmod 0700 "$wd" 2>/dev/null || true
+
+  # 走到这里说明旧 env 不完整；开始用 wgcf 重建
+  install_wgcf || { warn "wgcf 安装失败，WARP 节点不会启用"; return 1; }
+
+  tmp_dir="$(mktemp -d "$wd/.prepare.XXXXXX")" || return 1
+  chmod 0700 "$tmp_dir" 2>/dev/null || true
+  log_file="$tmp_dir/wgcf.log"
+  account_file="$wd/wgcf-account.toml"
+  account_source="$account_file"
+
+  if ! wgcf_account_ready "$account_file"; then
+    account_source="$tmp_dir/wgcf-account.toml"
+    if run_wgcf_logged "注册" "$log_file" register --accept-tos --config "$account_source"; then
+      register_ok=true
+    fi
+    if ! wgcf_account_ready "$account_source"; then
+      rm -rf -- "$tmp_dir"
+      return 1
+    fi
+    if [[ "$register_ok" != true ]]; then
+      warn "wgcf 注册命令返回失败，但账号文件完整；继续验证生成结果。"
+    fi
+    new_account=true
+  fi
+
+  profile_file="$tmp_dir/wgcf-profile.conf"
+  if ! run_wgcf_logged "生成配置" "$log_file" generate --config "$account_source" --profile "$profile_file"; then
+    rm -rf -- "$tmp_dir"
+    return 1
+  fi
+  if ! parse_warp_profile "$profile_file"; then
+    printf '%s\n' 'wgcf generated an incomplete or invalid WireGuard profile' > "$log_file"
+    record_wgcf_failure "配置校验" "$log_file"
+    rm -rf -- "$tmp_dir"
+    return 1
+  fi
+
+  if [[ "$new_account" == true ]]; then
+    if [[ -e "$account_file" ]]; then
+      timestamp="$(date +%Y%m%d-%H%M%S)"
+      backup_file="${account_file}.invalid-${timestamp}"
+      cp -a -- "$account_file" "$backup_file" || { rm -rf -- "$tmp_dir"; return 1; }
+      chmod 0600 "$backup_file" 2>/dev/null || true
+    fi
+    save_private_file "$account_source" "$account_file" || { rm -rf -- "$tmp_dir"; return 1; }
+  else
+    chmod 0600 "$account_file" 2>/dev/null || true
+  fi
+  save_private_file "$profile_file" "$wd/wgcf-profile.conf" || { rm -rf -- "$tmp_dir"; return 1; }
+  save_warp || { rm -rf -- "$tmp_dir"; return 1; }
+  rm -f -- "$wd/wgcf-last-error.log"
+  rm -rf -- "$tmp_dir"
+  info "WARP 配置已生成并通过完整性检查"
+}
+
+warp_backend_config_ready(){
+  case "${WARP_BACKEND:-auto}" in
+    proxy)
+      warp_proxy_config_ready
+      ;;
+    wireguard)
+      load_warp 2>/dev/null || true
+      warp_profile_ready
+      ;;
+    auto)
+      # 旧版 env.conf 没有 WARP_BACKEND；有效 profile 必须继续无缝可用。
+      load_warp 2>/dev/null || true
+      warp_profile_ready
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+warp_backend_label(){
+  case "${WARP_BACKEND:-auto}" in
+    proxy) printf 'official-proxy' ;;
+    wireguard) printf 'wgcf-wireguard' ;;
+    auto) printf 'auto' ;;
+    *) printf 'disabled' ;;
+  esac
+}
+
+ensure_warp_backend(){
+  [[ "${ENABLE_WARP:-true}" == "true" ]] || return 0
+  normalize_runtime_settings
+
+  case "$WARP_BACKEND" in
+    proxy)
+      ensure_warp_proxy
+      ;;
+    wireguard)
+      ensure_warp_profile && WARP_BACKEND=wireguard
+      ;;
+    auto)
+      # 升级时优先保留已有 WireGuard profile，避免改变现有 UDP 能力和出口状态。
+      if reuse_warp_profile; then
+        WARP_BACKEND=wireguard
+        return 0
+      fi
+      # 已导入的账号可离线生成 profile；这里不会创建新 wgcf 账号。
+      if wgcf_account_ready "$WGCF_DIR/wgcf-account.toml"; then
+        if ensure_warp_profile; then
+          WARP_BACKEND=wireguard
+          return 0
+        fi
+        warn "已有 wgcf 账号无法生成有效 profile，将尝试官方 WARP 客户端"
+      fi
+      if ensure_warp_proxy; then
+        WARP_BACKEND=proxy
+        return 0
+      fi
+      warn "官方 WARP 客户端不可用；默认模式不会再调用易触发 HTTP 429 的 wgcf 新账号注册。"
+      warn "可修复官方客户端后重试，或导入已有 wgcf-profile.conf。"
+      return 1
+      ;;
+  esac
+}
+
+uninstall_managed_warp_cli(){
+  [[ -f "$WARP_CLI_MANAGED_MARKER" ]] || return 0
+  local package_manager
+  package_manager="$(awk -F= '$1=="package_manager" {print $2; exit}' "$WARP_CLI_MANAGED_MARKER" 2>/dev/null)"
+  info "正在移除由 Sing-Box-Plus 安装的官方 WARP 客户端..."
+  warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now warp-svc.service >/dev/null 2>&1 || true
+  fi
+  case "$package_manager" in
+    apt) DEBIAN_FRONTEND=noninteractive apt-get purge -y cloudflare-warp >/dev/null 2>&1 || true ;;
+    dnf) dnf remove -y cloudflare-warp >/dev/null 2>&1 || true ;;
+    yum) yum remove -y cloudflare-warp >/dev/null 2>&1 || true ;;
+  esac
+}
+
+backup_warp_repair(){
+  local backup_dir="$1"
+  backup_runtime_file "$SB_DIR/env.conf" env.conf "$backup_dir" || return 1
+  backup_runtime_file "$CONF_JSON" config.json "$backup_dir" || return 1
+  backup_runtime_file "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" sing-box.service "$backup_dir" || return 1
+  backup_runtime_file "$ROUTE_JSON" routes.json "$backup_dir" || return 1
+  backup_runtime_file "$SB_DIR/warp.env" warp.env "$backup_dir" || return 1
+  backup_runtime_file "$SB_DIR/creds.env" creds.env "$backup_dir" || return 1
+  backup_runtime_file "$SB_DIR/ports.env" ports.env "$backup_dir" || return 1
+  backup_runtime_file "$SHARE_LINKS_FILE" share-links.txt "$backup_dir" || return 1
+  backup_runtime_file "$WGCF_DIR/wgcf-account.toml" wgcf-account.toml "$backup_dir" || return 1
+  backup_runtime_file "$WGCF_DIR/wgcf-profile.conf" wgcf-profile.conf "$backup_dir" || return 1
+  backup_runtime_file "$CERT_DIR/fullchain.pem" fullchain.pem "$backup_dir" || return 1
+  backup_runtime_file "$CERT_DIR/key.pem" key.pem "$backup_dir" || return 1
+}
+
+restore_warp_repair(){
+  local backup_dir="$1" restore_failed=0
+  restore_runtime_file "$backup_dir" env.conf "$SB_DIR/env.conf" || restore_failed=1
+  restore_runtime_file "$backup_dir" config.json "$CONF_JSON" || restore_failed=1
+  restore_runtime_file "$backup_dir" sing-box.service "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" || restore_failed=1
+  restore_runtime_file "$backup_dir" routes.json "$ROUTE_JSON" || restore_failed=1
+  restore_runtime_file "$backup_dir" warp.env "$SB_DIR/warp.env" || restore_failed=1
+  restore_runtime_file "$backup_dir" creds.env "$SB_DIR/creds.env" || restore_failed=1
+  restore_runtime_file "$backup_dir" ports.env "$SB_DIR/ports.env" || restore_failed=1
+  restore_runtime_file "$backup_dir" share-links.txt "$SHARE_LINKS_FILE" || restore_failed=1
+  restore_runtime_file "$backup_dir" wgcf-account.toml "$WGCF_DIR/wgcf-account.toml" || restore_failed=1
+  restore_runtime_file "$backup_dir" wgcf-profile.conf "$WGCF_DIR/wgcf-profile.conf" || restore_failed=1
+  restore_runtime_file "$backup_dir" fullchain.pem "$CERT_DIR/fullchain.pem" || restore_failed=1
+  restore_runtime_file "$backup_dir" key.pem "$CERT_DIR/key.pem" || restore_failed=1
+  return "$restore_failed"
+}
+
+verify_warp_egress(){
+  (
+    local tmp_dir verify_config run_log port="" proxy_pid="" proxy_ready=false
+    local trace="" warp_state="" candidate attempt
+
+    tmp_dir="$(mktemp -d "$SB_DIR/.warp-verify.XXXXXX")" || return 1
+    case "$tmp_dir" in
+      "$SB_DIR"/.warp-verify.*) ;;
+      *) return 1 ;;
+    esac
+    chmod 0700 "$tmp_dir" 2>/dev/null || true
+    verify_config="$tmp_dir/config.json"
+    run_log="$tmp_dir/sing-box.log"
+
+    cleanup(){
+      trap - EXIT INT TERM
+      if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>/dev/null; then
+        kill "$proxy_pid" 2>/dev/null || true
+        wait "$proxy_pid" 2>/dev/null || true
+      fi
+      rm -rf -- "$tmp_dir"
+    }
+    trap cleanup EXIT INT TERM
+
+    for candidate in $(seq 29400 29499); do
+      if ! ss -H -ltn "sport = :$candidate" 2>/dev/null | grep -q .; then
+        port="$candidate"
+        break
+      fi
+    done
+    [[ -n "$port" ]] || return 1
+
+    if ! jq --argjson port "$port" '
+      (.dns.final) as $resolver
+      | ([.endpoints[]? | select(.tag == "warp")]) as $warp_endpoints
+      | ([.outbounds[]? | select(.tag == "warp")]) as $warp_outbounds
+      | ([.outbounds[]? | select(.tag == "direct")]) as $direct
+      | if (($warp_endpoints | length) + ($warp_outbounds | length)) != 1
+          or ($direct | length) != 1 or ($resolver == null) then
+          error("missing WARP verification dependency")
+        else
+          {
+            log: {level: "warn", timestamp: true},
+            dns: .dns,
+            inbounds: [{
+              type: "socks",
+              tag: "warp-verify-in",
+              listen: "127.0.0.1",
+              listen_port: $port
+            }],
+            endpoints: $warp_endpoints,
+            outbounds: ($direct + $warp_outbounds),
+            route: {
+              rules: [{
+                inbound: ["warp-verify-in"],
+                action: "route",
+                outbound: "warp"
+              }],
+              default_domain_resolver: $resolver,
+              final: "direct"
+            }
+          }
+        end
+    ' "$CONF_JSON" > "$verify_config"; then
+      return 1
+    fi
+    chmod 0600 "$verify_config" 2>/dev/null || true
+    "$BIN_PATH" check -c "$verify_config" >/dev/null 2>&1 || return 1
+
+    (
+      cd "$tmp_dir"
+      exec "$BIN_PATH" run -c "$verify_config"
+    ) > "$run_log" 2>&1 &
+    proxy_pid=$!
+
+    for _ in $(seq 1 50); do
+      if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .; then
+        proxy_ready=true
+        break
+      fi
+      kill -0 "$proxy_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if [[ "$proxy_ready" != true ]]; then
+      mkdir -p "$WGCF_DIR" 2>/dev/null || true
+      [[ ! -f "$run_log" ]] || install -m 0600 "$run_log" "$WGCF_DIR/warp-verify-last-error.log" 2>/dev/null || true
+      return 1
+    fi
+
+    for attempt in $(seq 1 8); do
+      trace="$(curl -fsS --max-time 5 --noproxy '' \
+        --proxy "socks5h://127.0.0.1:$port" \
+        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+      warp_state="$(printf '%s\n' "$trace" | awk -F= '$1=="warp" {print $2; exit}')"
+      [[ "$warp_state" =~ ^(on|plus)$ ]] && break
+      [[ "$attempt" -lt 8 ]] && sleep 1
+    done
+    if [[ ! "$warp_state" =~ ^(on|plus)$ ]]; then
+      mkdir -p "$WGCF_DIR" 2>/dev/null || true
+      [[ ! -f "$run_log" ]] || install -m 0600 "$run_log" "$WGCF_DIR/warp-verify-last-error.log" 2>/dev/null || true
+      return 1
+    fi
+    rm -f -- "$WGCF_DIR/warp-verify-last-error.log"
+  )
+}
+
+repair_warp(){
+  local profile_to_import="${1:-}"
+  local previous_warp_ready=false previous_proxy_backend=false
+  [[ "$EUID" -eq 0 || "${SBP_SKIP_ROOT:-0}" -eq 1 || -n "${TEST_ROOT:-}" ]] \
+    || die "WARP 修复需要 root 权限，请使用 sudo 运行"
+  ensure_installed_or_hint || return 1
+  load_env || true
+  load_creds || true
+  load_ports || true
+  ensure_dirs
+
+  if [[ -n "$profile_to_import" ]]; then
+    if warp_proxy_config_ready; then
+      previous_proxy_backend=true
+    fi
+    if warp_backend_config_ready; then
+      previous_warp_ready=true
+    fi
+    if [[ ! -f "$profile_to_import" || ! -r "$profile_to_import" ]]; then
+      warn "WARP WireGuard profile 不存在或不可读"
+      return 1
+    fi
+    ENABLE_WARP=true
+    if ! parse_warp_profile "$profile_to_import"; then
+      warn "WARP WireGuard profile 无效，未改动运行配置"
+      return 1
+    fi
+  fi
+
+  local backup_root="$SB_DIR/backups" backup_dir timestamp old_umask route_check
+  local route_changed=false
+  local service_active=false restart_attempted=false unit_changed=false
+  local failure="" restore_failed=false
+  if command -v flock >/dev/null 2>&1; then
+    exec 7>"$SB_DIR/.warp-repair.lock"
+    flock -n 7 || { warn "另一个 WARP 修复正在进行，请稍后重试"; return 1; }
+  fi
+
+  old_umask="$(umask)"
+  umask 077
+  mkdir -p "$backup_root" || { umask "$old_umask"; return 1; }
+  timestamp="$(date +%Y%m%d-%H%M%S)"
+  backup_dir="$(mktemp -d "$backup_root/warp-repair-${timestamp}.XXXXXX")" || { umask "$old_umask"; return 1; }
+  chmod 0700 "$backup_dir" || { umask "$old_umask"; return 1; }
+  if ! backup_warp_repair "$backup_dir"; then
+    umask "$old_umask"
+    warn "WARP 修复前备份失败，未修改运行配置：$backup_dir"
+    return 1
+  fi
+
+  if [[ -s "$ROUTE_JSON" ]]; then
+    route_check="$(mktemp "$backup_dir/routes-preflight.XXXXXX")" || {
+      umask "$old_umask"
+      return 1
+    }
+    if ! normalize_route_file "$ROUTE_JSON" > "$route_check" \
+        || ! validate_route_references "$route_check"; then
+      rm -f -- "$route_check"
+      umask "$old_umask"
+      warn "现有自定义路由校验失败；WARP 配置和服务均未改动。"
+      return 1
+    fi
+    if ! validate_remote_rule_sets "$route_check"; then
+      rm -f -- "$route_check"
+      umask "$old_umask"
+      warn "现有远程规则集预检失败；WARP 配置和服务均未改动。"
+      return 1
+    fi
+    if jq -en --slurpfile current "$ROUTE_JSON" --slurpfile candidate "$route_check" \
+        '$current[0] == $candidate[0]' >/dev/null; then
+      rm -f -- "$route_check"
+      route_check=""
+    else
+      route_changed=true
+    fi
+  fi
+
+  ENABLE_WARP=true
+  if [[ -n "$profile_to_import" ]]; then
+    if ! save_private_file "$profile_to_import" "$WGCF_DIR/wgcf-profile.conf" \
+        || ! save_warp; then
+      failure="保存导入的 WARP WireGuard profile 失败"
+    else
+      WARP_BACKEND=wireguard
+    fi
+  fi
+  if [[ -z "$failure" ]] && ! ensure_warp_backend; then
+    if [[ -n "$profile_to_import" ]]; then
+      failure="导入的 WARP WireGuard profile 未能启用"
+    else
+      [[ -z "$route_check" ]] || rm -f -- "$route_check"
+      umask "$old_umask"
+      warn "WARP 账号仍不可用；sing-box 配置和服务均未改动。"
+      return 1
+    fi
+  fi
+  if [[ -z "$failure" && "$route_changed" == true ]]; then
+    if ! chmod 600 "$route_check" || ! mv -f -- "$route_check" "$ROUTE_JSON"; then
+      failure="保存规范化分流配置失败"
+    else
+      route_check=""
+      info "已规范化旧版生成的 geosite 规则集配置。"
+    fi
+  fi
+  if [[ -z "$failure" ]] && ! save_env; then
+    failure="保存 WARP 开关失败"
+  elif [[ -z "$failure" ]] && ! write_config; then
+    failure="生成 sing-box 配置失败"
+  elif [[ -z "$failure" ]] && ! warp_backend_config_ready; then
+    failure="WARP 配置完整性复核失败"
+  elif [[ -z "$failure" ]] && ! jq -e '([.endpoints[]? | select(.tag == "warp")] + [.outbounds[]? | select(.tag == "warp")]) | length == 1' \
+      "$CONF_JSON" >/dev/null 2>&1; then
+    failure="生成配置中缺少唯一的 WARP 出口"
+  elif [[ -z "$failure" ]] && ! verify_warp_egress; then
+    failure="WARP 出口连通性验证失败（Cloudflare trace 未返回 warp=on/plus）"
+  fi
+
+  if [[ -z "$failure" && -n "$profile_to_import" ]]; then
+    if ! write_singbox_unit; then
+      failure="更新 sing-box 服务依赖失败"
+    else
+      unit_changed=true
+      systemctl daemon-reload || failure="重新加载 sing-box 服务依赖失败"
+    fi
+  fi
+
+  if [[ -z "$failure" ]] && command -v systemctl >/dev/null 2>&1 \
+      && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
+    service_active=true
+    restart_attempted=true
+    if ! restart_service_stably "$SYSTEMD_SERVICE"; then
+      failure="sing-box 重启后未能稳定运行"
+    fi
+  fi
+
+  if [[ -n "$failure" ]]; then
+    warn "$failure，正在恢复修复前配置"
+    restore_warp_repair "$backup_dir" || restore_failed=true
+    load_env || true
+    load_warp 2>/dev/null || true
+    if [[ "$unit_changed" == true ]]; then
+      systemctl daemon-reload || restore_failed=true
+    fi
+    if [[ "$restart_attempted" == true ]]; then
+      restart_service_stably "$SYSTEMD_SERVICE" >/dev/null 2>&1 || restore_failed=true
+    fi
+    umask "$old_umask"
+    if [[ "$restore_failed" == true ]]; then
+      warn "自动回滚不完整，请从以下目录手动恢复：$backup_dir"
+    else
+      warn "已恢复修复前配置：$backup_dir"
+    fi
+    return 1
+  fi
+
+  if [[ -z "$profile_to_import" || "$previous_warp_ready" != true ]]; then
+    open_firewall || warn "WARP 已启用，但防火墙规则更新失败，请手动检查端口"
+    print_links_grouped || warn "WARP 已启用，但导入链接文件更新失败"
+  fi
+  if [[ "$previous_proxy_backend" == true && "$service_active" == true \
+        && -f "$WARP_CLI_MANAGED_MARKER" ]]; then
+    # The script owns this daemon; release its memory only after native WARP is live.
+    if systemctl disable --now warp-svc.service >/dev/null 2>&1; then
+      info "已停止并禁用脚本安装的 warp-svc；官方客户端配置保留以便回退。"
+    else
+      warn "原 WARP 出口已切到 WireGuard，但无法停止 warp-svc；请检查服务状态。"
+    fi
+  fi
+  umask "$old_umask"
+  if [[ "$service_active" == true ]]; then
+    info "WARP 已启用并完成 sing-box 重启"
+  else
+    info "WARP 已写入配置；sing-box 当前未运行，未执行重启"
+  fi
+  info "修复前备份：$backup_dir"
+}
+
 # ===== 写 config.json（使用你提供的稳定配置逻辑） =====
 write_config(){
   local preserve_warp="${1:-false}"
@@ -3778,6 +3764,381 @@ print_links_grouped(){
   hr
   info "导入链接已更新：$SHARE_LINKS_FILE"
   print_socks_node_links
+}
+
+# ===== Optional SOCKS egress nodes =====
+socks_uri_decode(){
+  local input="$1" output="" char byte
+  while [[ -n "$input" ]]; do
+    char="${input:0:1}"; input="${input:1}"
+    if [[ "$char" == '%' ]]; then
+      [[ "${input:0:2}" =~ ^[0-9a-fA-F]{2}$ ]] || return 1
+      byte=$((16#${input:0:2}))
+      (( byte >= 32 && byte != 127 )) || return 1
+      printf -v char '%b' "\\x${input:0:2}"
+      input="${input:2}"
+    fi
+    output+="$char"
+  done
+  printf '%s' "$output"
+}
+
+socks_node_outbound_from_link(){
+  local link="$1" tag="$2" scheme body query="" userinfo="" hostport
+  local username="" password="" decoded pair key value version=5
+  [[ "$link" != *[$'\r\n\t ']* ]] || return 1
+  scheme="${link%%://*}"; scheme="${scheme,,}"
+  [[ "$scheme" == socks5 || "$scheme" == socks5h ]] || return 1
+  body="${link#*://}"; body="${body%%\#*}"
+  if [[ "$body" == *'?'* ]]; then
+    query="${body#*\?}"; body="${body%%\?*}"
+  fi
+  body="${body%/}"
+  if [[ "$body" != *'@'* && "$body" != *':'* ]]; then
+    body="$(b64dec "$body")" || return 1
+    body="${body%/}"
+  fi
+  if [[ "$body" == *'@'* ]]; then
+    userinfo="${body%@*}"; hostport="${body##*@}"
+    if [[ "$userinfo" != *':'* ]]; then
+      decoded="$(b64dec "$userinfo" 2>/dev/null)" || decoded=""
+      [[ "$decoded" != *':'* ]] || userinfo="$decoded"
+    fi
+    username="$(socks_uri_decode "${userinfo%%:*}")" || return 1
+    if [[ "$userinfo" == *':'* ]]; then
+      password="$(socks_uri_decode "${userinfo#*:}")" || return 1
+    fi
+  else
+    hostport="$body"
+  fi
+  split_hostport "$hostport" || return 1
+  [[ -n "$SBP_PARSED_HOST" && ${#SBP_PARSED_PORT} -le 5 ]] || return 1
+  local port=$((10#$SBP_PARSED_PORT))
+  (( port >= 1 && port <= 65535 )) || return 1
+  local -a pairs=()
+  IFS='&' read -r -a pairs <<< "$query"
+  for pair in "${pairs[@]}"; do
+    key="${pair%%=*}"; value="$(socks_uri_decode "${pair#*=}")" || return 1
+    case "$key" in
+      user|username) username="$value" ;;
+      pass|password) password="$value" ;;
+      version) version="$value" ;;
+    esac
+  done
+  [[ "$version" == 5 ]] || return 1
+  jq -cn --arg tag "$tag" --arg server "$SBP_PARSED_HOST" --argjson port "$port" \
+    --arg user "$username" --arg pass "$password" '
+    {type:"socks", tag:$tag, server:$server, server_port:$port, version:"5",
+      domain_resolver:"dns-doh-primary"}
+    | if $user != "" or $pass != "" then .username=$user | .password=$pass else . end'
+}
+
+validate_socks_nodes(){
+  jq -ces '
+    def port: type == "number" and . == floor and . >= 1 and . <= 65535;
+    def text: type == "string" and (test("[\\x00-\\x1f\\x7f]") | not);
+    def host:
+      text and length > 0 and
+      (test("^[A-Za-z0-9.-]+$|^[0-9A-Fa-f:]+(%[A-Za-z0-9._-]+)?$") and . != ".");
+    def protocol: IN("vless-reality", "vless-grpcr", "trojan-reality", "hy2", "vmess-ws",
+      "hy2-obfs", "ss2022", "ss", "tuic-v5", "anytls");
+    if length != 1 then error("SOCKS 节点文件必须只包含一个 JSON 对象") else .[0] end
+    | if type != "object" or (keys != ["nodes"]) or (.nodes | type) != "array" then
+        error("SOCKS 节点文件格式无效") else . end
+    | if all(.nodes[];
+        type == "object"
+        and ((keys - ["dns_mode","id","name","outbound","port","protocol","system_ipv6"]) | length == 0)
+        and ((["dns_mode","id","name","outbound","port","protocol"] - keys) | length == 0)
+        and (.id | type == "string" and test("^sbp-socks-[a-f0-9]{16}$"))
+        and (.name | text and length > 0 and length <= 80)
+        and (.port | port) and (.protocol | protocol) and (.dns_mode | IN("local","remote"))
+        and (if has("system_ipv6") then (.system_ipv6 | type == "boolean") else true end)
+        and (.outbound | type == "object")
+        and ((.outbound | keys) - ["domain_resolver","password","server","server_port","tag","type","username","version"] | length == 0)
+        and .outbound.type == "socks" and .outbound.version == "5"
+        and .outbound.tag == (.id + "-out") and .outbound.domain_resolver == "dns-doh-primary"
+        and (.outbound.server | host) and (.outbound.server_port | port)
+        and ((.outbound.username // "") | text and utf8bytelength <= 255)
+        and ((.outbound.password // "") | text and utf8bytelength <= 255))
+      and ([.nodes[].id] | length == (unique | length))
+      and ([.nodes[].port] | length == (unique | length))
+      then . else error("SOCKS 节点参数无效或端口、标识重复") end
+  ' "$1"
+}
+
+load_socks_nodes(){
+  if [[ -e "$SOCKS_NODES_JSON" ]]; then
+    validate_socks_nodes "$SOCKS_NODES_JSON"
+  else
+    printf '%s\n' '{"nodes":[]}'
+  fi
+}
+
+socks_protocol_label(){
+  case "$1" in
+    vless-reality) printf 'VLESS Reality' ;;
+    vless-grpcr) printf 'VLESS gRPC Reality' ;;
+    trojan-reality) printf 'Trojan Reality' ;;
+    hy2) printf 'Hysteria2' ;;
+    vmess-ws) printf 'VMess WS' ;;
+    hy2-obfs) printf 'Hysteria2 obfs' ;;
+    ss2022) printf 'SS2022' ;;
+    ss) printf 'Shadowsocks' ;;
+    tuic-v5) printf 'TUIC v5' ;;
+    anytls) printf 'AnyTLS' ;;
+    *) return 1 ;;
+  esac
+}
+
+socks_node_port_available(){
+  local port="$1" nodes
+  [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || return 1
+  warp_socks_port_conflicts_with_node "$port" && return 1
+  [[ "$port" != "$WARP_SOCKS_PORT" ]] || return 1
+  nodes="$(load_socks_nodes)" || return 1
+  jq -e --argjson port "$port" 'all(.nodes[]; .port != $port)' <<< "$nodes" >/dev/null || return 1
+  if [[ -f "$CONF_JSON" ]] && jq -e --argjson port "$port" \
+      'any(.inbounds[]?; .listen_port == $port)' "$CONF_JSON" >/dev/null; then return 1; fi
+  if command -v ss >/dev/null 2>&1 && [[ -n "$(ss -H -lntu "sport = :$port" 2>/dev/null)" ]]; then return 1; fi
+  [[ "$TLS_CERT_MODE" != acme || ( "$port" != 80 && "$port" != 443 ) ]]
+}
+
+socks_node_firewall_rules(){
+  local nodes protocol port
+  nodes="$(load_socks_nodes)" || return 1
+  while IFS=$'\t' read -r protocol port; do
+    [[ -n "$protocol" ]] || continue
+    case "$protocol" in
+      hy2|hy2-obfs|tuic-v5) printf '%s/udp\n' "$port" ;;
+      ss2022|ss) printf '%s/tcp\n%s/udp\n' "$port" "$port" ;;
+      *) printf '%s/tcp\n' "$port" ;;
+    esac
+  done < <(jq -r '.nodes[] | [.protocol, .port] | @tsv' <<< "$nodes" | tr -d '\r')
+}
+
+close_socks_node_firewall_rules(){
+  local previous="$1" old_rules current_rules rule backend=iptables port proto
+  [[ -f "$previous" ]] || return 0
+  old_rules="$(SOCKS_NODES_JSON="$previous" socks_node_firewall_rules)" || return 1
+  current_rules="$(socks_node_firewall_rules)" || return 1
+  local -a removed=()
+  while IFS= read -r rule; do
+    [[ -n "$rule" ]] || continue
+    if ! grep -Fxq -- "$rule" <<< "$current_rules"; then removed+=("$rule"); fi
+  done <<< "$old_rules"
+  (( ${#removed[@]} > 0 )) || return 0
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -qi -E '(^|[[:space:]])active($|[[:space:]])|活跃'; then
+    backend=ufw
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    backend=firewalld
+  else
+    command -v iptables >/dev/null 2>&1 || return 0
+  fi
+  for rule in "${removed[@]}"; do
+    case "$backend" in
+      ufw) ufw delete allow "$rule" >/dev/null || return 1 ;;
+      firewalld) firewall-cmd --permanent --remove-port="$rule" >/dev/null || return 1 ;;
+      iptables)
+        port="${rule%/*}"; proto="${rule#*/}"
+        if iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+          iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT || return 1
+        fi
+        ;;
+    esac
+  done
+  case "$backend" in
+    ufw) ufw reload >/dev/null ;;
+    firewalld) firewall-cmd --reload >/dev/null ;;
+    iptables) if command -v netfilter-persistent >/dev/null 2>&1; then netfilter-persistent save >/dev/null; fi ;;
+  esac
+}
+
+apply_socks_nodes()(
+  trap - EXIT
+  local candidate="$1" expected="$2" current backup_dir failure="" item
+  local service_active=false restart_attempted=false rollback_failed=false
+  ensure_installed_or_hint || return 1
+  validate_socks_nodes "$candidate" >/dev/null || return 1
+  if ! mkdir "$SB_DIR/.socks-nodes.lock" 2>/dev/null; then
+    warn "另一个 SOCKS 节点操作正在运行。"; return 1
+  fi
+  trap 'rmdir "$SB_DIR/.socks-nodes.lock"' EXIT
+  current="$(load_socks_nodes)" || return 1
+  [[ "$current" == "$expected" ]] || { warn "SOCKS 节点已被其他操作修改，请重试。"; return 1; }
+  mkdir -p "$SB_DIR/backups" || return 1
+  backup_dir="$(mktemp -d "$SB_DIR/backups/socks-nodes-$(date +%Y%m%d-%H%M%S)-XXXXXX")" || return 1
+  chmod 700 "$backup_dir" || return 1
+  local -a paths=("$SOCKS_NODES_JSON" "$CONF_JSON" "$SB_DIR/env.conf" "$SB_DIR/ports.env"
+    "$SB_DIR/creds.env" "$CERT_DIR/fullchain.pem" "$CERT_DIR/key.pem" "$SOCKS_SHARE_LINKS_FILE")
+  local -a names=(socks-nodes.json config.json env.conf ports.env creds.env fullchain.pem key.pem socks-share-links.txt)
+  for item in "${!paths[@]}"; do
+    backup_runtime_file "${paths[$item]}" "${names[$item]}" "$backup_dir" || return 1
+  done
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
+    service_active=true
+  fi
+  local tmp
+  tmp="$(mktemp "${SOCKS_NODES_JSON}.tmp.XXXXXX")" || return 1
+  if ! cp -- "$candidate" "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$SOCKS_NODES_JSON"; then
+    rm -f -- "$tmp"; failure="保存 SOCKS 节点失败"
+  elif ! write_config true; then
+    failure="生成或校验 SOCKS 节点配置失败"
+  elif [[ "$service_active" == true ]]; then
+    restart_attempted=true
+    restart_service_stably "$SYSTEMD_SERVICE" || failure="服务重启后未能稳定运行"
+  fi
+  if [[ -z "$failure" ]] && ! print_socks_node_links; then
+    failure="生成 SOCKS 节点分享链接失败"
+  fi
+  if [[ -n "$failure" ]]; then
+    for item in "${!paths[@]}"; do
+      restore_runtime_file "$backup_dir" "${names[$item]}" "${paths[$item]}" || rollback_failed=true
+    done
+    if [[ "$restart_attempted" == true ]]; then
+      restart_service_stably "$SYSTEMD_SERVICE" || rollback_failed=true
+    fi
+    warn "$failure，已尝试恢复原配置；备份：$backup_dir"
+    [[ "$rollback_failed" == false ]] || warn "部分恢复失败，请检查服务和备份。"
+    return 1
+  fi
+  open_firewall || warn "配置已保存，但防火墙放行失败，请检查端口。"
+  close_socks_node_firewall_rules "$backup_dir/socks-nodes.json" \
+    || warn "节点已更新，但旧端口防火墙规则清理失败。"
+  if [[ "$service_active" == true ]]; then info "SOCKS 节点已应用";
+  else info "SOCKS 节点已保存；服务当前未运行"; fi
+)
+
+add_socks_node()(
+  trap - EXIT
+  local link protocol name port id outbound current tmp dns_mode=local system_ipv6=false attempt
+  local -a protocols=(vless-reality vless-grpcr trojan-reality hy2 vmess-ws hy2-obfs ss2022 ss tuic-v5 anytls)
+  ensure_installed_or_hint || return 1
+  load_env; load_ports || return 1
+  current="$(load_socks_nodes)" || return 1
+  read -rsp 'SOCKS5 / SOCKS5H 链接: ' link || return 0
+  printf '\n'
+  id="sbp-socks-$(rand_hex8 | tr -d '\r\n')"
+  outbound="$(socks_node_outbound_from_link "$link" "$id-out")" \
+    || { warn "SOCKS 链接无效，请检查地址、端口和认证信息。"; return 1; }
+  [[ "${link%%://*}" != [sS][oO][cC][kK][sS]5[hH] ]] || dns_mode=remote
+  local index=1 choice
+  for protocol in "${protocols[@]}"; do
+    printf '%2s) %s\n' "$index" "$(socks_protocol_label "$protocol")"; index=$((index+1))
+  done
+  read -rp '协议 [1]: ' choice || return 0
+  choice="${choice:-1}"
+  [[ "$choice" =~ ^([1-9]|10)$ ]] || { warn "协议选项无效。"; return 1; }
+  protocol="${protocols[$((choice-1))]}"
+  name="${link#*\#}"
+  if [[ "$name" == "$link" || -z "$name" ]]; then name="$protocol-socks";
+  else name="$(socks_uri_decode "$name")" || { warn "节点名称编码无效。"; return 1; }; fi
+  read -rp "节点名称 [$name]: " choice || return 0
+  name="${choice:-$name}"
+  read -rp '端口 [自动]: ' port || return 0
+  if [[ -z "$port" ]]; then
+    for ((attempt=0; attempt<100; attempt++)); do
+      port=$((RANDOM % 55536 + 10000))
+      socks_node_port_available "$port" && break
+    done
+  fi
+  socks_node_port_available "$port" || { warn "端口无效或已被使用。"; return 1; }
+  printf '系统 IPv6 使用本机出口，目标域名由本机解析。\n'
+  read -rp '启用系统 IPv6 出口（IPv4 优先）？[y/N]: ' choice || return 0
+  case "$choice" in
+    y|Y)
+      [[ -n "$(default_ipv6_address)" ]] || { warn "系统没有可用的 IPv6 出口路由。"; return 1; }
+      system_ipv6=true ;;
+    n|N|'') ;;
+    *) warn "IPv6 选项无效。"; return 1 ;;
+  esac
+  tmp="$(mktemp "$SB_DIR/.socks-node.XXXXXX")" || return 1
+  trap 'rm -f -- "$tmp"' EXIT
+  jq -c --arg id "$id" --arg name "$name" --arg protocol "$protocol" --argjson port "$port" \
+    --arg dns_mode "$dns_mode" --argjson system_ipv6 "$system_ipv6" --argjson outbound "$outbound" \
+    '.nodes += [{id:$id, name:$name, protocol:$protocol, port:$port, dns_mode:$dns_mode, system_ipv6:$system_ipv6, outbound:$outbound}]' \
+    <<< "$current" > "$tmp" || return 1
+  chmod 600 "$tmp" || return 1
+  apply_socks_nodes "$tmp" "$current"
+)
+
+list_socks_nodes(){
+  local nodes
+  nodes="$(load_socks_nodes)" || return 1
+  if [[ "$(jq '.nodes | length' <<< "$nodes")" == 0 ]]; then info "暂无 SOCKS 出口节点"; return 0; fi
+  jq -r '.nodes | to_entries[] | "\(.key + 1)) \(.value.name) | \(.value.protocol) | \(.value.port)" +
+    (if .value.system_ipv6 == true then " | 系统 IPv6" else "" end)' <<< "$nodes"
+}
+
+configure_socks_node_ipv6()(
+  trap - EXIT
+  local current choice count index enabled=false tmp
+  ensure_installed_or_hint || return 1
+  current="$(load_socks_nodes)" || return 1
+  count="$(jq '.nodes | length' <<< "$current")"
+  [[ "$count" != 0 ]] || { info "暂无 SOCKS 出口节点"; return 0; }
+  list_socks_nodes || return 1
+  read -rp '节点编号 [0 返回]: ' choice || return 0
+  [[ "${choice:-0}" != 0 ]] || return 0
+  [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= count )) || { warn "节点编号无效。"; return 1; }
+  index=$((choice-1))
+  if [[ "$(jq -r --argjson index "$index" '.nodes[$index].system_ipv6 // false' <<< "$current")" == true ]]; then
+    choice=2
+  else choice=1; fi
+  printf '1) 仅 SOCKS\n2) SOCKS IPv4 + 系统 IPv6（IPv4 优先）\n'
+  printf '系统 IPv6 使用本机出口，目标域名由本机解析。\n'
+  local selection
+  read -rp "出口模式 [$choice]: " selection || return 0
+  case "${selection:-$choice}" in
+    1) ;;
+    2)
+      [[ -n "$(default_ipv6_address)" ]] || { warn "系统没有可用的 IPv6 出口路由。"; return 1; }
+      enabled=true ;;
+    *) warn "出口模式无效。"; return 1 ;;
+  esac
+  tmp="$(mktemp "$SB_DIR/.socks-node.XXXXXX")" || return 1
+  trap 'rm -f -- "$tmp"' EXIT
+  jq -c --argjson index "$index" --argjson enabled "$enabled" \
+    '.nodes[$index].system_ipv6 = $enabled' <<< "$current" > "$tmp" || return 1
+  chmod 600 "$tmp" || return 1
+  apply_socks_nodes "$tmp" "$current"
+)
+
+remove_socks_node()(
+  trap - EXIT
+  local current choice count tmp confirm
+  current="$(load_socks_nodes)" || return 1
+  count="$(jq '.nodes | length' <<< "$current")"
+  [[ "$count" != 0 ]] || { info "暂无 SOCKS 出口节点"; return 0; }
+  list_socks_nodes || return 1
+  read -rp '删除节点编号 [0 返回]: ' choice || return 0
+  [[ "${choice:-0}" != 0 ]] || return 0
+  [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= count )) || { warn "节点编号无效。"; return 1; }
+  read -rp '删除该节点并重启运行中的服务？[y/N]: ' confirm || return 0
+  [[ "$confirm" == [yY] ]] || return 0
+  tmp="$(mktemp "$SB_DIR/.socks-node.XXXXXX")" || return 1
+  trap 'rm -f -- "$tmp"' EXIT
+  jq -c --argjson index "$((choice-1))" 'del(.nodes[$index])' <<< "$current" > "$tmp" || return 1
+  chmod 600 "$tmp" || return 1
+  apply_socks_nodes "$tmp" "$current"
+)
+
+socks_nodes_menu(){
+  ensure_installed_or_hint || return 0
+  local choice
+  while :; do
+    hr
+    printf 'SOCKS 出口节点\n1) 导入链接并创建节点\n2) 查看节点\n3) 查看分享链接\n4) 删除节点\n5) 配置系统 IPv6 出口\n0) 返回\n'
+    read -rp '选择: ' choice || return 0
+    case "$choice" in
+      1) add_socks_node || true ;;
+      2) list_socks_nodes || true ;;
+      3) print_socks_node_links || true ;;
+      4) remove_socks_node || true ;;
+      5) configure_socks_node_ipv6 || true ;;
+      0|'') return 0 ;;
+      *) warn "无效选项" ;;
+    esac
+  done
 }
 
 # ===== 自定义路由菜单 =====
@@ -5126,23 +5487,22 @@ rotate_ports(){
   read -p "回车返回..." _ || true
 }
 
-# ===== 一键彻底卸载与深度清理 =====
-uninstall_managed_warp_cli(){
-  [[ -f "$WARP_CLI_MANAGED_MARKER" ]] || return 0
-  local package_manager
-  package_manager="$(awk -F= '$1=="package_manager" {print $2; exit}' "$WARP_CLI_MANAGED_MARKER" 2>/dev/null)"
-  info "正在移除由 Sing-Box-Plus 安装的官方 WARP 客户端..."
-  warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl disable --now warp-svc.service >/dev/null 2>&1 || true
-  fi
-  case "$package_manager" in
-    apt) DEBIAN_FRONTEND=noninteractive apt-get purge -y cloudflare-warp >/dev/null 2>&1 || true ;;
-    dnf) dnf remove -y cloudflare-warp >/dev/null 2>&1 || true ;;
-    yum) yum remove -y cloudflare-warp >/dev/null 2>&1 || true ;;
-  esac
+deploy_native(){
+  install_deps
+  install_singbox
+  write_config
+  info "检查配置 ..."
+  "$BIN_PATH" check -c "$CONF_JSON"
+  info "写入并启用 systemd 服务 ..."
+  write_systemd
+  open_firewall
+  systemctl restart "${SYSTEMD_SERVICE}" || die "sing-box 启动失败"
+  echo; echo -e "${C_BOLD}${C_GREEN}★ Sing-Box-Plus 部署完成${C_RESET}"; echo
+  print_links_grouped
+  exit 0
 }
 
+# ===== 一键彻底卸载与深度清理 =====
 uninstall_all(){
   clear >/dev/null 2>&1 || true
   hr
@@ -5240,365 +5600,7 @@ uninstall_all(){
   exit 0
 }
 
-deploy_native(){
-  install_deps
-  install_singbox
-  write_config
-  info "检查配置 ..."
-  "$BIN_PATH" check -c "$CONF_JSON"
-  info "写入并启用 systemd 服务 ..."
-  write_systemd
-  open_firewall
-  systemctl restart "${SYSTEMD_SERVICE}" || die "sing-box 启动失败"
-  echo; echo -e "${C_BOLD}${C_GREEN}★ Sing-Box-Plus 部署完成${C_RESET}"; echo
-  print_links_grouped
-  exit 0
-}
-
-ensure_installed_or_hint(){
-  if [[ ! -f "$CONF_JSON" ]]; then
-    warn "尚未安装，请先选择 1) 安装/部署"
-    return 1
-  fi
-  return 0
-}
-
 # ===== 已有节点轻量更新 =====
-backup_runtime_file(){
-  local source_path=$1 backup_name=$2 backup_dir=$3
-  if [[ -e "$source_path" || -L "$source_path" ]]; then
-    cp -a -- "$source_path" "$backup_dir/$backup_name" || return 1
-  else
-    : > "$backup_dir/${backup_name}.missing" || return 1
-  fi
-}
-
-restore_runtime_file(){
-  local backup_dir=$1 backup_name=$2 target_path=$3
-  if [[ -e "$backup_dir/$backup_name" || -L "$backup_dir/$backup_name" ]]; then
-    mkdir -p "$(dirname "$target_path")" || return 1
-    cp -a -- "$backup_dir/$backup_name" "$target_path" || return 1
-  elif [[ -f "$backup_dir/${backup_name}.missing" ]]; then
-    rm -f -- "$target_path" || return 1
-  fi
-}
-
-backup_warp_repair(){
-  local backup_dir="$1"
-  backup_runtime_file "$SB_DIR/env.conf" env.conf "$backup_dir" || return 1
-  backup_runtime_file "$CONF_JSON" config.json "$backup_dir" || return 1
-  backup_runtime_file "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" sing-box.service "$backup_dir" || return 1
-  backup_runtime_file "$ROUTE_JSON" routes.json "$backup_dir" || return 1
-  backup_runtime_file "$SB_DIR/warp.env" warp.env "$backup_dir" || return 1
-  backup_runtime_file "$SB_DIR/creds.env" creds.env "$backup_dir" || return 1
-  backup_runtime_file "$SB_DIR/ports.env" ports.env "$backup_dir" || return 1
-  backup_runtime_file "$SHARE_LINKS_FILE" share-links.txt "$backup_dir" || return 1
-  backup_runtime_file "$WGCF_DIR/wgcf-account.toml" wgcf-account.toml "$backup_dir" || return 1
-  backup_runtime_file "$WGCF_DIR/wgcf-profile.conf" wgcf-profile.conf "$backup_dir" || return 1
-  backup_runtime_file "$CERT_DIR/fullchain.pem" fullchain.pem "$backup_dir" || return 1
-  backup_runtime_file "$CERT_DIR/key.pem" key.pem "$backup_dir" || return 1
-}
-
-restore_warp_repair(){
-  local backup_dir="$1" restore_failed=0
-  restore_runtime_file "$backup_dir" env.conf "$SB_DIR/env.conf" || restore_failed=1
-  restore_runtime_file "$backup_dir" config.json "$CONF_JSON" || restore_failed=1
-  restore_runtime_file "$backup_dir" sing-box.service "${SYSTEMD_UNIT_DIR}/${SYSTEMD_SERVICE}" || restore_failed=1
-  restore_runtime_file "$backup_dir" routes.json "$ROUTE_JSON" || restore_failed=1
-  restore_runtime_file "$backup_dir" warp.env "$SB_DIR/warp.env" || restore_failed=1
-  restore_runtime_file "$backup_dir" creds.env "$SB_DIR/creds.env" || restore_failed=1
-  restore_runtime_file "$backup_dir" ports.env "$SB_DIR/ports.env" || restore_failed=1
-  restore_runtime_file "$backup_dir" share-links.txt "$SHARE_LINKS_FILE" || restore_failed=1
-  restore_runtime_file "$backup_dir" wgcf-account.toml "$WGCF_DIR/wgcf-account.toml" || restore_failed=1
-  restore_runtime_file "$backup_dir" wgcf-profile.conf "$WGCF_DIR/wgcf-profile.conf" || restore_failed=1
-  restore_runtime_file "$backup_dir" fullchain.pem "$CERT_DIR/fullchain.pem" || restore_failed=1
-  restore_runtime_file "$backup_dir" key.pem "$CERT_DIR/key.pem" || restore_failed=1
-  return "$restore_failed"
-}
-
-verify_warp_egress(){
-  (
-    local tmp_dir verify_config run_log port="" proxy_pid="" proxy_ready=false
-    local trace="" warp_state="" candidate attempt
-
-    tmp_dir="$(mktemp -d "$SB_DIR/.warp-verify.XXXXXX")" || return 1
-    case "$tmp_dir" in
-      "$SB_DIR"/.warp-verify.*) ;;
-      *) return 1 ;;
-    esac
-    chmod 0700 "$tmp_dir" 2>/dev/null || true
-    verify_config="$tmp_dir/config.json"
-    run_log="$tmp_dir/sing-box.log"
-
-    cleanup(){
-      trap - EXIT INT TERM
-      if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>/dev/null; then
-        kill "$proxy_pid" 2>/dev/null || true
-        wait "$proxy_pid" 2>/dev/null || true
-      fi
-      rm -rf -- "$tmp_dir"
-    }
-    trap cleanup EXIT INT TERM
-
-    for candidate in $(seq 29400 29499); do
-      if ! ss -H -ltn "sport = :$candidate" 2>/dev/null | grep -q .; then
-        port="$candidate"
-        break
-      fi
-    done
-    [[ -n "$port" ]] || return 1
-
-    if ! jq --argjson port "$port" '
-      (.dns.final) as $resolver
-      | ([.endpoints[]? | select(.tag == "warp")]) as $warp_endpoints
-      | ([.outbounds[]? | select(.tag == "warp")]) as $warp_outbounds
-      | ([.outbounds[]? | select(.tag == "direct")]) as $direct
-      | if (($warp_endpoints | length) + ($warp_outbounds | length)) != 1
-          or ($direct | length) != 1 or ($resolver == null) then
-          error("missing WARP verification dependency")
-        else
-          {
-            log: {level: "warn", timestamp: true},
-            dns: .dns,
-            inbounds: [{
-              type: "socks",
-              tag: "warp-verify-in",
-              listen: "127.0.0.1",
-              listen_port: $port
-            }],
-            endpoints: $warp_endpoints,
-            outbounds: ($direct + $warp_outbounds),
-            route: {
-              rules: [{
-                inbound: ["warp-verify-in"],
-                action: "route",
-                outbound: "warp"
-              }],
-              default_domain_resolver: $resolver,
-              final: "direct"
-            }
-          }
-        end
-    ' "$CONF_JSON" > "$verify_config"; then
-      return 1
-    fi
-    chmod 0600 "$verify_config" 2>/dev/null || true
-    "$BIN_PATH" check -c "$verify_config" >/dev/null 2>&1 || return 1
-
-    (
-      cd "$tmp_dir"
-      exec "$BIN_PATH" run -c "$verify_config"
-    ) > "$run_log" 2>&1 &
-    proxy_pid=$!
-
-    for _ in $(seq 1 50); do
-      if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .; then
-        proxy_ready=true
-        break
-      fi
-      kill -0 "$proxy_pid" 2>/dev/null || break
-      sleep 0.1
-    done
-    if [[ "$proxy_ready" != true ]]; then
-      mkdir -p "$WGCF_DIR" 2>/dev/null || true
-      [[ ! -f "$run_log" ]] || install -m 0600 "$run_log" "$WGCF_DIR/warp-verify-last-error.log" 2>/dev/null || true
-      return 1
-    fi
-
-    for attempt in $(seq 1 8); do
-      trace="$(curl -fsS --max-time 5 --noproxy '' \
-        --proxy "socks5h://127.0.0.1:$port" \
-        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
-      warp_state="$(printf '%s\n' "$trace" | awk -F= '$1=="warp" {print $2; exit}')"
-      [[ "$warp_state" =~ ^(on|plus)$ ]] && break
-      [[ "$attempt" -lt 8 ]] && sleep 1
-    done
-    if [[ ! "$warp_state" =~ ^(on|plus)$ ]]; then
-      mkdir -p "$WGCF_DIR" 2>/dev/null || true
-      [[ ! -f "$run_log" ]] || install -m 0600 "$run_log" "$WGCF_DIR/warp-verify-last-error.log" 2>/dev/null || true
-      return 1
-    fi
-    rm -f -- "$WGCF_DIR/warp-verify-last-error.log"
-  )
-}
-
-repair_warp(){
-  local profile_to_import="${1:-}"
-  local previous_warp_ready=false previous_proxy_backend=false
-  [[ "$EUID" -eq 0 || "${SBP_SKIP_ROOT:-0}" -eq 1 || -n "${TEST_ROOT:-}" ]] \
-    || die "WARP 修复需要 root 权限，请使用 sudo 运行"
-  ensure_installed_or_hint || return 1
-  load_env || true
-  load_creds || true
-  load_ports || true
-  ensure_dirs
-
-  if [[ -n "$profile_to_import" ]]; then
-    if warp_proxy_config_ready; then
-      previous_proxy_backend=true
-    fi
-    if warp_backend_config_ready; then
-      previous_warp_ready=true
-    fi
-    if [[ ! -f "$profile_to_import" || ! -r "$profile_to_import" ]]; then
-      warn "WARP WireGuard profile 不存在或不可读"
-      return 1
-    fi
-    ENABLE_WARP=true
-    if ! parse_warp_profile "$profile_to_import"; then
-      warn "WARP WireGuard profile 无效，未改动运行配置"
-      return 1
-    fi
-  fi
-
-  local backup_root="$SB_DIR/backups" backup_dir timestamp old_umask route_check
-  local route_changed=false
-  local service_active=false restart_attempted=false unit_changed=false
-  local failure="" restore_failed=false
-  if command -v flock >/dev/null 2>&1; then
-    exec 7>"$SB_DIR/.warp-repair.lock"
-    flock -n 7 || { warn "另一个 WARP 修复正在进行，请稍后重试"; return 1; }
-  fi
-
-  old_umask="$(umask)"
-  umask 077
-  mkdir -p "$backup_root" || { umask "$old_umask"; return 1; }
-  timestamp="$(date +%Y%m%d-%H%M%S)"
-  backup_dir="$(mktemp -d "$backup_root/warp-repair-${timestamp}.XXXXXX")" || { umask "$old_umask"; return 1; }
-  chmod 0700 "$backup_dir" || { umask "$old_umask"; return 1; }
-  if ! backup_warp_repair "$backup_dir"; then
-    umask "$old_umask"
-    warn "WARP 修复前备份失败，未修改运行配置：$backup_dir"
-    return 1
-  fi
-
-  if [[ -s "$ROUTE_JSON" ]]; then
-    route_check="$(mktemp "$backup_dir/routes-preflight.XXXXXX")" || {
-      umask "$old_umask"
-      return 1
-    }
-    if ! normalize_route_file "$ROUTE_JSON" > "$route_check" \
-        || ! validate_route_references "$route_check"; then
-      rm -f -- "$route_check"
-      umask "$old_umask"
-      warn "现有自定义路由校验失败；WARP 配置和服务均未改动。"
-      return 1
-    fi
-    if ! validate_remote_rule_sets "$route_check"; then
-      rm -f -- "$route_check"
-      umask "$old_umask"
-      warn "现有远程规则集预检失败；WARP 配置和服务均未改动。"
-      return 1
-    fi
-    if jq -en --slurpfile current "$ROUTE_JSON" --slurpfile candidate "$route_check" \
-        '$current[0] == $candidate[0]' >/dev/null; then
-      rm -f -- "$route_check"
-      route_check=""
-    else
-      route_changed=true
-    fi
-  fi
-
-  ENABLE_WARP=true
-  if [[ -n "$profile_to_import" ]]; then
-    if ! save_private_file "$profile_to_import" "$WGCF_DIR/wgcf-profile.conf" \
-        || ! save_warp; then
-      failure="保存导入的 WARP WireGuard profile 失败"
-    else
-      WARP_BACKEND=wireguard
-    fi
-  fi
-  if [[ -z "$failure" ]] && ! ensure_warp_backend; then
-    if [[ -n "$profile_to_import" ]]; then
-      failure="导入的 WARP WireGuard profile 未能启用"
-    else
-      [[ -z "$route_check" ]] || rm -f -- "$route_check"
-      umask "$old_umask"
-      warn "WARP 账号仍不可用；sing-box 配置和服务均未改动。"
-      return 1
-    fi
-  fi
-  if [[ -z "$failure" && "$route_changed" == true ]]; then
-    if ! chmod 600 "$route_check" || ! mv -f -- "$route_check" "$ROUTE_JSON"; then
-      failure="保存规范化分流配置失败"
-    else
-      route_check=""
-      info "已规范化旧版生成的 geosite 规则集配置。"
-    fi
-  fi
-  if [[ -z "$failure" ]] && ! save_env; then
-    failure="保存 WARP 开关失败"
-  elif [[ -z "$failure" ]] && ! write_config; then
-    failure="生成 sing-box 配置失败"
-  elif [[ -z "$failure" ]] && ! warp_backend_config_ready; then
-    failure="WARP 配置完整性复核失败"
-  elif [[ -z "$failure" ]] && ! jq -e '([.endpoints[]? | select(.tag == "warp")] + [.outbounds[]? | select(.tag == "warp")]) | length == 1' \
-      "$CONF_JSON" >/dev/null 2>&1; then
-    failure="生成配置中缺少唯一的 WARP 出口"
-  elif [[ -z "$failure" ]] && ! verify_warp_egress; then
-    failure="WARP 出口连通性验证失败（Cloudflare trace 未返回 warp=on/plus）"
-  fi
-
-  if [[ -z "$failure" && -n "$profile_to_import" ]]; then
-    if ! write_singbox_unit; then
-      failure="更新 sing-box 服务依赖失败"
-    else
-      unit_changed=true
-      systemctl daemon-reload || failure="重新加载 sing-box 服务依赖失败"
-    fi
-  fi
-
-  if [[ -z "$failure" ]] && command -v systemctl >/dev/null 2>&1 \
-      && systemctl is-active --quiet "$SYSTEMD_SERVICE"; then
-    service_active=true
-    restart_attempted=true
-    if ! restart_service_stably "$SYSTEMD_SERVICE"; then
-      failure="sing-box 重启后未能稳定运行"
-    fi
-  fi
-
-  if [[ -n "$failure" ]]; then
-    warn "$failure，正在恢复修复前配置"
-    restore_warp_repair "$backup_dir" || restore_failed=true
-    load_env || true
-    load_warp 2>/dev/null || true
-    if [[ "$unit_changed" == true ]]; then
-      systemctl daemon-reload || restore_failed=true
-    fi
-    if [[ "$restart_attempted" == true ]]; then
-      restart_service_stably "$SYSTEMD_SERVICE" >/dev/null 2>&1 || restore_failed=true
-    fi
-    umask "$old_umask"
-    if [[ "$restore_failed" == true ]]; then
-      warn "自动回滚不完整，请从以下目录手动恢复：$backup_dir"
-    else
-      warn "已恢复修复前配置：$backup_dir"
-    fi
-    return 1
-  fi
-
-  if [[ -z "$profile_to_import" || "$previous_warp_ready" != true ]]; then
-    open_firewall || warn "WARP 已启用，但防火墙规则更新失败，请手动检查端口"
-    print_links_grouped || warn "WARP 已启用，但导入链接文件更新失败"
-  fi
-  if [[ "$previous_proxy_backend" == true && "$service_active" == true \
-        && -f "$WARP_CLI_MANAGED_MARKER" ]]; then
-    # The script owns this daemon; release its memory only after native WARP is live.
-    if systemctl disable --now warp-svc.service >/dev/null 2>&1; then
-      info "已停止并禁用脚本安装的 warp-svc；官方客户端配置保留以便回退。"
-    else
-      warn "原 WARP 出口已切到 WireGuard，但无法停止 warp-svc；请检查服务状态。"
-    fi
-  fi
-  umask "$old_umask"
-  if [[ "$service_active" == true ]]; then
-    info "WARP 已启用并完成 sing-box 重启"
-  else
-    info "WARP 已写入配置；sing-box 当前未运行，未执行重启"
-  fi
-  info "修复前备份：$backup_dir"
-}
-
 backup_runtime_update(){
   local backup_dir=$1
   backup_runtime_file "$SBP_SCRIPT_PATH" management-script "$backup_dir" || return 1
