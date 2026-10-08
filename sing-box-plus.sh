@@ -313,6 +313,29 @@ REALITY_SERVER_PORT=${REALITY_SERVER_PORT:-443}
 GRPC_SERVICE=${GRPC_SERVICE:-grpc}
 VMESS_WS_PATH=${VMESS_WS_PATH:-/vm}
 
+# WARP 相关路径（均可通过环境变量覆盖，测试依赖这一点）
+WGCF_BIN=${WGCF_BIN:-/usr/local/bin/wgcf}
+WARP_CLI_MANAGED_MARKER=${WARP_CLI_MANAGED_MARKER:-$SB_DIR/.warp-cli-installed-by-sbp}
+WARP_OS_RELEASE=${WARP_OS_RELEASE:-/etc/os-release}
+WARP_APT_KEYRING=${WARP_APT_KEYRING:-/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg}
+WARP_APT_SOURCE_LIST=${WARP_APT_SOURCE_LIST:-/etc/apt/sources.list.d/cloudflare-client.list}
+WARP_YUM_REPO=${WARP_YUM_REPO:-/etc/yum.repos.d/cloudflare-warp.repo}
+WARP_TRACE_URL=${WARP_TRACE_URL:-https://www.cloudflare.com/cdn-cgi/trace}
+WARP_MTU=1280
+
+# ===== 协议注册表 =====
+# Index-aligned tables, one column per inbound protocol. The direct inbound tag
+# equals the protocol id; its WARP twin is tagged "<id>-warp" and listens on the
+# port stored in "<port var>_W". Every per-protocol loop derives from these rows.
+SBP_PROTOCOLS=(vless-reality vless-grpcr trojan-reality hy2 vmess-ws hy2-obfs ss2022 ss tuic-v5 anytls)
+SBP_PORT_VARS=(PORT_VLESSR PORT_VLESS_GRPCR PORT_TROJANR PORT_HY2 PORT_VMESS_WS PORT_HY2_OBFS PORT_SS2022 PORT_SS PORT_TUIC PORT_ANYTLS)
+SBP_PROTOCOL_NETWORKS=(tcp tcp tcp udp tcp udp tcp/udp tcp/udp udp tcp)
+SBP_PROTOCOL_LABELS=("VLESS Reality" "VLESS gRPC Reality" "Trojan Reality" "Hysteria2" "VMess WS"
+  "Hysteria2 obfs" "SS2022" "Shadowsocks" "TUIC v5" "AnyTLS")
+SBP_LINK_NAMES=(vless-reality vless-grpc-reality trojan-reality hysteria2 vmess-ws hysteria2-obfs ss2022 ss tuic-v5 anytls)
+SBP_WARP_PORT_VARS=("${SBP_PORT_VARS[@]/%/_W}")
+SBP_ALL_PORT_VARS=("${SBP_PORT_VARS[@]}" "${SBP_WARP_PORT_VARS[@]}")
+
 # ===== 颜色 =====
 C_RESET="\033[0m"; C_BOLD="\033[1m"; C_DIM="\033[2m"
 C_RED="\033[31m";  C_GREEN="\033[32m"; C_YELLOW="\033[33m"
@@ -374,8 +397,10 @@ normalize_runtime_settings(){
   valid_duration "$TCP_KEEP_ALIVE_INTERVAL" || { warn "TCP_KEEP_ALIVE_INTERVAL 无效，已恢复为 30s"; TCP_KEEP_ALIVE_INTERVAL=30s; }
   valid_duration "$UDP_TIMEOUT" || { warn "UDP_TIMEOUT 无效，已恢复为 10m"; UDP_TIMEOUT=10m; }
   valid_duration "$DNS_HEALTH_INTERVAL" || { warn "DNS_HEALTH_INTERVAL 无效，已恢复为 2m"; DNS_HEALTH_INTERVAL=2m; }
-  if [[ ! "$WARP_KEEPALIVE_INTERVAL" =~ ^[0-9]+$ ]] ||
-     (( WARP_KEEPALIVE_INTERVAL < 1 || WARP_KEEPALIVE_INTERVAL > 65535 )); then
+  if [[ "$WARP_KEEPALIVE_INTERVAL" =~ ^[0-9]{1,5}$ ]] &&
+     (( 10#$WARP_KEEPALIVE_INTERVAL >= 1 && 10#$WARP_KEEPALIVE_INTERVAL <= 65535 )); then
+    WARP_KEEPALIVE_INTERVAL=$((10#$WARP_KEEPALIVE_INTERVAL))
+  else
     warn "WARP_KEEPALIVE_INTERVAL 无效，已恢复为 25"
     WARP_KEEPALIVE_INTERVAL=25
   fi
@@ -390,13 +415,11 @@ normalize_runtime_settings(){
     warn "WARP_SOCKS_HOST 必须是本机回环地址，已恢复为 127.0.0.1"
     WARP_SOCKS_HOST=127.0.0.1
   fi
-  if [[ ! "${WARP_SOCKS_PORT:-}" =~ ^[0-9]+$ ]] ||
-     (( ${#WARP_SOCKS_PORT} > 5 )) ||
-     (( 10#$WARP_SOCKS_PORT < 1 || 10#$WARP_SOCKS_PORT > 65535 )); then
+  if valid_port "${WARP_SOCKS_PORT:-}"; then
+    WARP_SOCKS_PORT=$((10#$WARP_SOCKS_PORT))
+  else
     warn "WARP_SOCKS_PORT 无效，已恢复为 40000"
     WARP_SOCKS_PORT=40000
-  else
-    WARP_SOCKS_PORT=$((10#$WARP_SOCKS_PORT))
   fi
   if [[ ! "$DNS_FAILURE_THRESHOLD" =~ ^[0-9]+$ ]] ||
      (( DNS_FAILURE_THRESHOLD < 1 || DNS_FAILURE_THRESHOLD > 100 )); then
@@ -539,6 +562,80 @@ get_ip(){ # 多源获取公网IP
 
 is_uuid(){ [[ "$1" =~ ^[0-9a-fA-F-]{36}$ ]]; }
 
+# Bash interprets leading zeros as octal, while JSON requires decimal numbers.
+# Normalize accepted ports with $((10#$port)) before serialization.
+valid_port(){ [[ "${1:-}" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+
+# Replace a file with stdin atomically so readers never observe a partial write.
+atomic_write(){
+  local target="$1" mode="${2:-0600}" tmp
+  mkdir -p "$(dirname "$target")" || return 1
+  tmp="$(mktemp "${target}.tmp.XXXXXX")" || return 1
+  if ! cat > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f -- "$tmp" "$target"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+save_private_file(){ atomic_write "$2" 0600 < "$1"; }
+
+# Quote values before sourcing them again, including paths and imported secrets.
+save_env_file(){
+  local target="$1" var
+  shift
+  {
+    for var in "$@"; do
+      printf '%s=%q\n' "$var" "${!var-}" || return 1
+    done
+  } | atomic_write "$target"
+}
+
+# Registry lookups: print the column value for a protocol id.
+protocol_index(){
+  local i
+  for i in "${!SBP_PROTOCOLS[@]}"; do
+    [[ "${SBP_PROTOCOLS[$i]}" == "${1:-}" ]] && { printf '%s' "$i"; return 0; }
+  done
+  return 1
+}
+protocol_network(){ local i; i="$(protocol_index "$1")" || return 1; printf '%s' "${SBP_PROTOCOL_NETWORKS[$i]}"; }
+protocol_label(){ local i; i="$(protocol_index "$1")" || return 1; printf '%s' "${SBP_PROTOCOL_LABELS[$i]}"; }
+
+# Expand a port and its network ("tcp", "udp" or "tcp/udp") into firewall rules.
+port_firewall_rules(){
+  local port="${1:-}" network="${2:-}"
+  [[ -n "$port" ]] || return 0
+  case "$network" in
+    tcp/udp) printf '%s/tcp\n%s/udp\n' "$port" "$port" ;;
+    tcp|udp) printf '%s/%s\n' "$port" "$network" ;;
+    *) return 1 ;;
+  esac
+}
+
+protocol_firewall_rules(){
+  local include_warp="${1:-false}" suffix index var
+  for suffix in '' _W; do
+    [[ "$suffix" != _W || "$include_warp" == true ]] || continue
+    for index in "${!SBP_PROTOCOLS[@]}"; do
+      var="${SBP_PORT_VARS[$index]}$suffix"
+      port_firewall_rules "${!var:-}" "${SBP_PROTOCOL_NETWORKS[$index]}" || return 1
+    done
+  done
+}
+
+protocol_config_json(){
+  local index var warp_var row
+  local -a rows=()
+  for index in "${!SBP_PROTOCOLS[@]}"; do
+    var="${SBP_PORT_VARS[$index]}"; warp_var="${SBP_WARP_PORT_VARS[$index]}"
+    valid_port "${!var:-}" && valid_port "${!warp_var:-}" || return 1
+    printf -v row '{"tag":"%s","port":%s,"warp_port":%s}' \
+      "${SBP_PROTOCOLS[$index]}" "$((10#${!var}))" "$((10#${!warp_var}))"
+    rows+=("$row")
+  done
+  printf '%s\n' "${rows[@]}" | jq -sc '.'
+}
+
 ensure_dirs(){ mkdir -p "$SB_DIR" "$DATA_DIR" "$CERT_DIR" "$WGCF_DIR"; }
 
 ensure_installed_or_hint(){
@@ -583,8 +680,7 @@ rand_ports_reset(){ PORTS=(); }
 
 warp_socks_port_conflicts_with_node(){
   local candidate="$1" var_name
-  for var_name in PORT_VLESSR PORT_VLESS_GRPCR PORT_TROJANR PORT_HY2 PORT_VMESS_WS PORT_HY2_OBFS PORT_SS2022 PORT_SS PORT_TUIC PORT_ANYTLS \
-                  PORT_VLESSR_W PORT_VLESS_GRPCR_W PORT_TROJANR_W PORT_HY2_W PORT_VMESS_WS_W PORT_HY2_OBFS_W PORT_SS2022_W PORT_SS_W PORT_TUIC_W PORT_ANYTLS_W; do
+  for var_name in "${SBP_ALL_PORT_VARS[@]}"; do
     [[ "${!var_name:-}" == "$candidate" ]] && return 0
   done
   if [[ -f "$SOCKS_NODES_JSON" ]] && jq -e --argjson port "$candidate" \
@@ -611,50 +707,28 @@ reserve_warp_socks_port(){
   PORTS+=("$WARP_SOCKS_PORT")
 }
 
-PORT_VLESSR=""; PORT_VLESS_GRPCR=""; PORT_TROJANR=""; PORT_HY2=""; PORT_VMESS_WS=""
-PORT_HY2_OBFS=""; PORT_SS2022=""; PORT_SS=""; PORT_TUIC=""; PORT_ANYTLS=""
-PORT_VLESSR_W=""; PORT_VLESS_GRPCR_W=""; PORT_TROJANR_W=""; PORT_HY2_W=""; PORT_VMESS_WS_W=""
-PORT_HY2_OBFS_W=""; PORT_SS2022_W=""; PORT_SS_W=""; PORT_TUIC_W=""; PORT_ANYTLS_W=""
+for sbp_port_var in "${SBP_ALL_PORT_VARS[@]}"; do printf -v "$sbp_port_var" '%s' ''; done
+unset sbp_port_var
 
-save_ports(){ cat > "$SB_DIR/ports.env" <<EOF
-PORT_VLESSR=$PORT_VLESSR
-PORT_VLESS_GRPCR=$PORT_VLESS_GRPCR
-PORT_TROJANR=$PORT_TROJANR
-PORT_HY2=$PORT_HY2
-PORT_VMESS_WS=$PORT_VMESS_WS
-PORT_HY2_OBFS=$PORT_HY2_OBFS
-PORT_SS2022=$PORT_SS2022
-PORT_SS=$PORT_SS
-PORT_TUIC=$PORT_TUIC
-PORT_ANYTLS=$PORT_ANYTLS
-PORT_VLESSR_W=$PORT_VLESSR_W
-PORT_VLESS_GRPCR_W=$PORT_VLESS_GRPCR_W
-PORT_TROJANR_W=$PORT_TROJANR_W
-PORT_HY2_W=$PORT_HY2_W
-PORT_VMESS_WS_W=$PORT_VMESS_WS_W
-PORT_HY2_OBFS_W=$PORT_HY2_OBFS_W
-PORT_SS2022_W=$PORT_SS2022_W
-PORT_SS_W=$PORT_SS_W
-PORT_TUIC_W=$PORT_TUIC_W
-PORT_ANYTLS_W=$PORT_ANYTLS_W
-EOF
-}
+save_ports(){ save_env_file "$SB_DIR/ports.env" "${SBP_ALL_PORT_VARS[@]}"; }
 load_ports(){ safe_source_env "$SB_DIR/ports.env" || return 1; }
 
 save_all_ports(){
   rand_ports_reset
   local v socks_nodes socks_port new_port
-  local -a port_vars=(PORT_VLESSR PORT_VLESS_GRPCR PORT_TROJANR PORT_HY2 PORT_VMESS_WS PORT_HY2_OBFS PORT_SS2022 PORT_SS PORT_TUIC PORT_ANYTLS
-    PORT_VLESSR_W PORT_VLESS_GRPCR_W PORT_TROJANR_W PORT_HY2_W PORT_VMESS_WS_W PORT_HY2_OBFS_W PORT_SS2022_W PORT_SS_W PORT_TUIC_W PORT_ANYTLS_W)
-  for v in "${port_vars[@]}"; do
-    [[ -n "${!v:-}" ]] && PORTS+=("${!v}")
+  for v in "${SBP_ALL_PORT_VARS[@]}"; do
+    if [[ -n "${!v:-}" ]]; then
+      valid_port "${!v}" || { warn "节点端口无效：$v"; return 1; }
+      printf -v "$v" '%s' "$((10#${!v}))"
+      PORTS+=("${!v}")
+    fi
   done
   socks_nodes="$(load_socks_nodes)" || return 1
   while IFS= read -r socks_port; do
     [[ -z "$socks_port" ]] || PORTS+=("$socks_port")
   done < <(jq -r '.nodes[].port' <<< "$socks_nodes" | tr -d '\r')
   reserve_warp_socks_port || return 1
-  for v in "${port_vars[@]}"; do
+  for v in "${SBP_ALL_PORT_VARS[@]}"; do
     if [[ -z "${!v:-}" ]]; then
       new_port="$(gen_port)" || return 1
       printf -v "$v" '%s' "$new_port"
@@ -666,49 +740,15 @@ save_all_ports(){
 }
 
 # ===== env / creds / warp =====
-save_env(){ cat > "$SB_DIR/env.conf" <<EOF
-BIN_PATH=$BIN_PATH
-SYSTEMD_SERVICE=$SYSTEMD_SERVICE
-CONF_JSON=$CONF_JSON
-DATA_DIR=$DATA_DIR
-ROUTE_JSON=$ROUTE_JSON
-ENABLE_VLESS_REALITY=$ENABLE_VLESS_REALITY
-ENABLE_VLESS_GRPCR=$ENABLE_VLESS_GRPCR
-ENABLE_TROJAN_REALITY=$ENABLE_TROJAN_REALITY
-ENABLE_HYSTERIA2=$ENABLE_HYSTERIA2
-ENABLE_VMESS_WS=$ENABLE_VMESS_WS
-ENABLE_HY2_OBFS=$ENABLE_HY2_OBFS
-ENABLE_SS2022=$ENABLE_SS2022
-ENABLE_SS=$ENABLE_SS
-ENABLE_TUIC=$ENABLE_TUIC
-ENABLE_ANYTLS=$ENABLE_ANYTLS
-ENABLE_WARP=$ENABLE_WARP
-WARP_BACKEND=$WARP_BACKEND
-WARP_SOCKS_HOST=$WARP_SOCKS_HOST
-WARP_SOCKS_PORT=$WARP_SOCKS_PORT
-REALITY_SERVER=$REALITY_SERVER
-REALITY_SERVER_PORT=$REALITY_SERVER_PORT
-GRPC_SERVICE=$GRPC_SERVICE
-VMESS_WS_PATH=$VMESS_WS_PATH
-TCP_KEEP_ALIVE=$TCP_KEEP_ALIVE
-TCP_KEEP_ALIVE_INTERVAL=$TCP_KEEP_ALIVE_INTERVAL
-UDP_TIMEOUT=$UDP_TIMEOUT
-WARP_KEEPALIVE_INTERVAL=$WARP_KEEPALIVE_INTERVAL
-DNS_HEALTH_INTERVAL=$DNS_HEALTH_INTERVAL
-DNS_FAILURE_THRESHOLD=$DNS_FAILURE_THRESHOLD
-DNS_RECOVERY_THRESHOLD=$DNS_RECOVERY_THRESHOLD
-DNS_SWITCH_COOLDOWN=$DNS_SWITCH_COOLDOWN
-EOF
-  # 用户输入的域名、邮箱和路径使用 shell 转义，避免 env.conf 被特殊字符破坏。
-  printf 'TLS_CERT_MODE=%q\n' "$TLS_CERT_MODE" >> "$SB_DIR/env.conf"
-  printf 'TLS_DOMAIN=%q\n' "$TLS_DOMAIN" >> "$SB_DIR/env.conf"
-  printf 'TLS_CERT_PATH=%q\n' "$TLS_CERT_PATH" >> "$SB_DIR/env.conf"
-  printf 'TLS_KEY_PATH=%q\n' "$TLS_KEY_PATH" >> "$SB_DIR/env.conf"
-  printf 'TLS_ACME_EMAIL=%q\n' "$TLS_ACME_EMAIL" >> "$SB_DIR/env.conf"
-  printf 'TLS_ACME_PROVIDER=%q\n' "$TLS_ACME_PROVIDER" >> "$SB_DIR/env.conf"
-  printf 'TLS_ACME_DATA_DIR=%q\n' "$TLS_ACME_DATA_DIR" >> "$SB_DIR/env.conf"
-  printf 'TLS_ACME_DISABLE_HTTP_CHALLENGE=%q\n' "$TLS_ACME_DISABLE_HTTP_CHALLENGE" >> "$SB_DIR/env.conf"
-  printf 'TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE=%q\n' "$TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE" >> "$SB_DIR/env.conf"
+save_env(){
+  save_env_file "$SB_DIR/env.conf" BIN_PATH SYSTEMD_SERVICE CONF_JSON DATA_DIR ROUTE_JSON \
+    ENABLE_VLESS_REALITY ENABLE_VLESS_GRPCR ENABLE_TROJAN_REALITY ENABLE_HYSTERIA2 \
+    ENABLE_VMESS_WS ENABLE_HY2_OBFS ENABLE_SS2022 ENABLE_SS ENABLE_TUIC ENABLE_ANYTLS \
+    ENABLE_WARP WARP_BACKEND WARP_SOCKS_HOST WARP_SOCKS_PORT REALITY_SERVER REALITY_SERVER_PORT \
+    GRPC_SERVICE VMESS_WS_PATH TCP_KEEP_ALIVE TCP_KEEP_ALIVE_INTERVAL UDP_TIMEOUT \
+    WARP_KEEPALIVE_INTERVAL DNS_HEALTH_INTERVAL DNS_FAILURE_THRESHOLD DNS_RECOVERY_THRESHOLD \
+    DNS_SWITCH_COOLDOWN TLS_CERT_MODE TLS_DOMAIN TLS_CERT_PATH TLS_KEY_PATH TLS_ACME_EMAIL \
+    TLS_ACME_PROVIDER TLS_ACME_DATA_DIR TLS_ACME_DISABLE_HTTP_CHALLENGE TLS_ACME_DISABLE_TLS_ALPN_CHALLENGE
 }
 load_env(){
   safe_source_env "$SB_DIR/env.conf" || true
@@ -716,50 +756,15 @@ load_env(){
 }
 
 save_creds(){
-  local tmp
-  tmp="$(mktemp "$SB_DIR/.creds.env.XXXXXX")" || return 1
-  if ! cat > "$tmp" <<EOF
-UUID=$UUID
-HY2_PWD=$HY2_PWD
-REALITY_PRIV=$REALITY_PRIV
-REALITY_PUB=$REALITY_PUB
-REALITY_SID=$REALITY_SID
-HY2_PWD2=$HY2_PWD2
-HY2_OBFS_PWD=$HY2_OBFS_PWD
-SS2022_KEY=$SS2022_KEY
-SS_PWD=$SS_PWD
-TUIC_UUID=$TUIC_UUID
-TUIC_PWD=$TUIC_PWD
-ANYTLS_PWD=$ANYTLS_PWD
-EOF
-  then
-    rm -f -- "$tmp"
-    return 1
-  fi
-  if ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$SB_DIR/creds.env"; then
-    rm -f -- "$tmp"
-    return 1
-  fi
+  save_env_file "$SB_DIR/creds.env" UUID HY2_PWD REALITY_PRIV REALITY_PUB REALITY_SID \
+    HY2_PWD2 HY2_OBFS_PWD SS2022_KEY SS_PWD TUIC_UUID TUIC_PWD ANYTLS_PWD
 }
 load_creds(){ safe_source_env "$SB_DIR/creds.env" || return 1; }
 
 save_warp(){
-  local tmp
-  mkdir -p "$SB_DIR" || return 1
-  tmp="$(mktemp "$SB_DIR/warp.env.tmp.XXXXXX")" || return 1
-  {
-    printf 'WARP_PRIVATE_KEY=%q\n' "${WARP_PRIVATE_KEY:-}"
-    printf 'WARP_PEER_PUBLIC_KEY=%q\n' "${WARP_PEER_PUBLIC_KEY:-}"
-    printf 'WARP_ENDPOINT_HOST=%q\n' "${WARP_ENDPOINT_HOST:-}"
-    printf 'WARP_ENDPOINT_PORT=%q\n' "${WARP_ENDPOINT_PORT:-}"
-    printf 'WARP_ADDRESS_V4=%q\n' "${WARP_ADDRESS_V4:-}"
-    printf 'WARP_ADDRESS_V6=%q\n' "${WARP_ADDRESS_V6:-}"
-    printf 'WARP_RESERVED_1=%q\n' "${WARP_RESERVED_1:-0}"
-    printf 'WARP_RESERVED_2=%q\n' "${WARP_RESERVED_2:-0}"
-    printf 'WARP_RESERVED_3=%q\n' "${WARP_RESERVED_3:-0}"
-  } > "$tmp" || { rm -f -- "$tmp"; return 1; }
-  chmod 0600 "$tmp" || { rm -f -- "$tmp"; return 1; }
-  mv -f -- "$tmp" "$SB_DIR/warp.env" || { rm -f -- "$tmp"; return 1; }
+  local WARP_RESERVED_1="${WARP_RESERVED_1:-0}" WARP_RESERVED_2="${WARP_RESERVED_2:-0}" WARP_RESERVED_3="${WARP_RESERVED_3:-0}"
+  save_env_file "$SB_DIR/warp.env" WARP_PRIVATE_KEY WARP_PEER_PUBLIC_KEY WARP_ENDPOINT_HOST \
+    WARP_ENDPOINT_PORT WARP_ADDRESS_V4 WARP_ADDRESS_V6 WARP_RESERVED_1 WARP_RESERVED_2 WARP_RESERVED_3
 }
 load_warp(){ safe_source_env "$SB_DIR/warp.env" || return 1; }
 
@@ -2393,17 +2398,9 @@ write_systemd(){
 }
 
 # ===== WARP（官方客户端，本地 SOCKS5 代理） =====
-WARP_CLI_MANAGED_MARKER=${WARP_CLI_MANAGED_MARKER:-$SB_DIR/.warp-cli-installed-by-sbp}
-WARP_OS_RELEASE=${WARP_OS_RELEASE:-/etc/os-release}
-WARP_APT_KEYRING=${WARP_APT_KEYRING:-/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg}
-WARP_APT_SOURCE_LIST=${WARP_APT_SOURCE_LIST:-/etc/apt/sources.list.d/cloudflare-client.list}
-WARP_YUM_REPO=${WARP_YUM_REPO:-/etc/yum.repos.d/cloudflare-warp.repo}
-
 valid_warp_proxy_settings(){
   [[ "${WARP_SOCKS_HOST:-}" == "127.0.0.1" || "${WARP_SOCKS_HOST:-}" == "::1" ]] || return 1
-  [[ "${WARP_SOCKS_PORT:-}" =~ ^[0-9]+$ ]] || return 1
-  (( ${#WARP_SOCKS_PORT} <= 5 )) || return 1
-  (( 10#$WARP_SOCKS_PORT >= 1 && 10#$WARP_SOCKS_PORT <= 65535 ))
+  valid_port "${WARP_SOCKS_PORT:-}"
 }
 
 warp_proxy_config_ready(){
@@ -2574,7 +2571,7 @@ ensure_warp_proxy(){
 
   for attempt in $(seq 1 8); do
     trace="$(curl -fsS --max-time 8 --noproxy '' --proxy "$(warp_proxy_url)" \
-      https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+      "$WARP_TRACE_URL" 2>/dev/null || true)"
     warp_state="$(printf '%s\n' "$trace" | awk -F= '$1=="warp" {print $2; exit}')"
     [[ "$warp_state" =~ ^(on|plus)$ ]] && break
     [[ "$attempt" -lt 8 ]] && sleep 1
@@ -2591,7 +2588,6 @@ ensure_warp_proxy(){
 }
 
 # ===== WARP（wgcf WireGuard，兼容已有 profile） =====
-WGCF_BIN=${WGCF_BIN:-/usr/local/bin/wgcf}
 install_wgcf() (
   local goarch release_json asset_fields release_tag asset_name url digest expected_hash current_hash
   local tmp="" staged_bin="" backup_bin=""
@@ -2703,11 +2699,10 @@ warp_profile_ready(){
   valid_warp_key "${WARP_PRIVATE_KEY:-}" || return 1
   valid_warp_key "${WARP_PEER_PUBLIC_KEY:-}" || return 1
   [[ -n "${WARP_ENDPOINT_HOST:-}" && "${WARP_ENDPOINT_HOST:-}" != *[[:space:]]* ]] || return 1
-  [[ "${WARP_ENDPOINT_PORT:-}" =~ ^[0-9]+$ ]] || return 1
-  (( WARP_ENDPOINT_PORT >= 1 && WARP_ENDPOINT_PORT <= 65535 )) || return 1
+  valid_port "${WARP_ENDPOINT_PORT:-}" || return 1
   [[ -n "${WARP_ADDRESS_V4:-}" || -n "${WARP_ADDRESS_V6:-}" ]] || return 1
   for value in "${WARP_RESERVED_1:-0}" "${WARP_RESERVED_2:-0}" "${WARP_RESERVED_3:-0}"; do
-    [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 0 && value <= 255 )) || return 1
+    [[ "$value" =~ ^[0-9]{1,3}$ ]] && (( 10#$value <= 255 )) || return 1
   done
 }
 
@@ -2717,15 +2712,6 @@ wgcf_account_ready(){
   for key in device_id access_token private_key; do
     grep -Eq "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*['\"][^'\"]+['\"]" "$account_file" || return 1
   done
-}
-
-save_private_file(){
-  local source_file="$1" target_file="$2" tmp
-  tmp="$(mktemp "${target_file}.tmp.XXXXXX")" || return 1
-  if ! cp -- "$source_file" "$tmp" || ! chmod 0600 "$tmp" || ! mv -f -- "$tmp" "$target_file"; then
-    rm -f -- "$tmp"
-    return 1
-  fi
 }
 
 record_wgcf_failure(){
@@ -2952,6 +2938,38 @@ ensure_warp_backend(){
   esac
 }
 
+# Build only the selected backend, so inactive credentials cannot affect JSON generation.
+warp_config_json(){
+  if [[ "${ENABLE_WARP:-false}" != true ]]; then
+    printf '%s\n' '{"enabled":false,"endpoints":[],"outbounds":[]}'
+    return 0
+  fi
+  case "${WARP_BACKEND:-auto}" in
+    wireguard)
+      warp_profile_ready && valid_port "${WARP_KEEPALIVE_INTERVAL:-}" || return 1
+      jq -cn --arg private_key "$WARP_PRIVATE_KEY" --arg public_key "$WARP_PEER_PUBLIC_KEY" \
+        --arg host "$WARP_ENDPOINT_HOST" --argjson port "$((10#$WARP_ENDPOINT_PORT))" \
+        --arg v4 "${WARP_ADDRESS_V4:-}" --arg v6 "${WARP_ADDRESS_V6:-}" \
+        --argjson r1 "$((10#${WARP_RESERVED_1:-0}))" --argjson r2 "$((10#${WARP_RESERVED_2:-0}))" \
+        --argjson r3 "$((10#${WARP_RESERVED_3:-0}))" \
+        --argjson keepalive "$((10#$WARP_KEEPALIVE_INTERVAL))" --argjson mtu "$WARP_MTU" --arg udp_timeout "$UDP_TIMEOUT" \
+        '{enabled:true, endpoints:[{
+          type:"wireguard", tag:"warp", system:false,
+          address:([$v4,$v6] | map(select(. != ""))), private_key:$private_key,
+          peers:[{address:$host, port:$port, public_key:$public_key, reserved:[$r1,$r2,$r3],
+            allowed_ips:["0.0.0.0/0","::/0"], persistent_keepalive_interval:$keepalive}],
+          mtu:$mtu, udp_timeout:$udp_timeout, domain_resolver:"dns-doh-primary"
+        }], outbounds:[]}'
+      ;;
+    proxy)
+      valid_warp_proxy_settings || return 1
+      jq -cn --arg host "$WARP_SOCKS_HOST" --argjson port "$((10#$WARP_SOCKS_PORT))" \
+        '{enabled:true, endpoints:[], outbounds:[{type:"socks", tag:"warp", server:$host, server_port:$port}]}'
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 uninstall_managed_warp_cli(){
   [[ -f "$WARP_CLI_MANAGED_MARKER" ]] || return 0
   local package_manager
@@ -3093,7 +3111,7 @@ verify_warp_egress(){
     for attempt in $(seq 1 8); do
       trace="$(curl -fsS --max-time 5 --noproxy '' \
         --proxy "socks5h://127.0.0.1:$port" \
-        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+        "$WARP_TRACE_URL" 2>/dev/null || true)"
       warp_state="$(printf '%s\n' "$trace" | awk -F= '$1=="warp" {print $2; exit}')"
       [[ "$warp_state" =~ ^(on|plus)$ ]] && break
       [[ "$attempt" -lt 8 ]] && sleep 1
@@ -3303,13 +3321,15 @@ write_config(){
   fi
 
   local CRT="$TLS_CERT_PATH" KEY="$TLS_KEY_PATH"
-  local ROUTING_JSON SOCKS_NODES BIND4 BIND6 TMP_CONF core_ver supports_1_14=false
+  local ROUTING_JSON SOCKS_NODES PROTOCOL_JSON WARP_JSON BIND4 BIND6 TMP_CONF core_ver supports_1_14=false
   core_ver="$(get_singbox_local_version "$BIN_PATH" 2>/dev/null || true)"
   if [[ -n "$core_ver" ]] && ! version_lt "$core_ver" 1.14.0; then
     supports_1_14=true
   fi
   ROUTING_JSON="$(load_route_json)"
   SOCKS_NODES="$(load_socks_nodes)" || return 1
+  PROTOCOL_JSON="$(protocol_config_json)" || return 1
+  WARP_JSON="$(warp_config_json)" || { warn "WARP 配置无效，已保留原配置"; return 1; }
   BIND4="$(default_ipv4_address || true)"
   BIND6="$(default_ipv6_address || true)"
   if jq -e 'any(.nodes[]; .system_ipv6 == true)' <<< "$SOCKS_NODES" >/dev/null && [[ -z "$BIND6" ]]; then
@@ -3329,20 +3349,7 @@ write_config(){
   --arg SS2022 "$SS2022_KEY" --arg SSPWD "$SS_PWD" --arg TUICUUID "$TUIC_UUID" --arg TUICPWD "$TUIC_PWD" \
   --arg ANYTLS "$ANYTLS_PWD" \
   --arg TCPKA "$TCP_KEEP_ALIVE" --arg TCPKAI "$TCP_KEEP_ALIVE_INTERVAL" --arg UDPT "$UDP_TIMEOUT" \
-  --argjson WARP_KEEPALIVE "$WARP_KEEPALIVE_INTERVAL" \
-  --arg WARP_BACKEND "${WARP_BACKEND:-auto}" \
-  --arg WARP_SOCKS_HOST "${WARP_SOCKS_HOST:-127.0.0.1}" --argjson WARP_SOCKS_PORT "${WARP_SOCKS_PORT:-40000}" \
-  --argjson P1 "$PORT_VLESSR" --argjson P2 "$PORT_VLESS_GRPCR" --argjson P3 "$PORT_TROJANR" \
-  --argjson P4 "$PORT_HY2" --argjson P5 "$PORT_VMESS_WS" --argjson P6 "$PORT_HY2_OBFS" \
-  --argjson P7 "$PORT_SS2022" --argjson P8 "$PORT_SS" --argjson P9 "$PORT_TUIC" --argjson P10 "$PORT_ANYTLS" \
-  --argjson PW1 "$PORT_VLESSR_W" --argjson PW2 "$PORT_VLESS_GRPCR_W" --argjson PW3 "$PORT_TROJANR_W" \
-  --argjson PW4 "$PORT_HY2_W" --argjson PW5 "$PORT_VMESS_WS_W" --argjson PW6 "$PORT_HY2_OBFS_W" \
-  --argjson PW7 "$PORT_SS2022_W" --argjson PW8 "$PORT_SS_W" --argjson PW9 "$PORT_TUIC_W" --argjson PW10 "$PORT_ANYTLS_W" \
-  --arg ENABLE_WARP "$ENABLE_WARP" \
-  --arg WPRIV "${WARP_PRIVATE_KEY:-}" --arg WPPUB "${WARP_PEER_PUBLIC_KEY:-}" \
-  --arg WHOST "${WARP_ENDPOINT_HOST:-}" --argjson WPORT "${WARP_ENDPOINT_PORT:-0}" \
-  --arg W4 "${WARP_ADDRESS_V4:-}" --arg W6 "${WARP_ADDRESS_V6:-}" \
-  --argjson WR1 "${WARP_RESERVED_1:-0}" --argjson WR2 "${WARP_RESERVED_2:-0}" --argjson WR3 "${WARP_RESERVED_3:-0}" \
+  --argjson PROTOCOLS "$PROTOCOL_JSON" --argjson WARP "$WARP_JSON" \
   --arg BIND4 "$BIND4" --arg BIND6 "$BIND6" --arg CACHEPATH "$DATA_DIR/cache.db" \
   --argjson CUSTOM_ROUTES "$ROUTING_JSON" \
   --argjson SOCKS_NODES "$SOCKS_NODES" \
@@ -3373,36 +3380,21 @@ write_config(){
   def inbound_tuic($port): ({type:"tuic", listen:"0.0.0.0", listen_port:$port, users:[{uuid:$TUICUUID, password:$TUICPWD}], congestion_control:"bbr", tls:inbound_tls(["h3"])} + listen_tuning);
   def inbound_anytls($port): ({type:"anytls", listen:"0.0.0.0", listen_port:$port, users:[{name:"anytls", password:$ANYTLS}], tls:inbound_tls(["h2","http/1.1"])} + listen_tuning);
 
-  def warp_wireguard_ready:
-    $ENABLE_WARP=="true" and $WARP_BACKEND=="wireguard"
-    and ($WPRIV|length)>0 and ($WPPUB|length)>0 and ($WHOST|length)>0 and ($WPORT>0)
-    and (([$W4, $W6] | map(select(. != "")) | length)>0);
+  def protocol_inbound($tag; $port):
+    if $tag == "vless-reality" then inbound_vless_flow($port)
+    elif $tag == "vless-grpcr" then inbound_vless($port) + {transport:{type:"grpc", service_name:$GRPC}}
+    elif $tag == "trojan-reality" then inbound_trojan($port)
+    elif $tag == "hy2" then inbound_hy2($port)
+    elif $tag == "vmess-ws" then inbound_vmess_ws($port)
+    elif $tag == "hy2-obfs" then inbound_hy2_obfs($port)
+    elif $tag == "ss2022" then inbound_ss2022($port)
+    elif $tag == "ss" then inbound_ss($port)
+    elif $tag == "tuic-v5" then inbound_tuic($port)
+    elif $tag == "anytls" then inbound_anytls($port)
+    else error("unknown inbound protocol: " + $tag) end;
 
-  def warp_proxy_ready:
-    $ENABLE_WARP=="true" and $WARP_BACKEND=="proxy"
-    and ($WARP_SOCKS_HOST=="127.0.0.1" or $WARP_SOCKS_HOST=="::1")
-    and ($WARP_SOCKS_PORT>0);
-
-  def warp_ready: warp_wireguard_ready or warp_proxy_ready;
-
-  def warp_endpoint:
-    {type:"wireguard", tag:"warp",
-      system: false,
-      address: ( [ $W4, $W6 ] | map(select(. != "")) ),
-      private_key:$WPRIV,
-      peers: [ {
-        address:$WHOST, port:$WPORT, public_key:$WPPUB,
-        reserved: [ $WR1, $WR2, $WR3 ],
-        allowed_ips: ["0.0.0.0/0","::/0"],
-        persistent_keepalive_interval: $WARP_KEEPALIVE
-      } ],
-      mtu:1280,
-      udp_timeout:$UDPT,
-      domain_resolver:"dns-doh-primary"
-    };
-
-  def warp_proxy_outbound:
-    {type:"socks", tag:"warp", server:$WARP_SOCKS_HOST, server_port:$WARP_SOCKS_PORT};
+  def direct_inbounds: [$PROTOCOLS[] | protocol_inbound(.tag; .port) + {tag:.tag}];
+  def warp_ready: $WARP.enabled;
 
   def custom_rule_sets($default):
     (($CUSTOM_ROUTES.rule_set // [])
@@ -3468,7 +3460,7 @@ write_config(){
       | map(select((keys - ["action","outbound"]) | length > 0)));
 
   def warp_inbound_rule:
-    { inbound: ["vless-reality-warp","vless-grpcr-warp","trojan-reality-warp","hy2-warp","vmess-ws-warp","hy2-obfs-warp","ss2022-warp","ss-warp","tuic-v5-warp","anytls-warp"], action:"route", outbound:"warp" };
+    { inbound: [$PROTOCOLS[].tag + "-warp"], action:"route", outbound:"warp" };
 
   def route_rules:
     # Explicit domain/block rules take precedence over the fallback exits of extra nodes.
@@ -3516,7 +3508,9 @@ write_config(){
       + (if (custom_rule_sets(resolved_final_outbound) | length) > 0 then
            {rule_set:custom_rule_sets(resolved_final_outbound)} else {} end));
 
-  {
+  direct_inbounds as $direct_inbounds
+  | ($PROTOCOLS | map({key:(.tag + "-warp"), value:.warp_port}) | from_entries) as $warp_ports
+  | {
     log:{level:"info", timestamp:true},
     dns:{
       servers:[
@@ -3528,32 +3522,11 @@ write_config(){
       strategy:"prefer_ipv4",
       cache_capacity:4096
     },
-    endpoints: (if warp_wireguard_ready then [warp_endpoint] else [] end),
-    inbounds: ([
-      (inbound_vless_flow($P1) + {tag:"vless-reality"}),
-      (inbound_vless($P2) + {tag:"vless-grpcr", transport:{type:"grpc", service_name:$GRPC}}),
-      (inbound_trojan($P3) + {tag:"trojan-reality"}),
-      (inbound_hy2($P4) + {tag:"hy2"}),
-      (inbound_vmess_ws($P5) + {tag:"vmess-ws"}),
-      (inbound_hy2_obfs($P6) + {tag:"hy2-obfs"}),
-      (inbound_ss2022($P7) + {tag:"ss2022"}),
-      (inbound_ss($P8) + {tag:"ss"}),
-      (inbound_tuic($P9) + {tag:"tuic-v5"}),
-      (inbound_anytls($P10) + {tag:"anytls"})
-    ] + (if warp_ready then [
-      (inbound_vless_flow($PW1) + {tag:"vless-reality-warp"}),
-      (inbound_vless($PW2) + {tag:"vless-grpcr-warp", transport:{type:"grpc", service_name:$GRPC}}),
-      (inbound_trojan($PW3) + {tag:"trojan-reality-warp"}),
-      (inbound_hy2($PW4) + {tag:"hy2-warp"}),
-      (inbound_vmess_ws($PW5) + {tag:"vmess-ws-warp"}),
-      (inbound_hy2_obfs($PW6) + {tag:"hy2-obfs-warp"}),
-      (inbound_ss2022($PW7) + {tag:"ss2022-warp"}),
-      (inbound_ss($PW8) + {tag:"ss-warp"}),
-      (inbound_tuic($PW9) + {tag:"tuic-v5-warp"}),
-      (inbound_anytls($PW10) + {tag:"anytls-warp"})
-    ] else [] end)),
-    outbounds: ([direct_outbound]
-      + (if warp_proxy_ready then [warp_proxy_outbound] else [] end)
+    endpoints: $WARP.endpoints,
+    inbounds: ($direct_inbounds + (if warp_ready then
+      ($direct_inbounds | map(.tag += "-warp" | .listen_port = $warp_ports[.tag]))
+      else [] end)),
+    outbounds: ([direct_outbound] + $WARP.outbounds
       + (if custom_uses_outbound("direct-ipv4") then [direct_ipv4_outbound] else [] end)
       + (if custom_uses_outbound("direct-ipv6") then [direct_ipv6_outbound] else [] end)
       + (if any($SOCKS_NODES.nodes[]; .system_ipv6 == true) then [socks_ipv6_outbound] else [] end)
@@ -3595,17 +3568,11 @@ write_config(){
 
 # ===== 防火墙 =====
 open_firewall(){
-  local rules=() warp_active=false socks_rules r
+  local rules=() warp_active=false protocol_rules socks_rules r
   load_env || true
   warp_backend_config_ready && warp_active=true
-  rules+=("${PORT_VLESSR}/tcp" "${PORT_VLESS_GRPCR}/tcp" "${PORT_TROJANR}/tcp" "${PORT_VMESS_WS}/tcp")
-  rules+=("${PORT_HY2}/udp" "${PORT_HY2_OBFS}/udp" "${PORT_TUIC}/udp" "${PORT_ANYTLS}/tcp")
-  rules+=("${PORT_SS2022}/tcp" "${PORT_SS2022}/udp" "${PORT_SS}/tcp" "${PORT_SS}/udp")
-  if [[ "$warp_active" == true ]]; then
-    rules+=("${PORT_VLESSR_W}/tcp" "${PORT_VLESS_GRPCR_W}/tcp" "${PORT_TROJANR_W}/tcp" "${PORT_VMESS_WS_W}/tcp")
-    rules+=("${PORT_HY2_W}/udp" "${PORT_HY2_OBFS_W}/udp" "${PORT_TUIC_W}/udp" "${PORT_ANYTLS_W}/tcp")
-    rules+=("${PORT_SS2022_W}/tcp" "${PORT_SS2022_W}/udp" "${PORT_SS_W}/tcp" "${PORT_SS_W}/udp")
-  fi
+  protocol_rules="$(protocol_firewall_rules "$warp_active")" || return 1
+  while IFS= read -r r; do [[ -z "$r" ]] || rules+=("$r"); done <<< "$protocol_rules"
   socks_rules="$(socks_node_firewall_rules)" || return 1
   while IFS= read -r r; do [[ -z "$r" ]] || rules+=("$r"); done <<< "$socks_rules"
   if [[ "$TLS_CERT_MODE" == acme ]]; then
@@ -3700,9 +3667,6 @@ print_links_grouped(){
   local tls_tip links_tmp l
   local warp_active=false link_count=10
   local links_direct=() links_warp=() protocol port_var link_name index
-  local protocols=(vless-reality vless-grpcr trojan-reality hy2 vmess-ws hy2-obfs ss2022 ss tuic-v5 anytls)
-  local port_vars=(PORT_VLESSR PORT_VLESS_GRPCR PORT_TROJANR PORT_HY2 PORT_VMESS_WS PORT_HY2_OBFS PORT_SS2022 PORT_SS PORT_TUIC PORT_ANYTLS)
-  local link_names=(vless-reality vless-grpc-reality trojan-reality hysteria2 vmess-ws hysteria2-obfs ss2022 ss tuic-v5 anytls)
   if warp_backend_config_ready; then
     warp_active=true
     link_count=20
@@ -3716,8 +3680,8 @@ print_links_grouped(){
   else
     tls_tip="Hysteria2 / TUIC / AnyTLS 使用自签证书并已允许跳过证书验证"
   fi
-  for index in "${!protocols[@]}"; do
-    protocol="${protocols[$index]}"; port_var="${port_vars[$index]}"; link_name="${link_names[$index]}"
+  for index in "${!SBP_PROTOCOLS[@]}"; do
+    protocol="${SBP_PROTOCOLS[$index]}"; port_var="${SBP_PORT_VARS[$index]}"; link_name="${SBP_LINK_NAMES[$index]}"
     l="$(node_share_link "$protocol" "${!port_var}" "$link_name" "$ip")" || return 1
     links_direct+=("$l")
     if [[ "$warp_active" == true ]]; then
@@ -3834,14 +3798,14 @@ socks_node_outbound_from_link(){
 }
 
 validate_socks_nodes(){
-  jq -ces '
+  local IFS=' '
+  jq -ces --arg protocol_ids "${SBP_PROTOCOLS[*]}" '
     def port: type == "number" and . == floor and . >= 1 and . <= 65535;
     def text: type == "string" and (test("[\\x00-\\x1f\\x7f]") | not);
     def host:
       text and length > 0 and
       (test("^[A-Za-z0-9.-]+$|^[0-9A-Fa-f:]+(%[A-Za-z0-9._-]+)?$") and . != ".");
-    def protocol: IN("vless-reality", "vless-grpcr", "trojan-reality", "hy2", "vmess-ws",
-      "hy2-obfs", "ss2022", "ss", "tuic-v5", "anytls");
+    def protocol: type == "string" and (. as $id | ($protocol_ids | split(" ") | index($id)) != null);
     if length != 1 then error("SOCKS 节点文件必须只包含一个 JSON 对象") else .[0] end
     | if type != "object" or (keys != ["nodes"]) or (.nodes | type) != "array" then
         error("SOCKS 节点文件格式无效") else . end
@@ -3874,21 +3838,7 @@ load_socks_nodes(){
   fi
 }
 
-socks_protocol_label(){
-  case "$1" in
-    vless-reality) printf 'VLESS Reality' ;;
-    vless-grpcr) printf 'VLESS gRPC Reality' ;;
-    trojan-reality) printf 'Trojan Reality' ;;
-    hy2) printf 'Hysteria2' ;;
-    vmess-ws) printf 'VMess WS' ;;
-    hy2-obfs) printf 'Hysteria2 obfs' ;;
-    ss2022) printf 'SS2022' ;;
-    ss) printf 'Shadowsocks' ;;
-    tuic-v5) printf 'TUIC v5' ;;
-    anytls) printf 'AnyTLS' ;;
-    *) return 1 ;;
-  esac
-}
+socks_protocol_label(){ protocol_label "$1"; }
 
 socks_node_port_available(){
   local port="$1" nodes
@@ -3904,15 +3854,12 @@ socks_node_port_available(){
 }
 
 socks_node_firewall_rules(){
-  local nodes protocol port
+  local nodes protocol port network
   nodes="$(load_socks_nodes)" || return 1
   while IFS=$'\t' read -r protocol port; do
     [[ -n "$protocol" ]] || continue
-    case "$protocol" in
-      hy2|hy2-obfs|tuic-v5) printf '%s/udp\n' "$port" ;;
-      ss2022|ss) printf '%s/tcp\n%s/udp\n' "$port" "$port" ;;
-      *) printf '%s/tcp\n' "$port" ;;
-    esac
+    network="$(protocol_network "$protocol")" || return 1
+    port_firewall_rules "$port" "$network" || return 1
   done < <(jq -r '.nodes[] | [.protocol, .port] | @tsv' <<< "$nodes" | tr -d '\r')
 }
 
@@ -4011,7 +3958,7 @@ apply_socks_nodes()(
 add_socks_node()(
   trap - EXIT
   local link protocol name port id outbound current tmp dns_mode=local system_ipv6=false attempt
-  local -a protocols=(vless-reality vless-grpcr trojan-reality hy2 vmess-ws hy2-obfs ss2022 ss tuic-v5 anytls)
+  local -a protocols=("${SBP_PROTOCOLS[@]}")
   ensure_installed_or_hint || return 1
   load_env; load_ports || return 1
   current="$(load_socks_nodes)" || return 1
@@ -5187,29 +5134,20 @@ show_service_status(){
     def_label="默认出口 10 节点 (当前出口: ${cur_def_outbound})"
   fi
   echo -e "  ${C_CYAN}[${def_label}]${C_RESET}"
-  printf "    %-18s : %b\n" "1. VLESS-Reality" "$(check_port_status "${PORT_VLESSR:-}" "tcp")"
-  printf "    %-18s : %b\n" "2. VLESS-gRPC-Real" "$(check_port_status "${PORT_VLESS_GRPCR:-}" "tcp")"
-  printf "    %-18s : %b\n" "3. Trojan-Reality" "$(check_port_status "${PORT_TROJANR:-}" "tcp")"
-  printf "    %-18s : %b\n" "4. Hysteria2" "$(check_port_status "${PORT_HY2:-}" "udp")"
-  printf "    %-18s : %b\n" "5. VMess-WS" "$(check_port_status "${PORT_VMESS_WS:-}" "tcp")"
-  printf "    %-18s : %b\n" "6. Hysteria2-Obfs" "$(check_port_status "${PORT_HY2_OBFS:-}" "udp")"
-  printf "    %-18s : %b\n" "7. SS-2022" "$(check_port_status "${PORT_SS2022:-}" "tcp/udp")"
-  printf "    %-18s : %b\n" "8. Shadowsocks" "$(check_port_status "${PORT_SS:-}" "tcp/udp")"
-  printf "    %-18s : %b\n" "9. TUIC v5" "$(check_port_status "${PORT_TUIC:-}" "udp")"
-  printf "    %-18s : %b\n" "10. AnyTLS" "$(check_port_status "${PORT_ANYTLS:-}" "tcp")"
+  local protocol_index port_var
+  for protocol_index in "${!SBP_PROTOCOLS[@]}"; do
+    port_var="${SBP_PORT_VARS[$protocol_index]}"
+    printf '    %-18s : %b\n' "$((protocol_index+1)). ${SBP_PROTOCOL_LABELS[$protocol_index]}" \
+      "$(check_port_status "${!port_var:-}" "${SBP_PROTOCOL_NETWORKS[$protocol_index]}")"
+  done
 
   if [[ "$warp_active" == true ]]; then
     echo -e "  ${C_CYAN}[WARP 10 节点]${C_RESET}"
-    printf "    %-18s : %b\n" "11. VLESS-Reality-W" "$(check_port_status "${PORT_VLESSR_W:-}" "tcp")"
-    printf "    %-18s : %b\n" "12. VLESS-gRPC-W" "$(check_port_status "${PORT_VLESS_GRPCR_W:-}" "tcp")"
-    printf "    %-18s : %b\n" "13. Trojan-Real-W" "$(check_port_status "${PORT_TROJANR_W:-}" "tcp")"
-    printf "    %-18s : %b\n" "14. Hysteria2-W" "$(check_port_status "${PORT_HY2_W:-}" "udp")"
-    printf "    %-18s : %b\n" "15. VMess-WS-W" "$(check_port_status "${PORT_VMESS_WS_W:-}" "tcp")"
-    printf "    %-18s : %b\n" "16. Hy2-Obfs-W" "$(check_port_status "${PORT_HY2_OBFS_W:-}" "udp")"
-    printf "    %-18s : %b\n" "17. SS-2022-W" "$(check_port_status "${PORT_SS2022_W:-}" "tcp/udp")"
-    printf "    %-18s : %b\n" "18. Shadowsocks-W" "$(check_port_status "${PORT_SS_W:-}" "tcp/udp")"
-    printf "    %-18s : %b\n" "19. TUIC-v5-W" "$(check_port_status "${PORT_TUIC_W:-}" "udp")"
-    printf "    %-18s : %b\n" "20. AnyTLS-W" "$(check_port_status "${PORT_ANYTLS_W:-}" "tcp")"
+    for protocol_index in "${!SBP_PROTOCOLS[@]}"; do
+      port_var="${SBP_WARP_PORT_VARS[$protocol_index]}"
+      printf '    %-18s : %b\n' "$((protocol_index+${#SBP_PROTOCOLS[@]}+1)). ${SBP_PROTOCOL_LABELS[$protocol_index]}-W" \
+        "$(check_port_status "${!port_var:-}" "${SBP_PROTOCOL_NETWORKS[$protocol_index]}")"
+    done
   else
     echo -e "  ${C_YELLOW}[WARP 未就绪：相关端口未启用]${C_RESET}"
   fi
@@ -5219,11 +5157,7 @@ show_service_status(){
       if [[ "$(jq '.nodes | length' <<< "$socks_nodes")" != 0 ]]; then
         printf '  [SOCKS 出口节点]\n'
         while IFS=$'\t' read -r socks_name socks_protocol socks_port; do
-          case "$socks_protocol" in
-            hy2|hy2-obfs|tuic-v5) socks_network=udp ;;
-            ss2022|ss) socks_network=tcp/udp ;;
-            *) socks_network=tcp ;;
-          esac
+          socks_network="$(protocol_network "$socks_protocol")" || return 1
           printf '    %s (%s) : %b\n' "$socks_name" "$socks_protocol" "$(check_port_status "$socks_port" "$socks_network")"
         done < <(jq -r '.nodes[] | [.name, .protocol, .port] | @tsv' <<< "$socks_nodes" | tr -d '\r')
       fi
@@ -5427,7 +5361,7 @@ run_diagnostics(){
 
     echo "== IPv4 外网测试 =="
     curl -4 -fsS --connect-timeout 3 --max-time 8 \
-      https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null |
+      "$WARP_TRACE_URL" 2>/dev/null |
       awk -F= '/^(ip|loc|warp)=/{print}'
     echo
 
@@ -5551,19 +5485,9 @@ uninstall_all(){
 
   info "正在清理防火墙端口规则..."
   load_ports || true
-  local rules=()
-  for p in "${PORT_VLESSR:-}" "${PORT_VLESS_GRPCR:-}" "${PORT_TROJANR:-}" "${PORT_VMESS_WS:-}" "${PORT_ANYTLS:-}" \
-           "${PORT_VLESSR_W:-}" "${PORT_VLESS_GRPCR_W:-}" "${PORT_TROJANR_W:-}" "${PORT_VMESS_WS_W:-}" "${PORT_ANYTLS_W:-}"; do
-    [[ -n "$p" ]] && rules+=("${p}/tcp")
-  done
-  for p in "${PORT_HY2:-}" "${PORT_HY2_OBFS:-}" "${PORT_TUIC:-}" \
-           "${PORT_HY2_W:-}" "${PORT_HY2_OBFS_W:-}" "${PORT_TUIC_W:-}"; do
-    [[ -n "$p" ]] && rules+=("${p}/udp")
-  done
-  for p in "${PORT_SS2022:-}" "${PORT_SS:-}" "${PORT_SS2022_W:-}" "${PORT_SS_W:-}"; do
-    [[ -n "$p" ]] && rules+=("${p}/tcp" "${p}/udp")
-  done
-  local socks_rules r
+  local rules=() protocol_rules socks_rules r
+  protocol_rules="$(protocol_firewall_rules true)" || return 1
+  while IFS= read -r r; do [[ -z "$r" ]] || rules+=("$r"); done <<< "$protocol_rules"
   socks_rules="$(socks_node_firewall_rules)" || socks_rules=""
   while IFS= read -r r; do [[ -z "$r" ]] || rules+=("$r"); done <<< "$socks_rules"
 
